@@ -1,0 +1,5 @@
+[project]
+name = "morse"
+
+[prog]
+top = "top::Top"

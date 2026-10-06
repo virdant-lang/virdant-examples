@@ -1,0 +1,85 @@
+//! Morse decoder for the iCEstick board.
+//!
+//! Type Morse code into a serial terminal at 115200 baud: '.' for a
+//! dot, '-' for a dash, and space (or enter) to finish a letter.
+//! The board sends the decoded character back to the terminal.
+//! The five green LEDs mirror the elements typed so far: element N
+//! shows on LED N, and a lit LED is a dash.
+//!
+//! For example, typing `... --- ... ` prints `SOS`.
+//! Letters longer than five elements, or element patterns that are
+//! no Morse character, decode to '?'.
+
+import ice40
+import uart
+import morse
+
+mod Top for ice40::IceStick {
+    incoming clock : Clock
+
+    incoming uart_rx : Bit
+    outgoing uart_tx : Bit
+
+    // User LEDs D1-D5; LED N shows element N (lit = dash).
+    outgoing led1 : Bit
+    outgoing led2 : Bit
+    outgoing led3 : Bit
+    outgoing led4 : Bit
+    outgoing led5 : Bit
+
+    // SPI flash (unused by this design).
+    outgoing flash_cs   : Bit
+    outgoing flash_clk  : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    // Power-on reset.  iCE40 registers power up at zero, so the
+    // counter starts at 0 and runs up to its max, holding `reset`
+    // high for the first 2^16 cycles (~5.5 ms at 12 MHz) before
+    // releasing the design into normal operation.
+    reg reset_counter : Word[16] on clock {
+        when {
+            case it != 0xFFFF { it <= it + 1w16 }
+        }
+    }
+
+    wire reset : Reset {
+        it := reset_counter != 0xFFFF
+    }
+
+    mod receiver of uart::UartReceiver {
+        it.clock := clock
+        it.reset := reset
+        it.rx    := uart_rx
+    }
+
+    mod decoder of morse::MorseDecoder {
+        it.clock := clock
+        it.reset := reset
+    }
+
+    // The terminal's bytes flow into the decoder, and the decoder's
+    // characters flow out through the sender.
+    decoder.inp :=: receiver.out
+
+    mod sender of uart::UartSender {
+        it.clock := clock
+        it.reset := reset
+        unused it.busy
+    }
+
+    sender.inp :=: decoder.out
+
+    uart_tx := sender.tx
+
+    led1 := decoder.dashes[0]
+    led2 := decoder.dashes[1]
+    led3 := decoder.dashes[2]
+    led4 := decoder.dashes[3]
+    led5 := decoder.dashes[4]
+
+    flash_cs := true
+    flash_clk := false
+    flash_mosi := false
+    unused flash_miso
+}

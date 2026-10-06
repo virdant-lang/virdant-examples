@@ -1,0 +1,198 @@
+//! Morse code decoder.
+//!
+//! The decoder consumes bytes typed on a serial terminal:
+//! '.' (0x2E) records a dot, '-' (0x2D) records a dash, and a space,
+//! carriage return, or newline finishes the current letter.
+//! When a letter finishes, its elements are looked up in the Morse
+//! table and the decoded ASCII character is offered on `out`.
+//! Anything else (a sixth element, or an element pattern that is no
+//! Morse character) decodes to '?'.
+//!
+//! The elements are packed into `code` below a marker bit: the code
+//! starts at 1, and every element shifts a 0 (dot) or 1 (dash) into
+//! the least-significant position.  The marker keeps letters of
+//! different lengths distinct, so 'E' (".") never collides with the
+//! prefix of 'I' ("..").
+//!
+//! The `dashes` output mirrors the elements typed so far: bit 0 is
+//! the first element and a set bit is a dash, so the top module can
+//! show the pattern being typed on the board LEDs.
+
+import uart
+
+//> Decodes Morse code typed over a serial terminal.
+//>
+//> Bytes arrive on the `inp` socket, where the decoder acts as the
+//> server, and decoded ASCII characters leave on the `out` socket,
+//> where it acts as the client.  Both use the `UartByte` handshake.
+mod MorseDecoder {
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Elements typed so far: bit 0 is the first element, and a set
+    //> bit is a dash.  Bits beyond the current letter length are 0.
+    outgoing dashes : Word[5] {
+        it := match length {
+            case 0 => 0w5
+            case 1 => word(0w4, code[0])
+            case 2 => word(0w3, code[0], code[1])
+            case 3 => word(0w2, code[0], code[1], code[2])
+            case 4 => word(0w1, code[0], code[1], code[2], code[3])
+            case 5 => word(code[0], code[1], code[2], code[3], code[4])
+            else => 0w5
+        }
+    }
+
+    // Raw bytes from the terminal.  A new byte is accepted only when
+    // the previous decoded character has been taken by the sender.
+    wire can_accept : Bit {
+        it := !decoded_valid
+    }
+
+    server socket inp of uart::UartByte {
+        it.ready := can_accept
+    }
+
+    // Decoded characters for the sender.
+    client socket out of uart::UartByte {
+        it.data := when {
+            case decoded_valid => @Valid(decoded_char)
+            else => @Invalid()
+        }
+    }
+
+    // The byte currently offered by the terminal, if any.
+    wire inp_byte : Word[8] {
+        it := match inp.data {
+            case @Valid(byte) => byte
+            case @Invalid() => 0w8
+        }
+    }
+
+    wire inp_valid : Bit {
+        it := match inp.data {
+            case @Valid(dontcare) => true
+            case @Invalid() => false
+        }
+    }
+
+    // A byte is consumed on the cycle both sides agree.
+    wire inp_fires : Bit {
+        it := inp_valid && can_accept
+    }
+
+    wire is_dot : Bit {
+        it := inp_byte == 0x2E
+    }
+
+    wire is_dash : Bit {
+        it := inp_byte == 0x2D
+    }
+
+    wire is_element : Bit {
+        it := is_dot || is_dash
+    }
+
+    // Space, carriage return, or newline finishes the letter.
+    wire is_break : Bit {
+        it := inp_byte == 0x20 || inp_byte == 0x0D || inp_byte == 0x0A
+    }
+
+    // The sender takes the decoded character.
+    wire out_fires : Bit {
+        it := decoded_valid && out.ready
+    }
+
+    //> Morse elements below a marker bit (see the package docstring).
+    reg code : Word[6] on clock
+
+    //> Number of elements in the current letter, 0 to 5.
+    reg length : Word[3] on clock
+
+    //> The decoded character, held until the sender accepts it.
+    reg decoded_char : Word[8] on clock
+
+    //> True while `decoded_char` waits for the sender.
+    reg decoded_valid : Bit on clock
+
+    // ASCII for the elements held in `code`, or '?' when they match
+    // no Morse character.  Each code is the marker bit followed by
+    // the elements: 0 for a dot, 1 for a dash, first element on top.
+    wire table_char : Word[8] {
+        it := match code {
+            case 2  => 0x45   // E .
+            case 3  => 0x54   // T -
+            case 4  => 0x49   // I ..
+            case 5  => 0x41   // A .-
+            case 6  => 0x4E   // N -.
+            case 7  => 0x4D   // M --
+            case 8  => 0x53   // S ...
+            case 9  => 0x55   // U ..-
+            case 10 => 0x52   // R .-.
+            case 11 => 0x57   // W .--
+            case 12 => 0x44   // D -..
+            case 13 => 0x4B   // K -.-
+            case 14 => 0x47   // G --.
+            case 15 => 0x4F   // O ---
+            case 16 => 0x48   // H ....
+            case 17 => 0x56   // V ...-
+            case 18 => 0x46   // F ..-.
+            case 20 => 0x4C   // L .-..
+            case 22 => 0x50   // P .--.
+            case 23 => 0x4A   // J .---
+            case 24 => 0x42   // B -...
+            case 25 => 0x58   // X -..-
+            case 26 => 0x43   // C -.-.
+            case 27 => 0x59   // Y -.--
+            case 28 => 0x5A   // Z --..
+            case 29 => 0x51   // Q --.-
+            case 32 => 0x35   // 5 .....
+            case 33 => 0x34   // 4 ....-
+            case 35 => 0x33   // 3 ...--
+            case 39 => 0x32   // 2 ..---
+            case 47 => 0x31   // 1 .----
+            case 48 => 0x36   // 6 -....
+            case 56 => 0x37   // 7 --...
+            case 60 => 0x38   // 8 ---..
+            case 62 => 0x39   // 9 ----.
+            case 63 => 0x30   // 0 -----
+            else => 0x3F      // ?
+        }
+    }
+
+    when {
+        case reset {
+            code <= 1w6
+            length <= 0
+            decoded_char <= 0w8
+            decoded_valid <= false
+        }
+        case inp_fires && is_dot && length < 5 {
+            // Shift a 0 in below the marker bit.
+            code <= word(code[5..0], 0w1)
+            length <= length + 1
+        }
+        case inp_fires && is_dash && length < 5 {
+            // Shift a 1 in below the marker bit.
+            code <= word(code[5..0], 1w1)
+            length <= length + 1
+        }
+        case inp_fires && is_element && length == 5 {
+            // A sixth element: no Morse character is that long.
+            decoded_char <= 0x3F
+            decoded_valid <= true
+            code <= 1w6
+            length <= 0
+        }
+        case inp_fires && is_break && length != 0 {
+            // Finish the letter and offer the decoded character.
+            decoded_char <= table_char
+            decoded_valid <= true
+            code <= 1w6
+            length <= 0
+        }
+        case out_fires {
+            decoded_valid <= false
+        }
+    }
+}
