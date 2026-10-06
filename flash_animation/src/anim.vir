@@ -1,0 +1,298 @@
+//! LED animation player that runs bytecode stored in SPI flash.
+//!
+//! The animation lives in the flash far above the bitstream, at
+//! byte offset 0x040000 (256 KiB).  The first byte must be the
+//! magic 0x56 ('V'); the program follows from byte 1.  The player
+//! reads it one byte at a time and executes:
+//!
+//!     0x00            - halt: freeze the LEDs
+//!     0x01 pattern    - light the LEDs given by `pattern` (bit 0 =
+//!                       LED 1, ..., bit 4 = LED 5)
+//!     0x02 ticks      - hold for `ticks` ticks; one tick is 2^17
+//!                       clock cycles (~10.9 ms at 12 MHz)
+//!     0x03 low high   - jump to byte offset `high * 256 + low` of
+//!                       the animation (0 is the magic byte)
+//!     0x04 quarters   - pause for `quarters` quarter-seconds
+//!                       (0.25 to 1.00 s in 0.25 s steps)
+//!
+//! Each instruction starts with a fresh flash fetch, so the player
+//! is a plain sequential interpreter: change the contents of the
+//! flash and the board plays a different show, no rebuild needed.
+//!
+//! When the magic byte is missing (empty or unprogrammed flash) the
+//! player falls back to a built-in knight-rider sweep, so a freshly
+//! programmed board still does something.
+
+import flash
+
+//> Player states.
+//>
+//> `CheckMagic`    - verify the animation magic byte
+//> `ReadCmd`       - fetch the next opcode
+//> `ReadPattern`   - fetch the argument of a `set`
+//> `ReadDelay`     - fetch the argument of a `wait`
+//> `ReadPause`     - fetch the argument of a `pause`
+//> `ReadJumpLow`   - fetch the low byte of a `jump` target
+//> `ReadJumpHigh`  - fetch the high byte of a `jump` target
+//> `Waiting`       - count down the current `wait`
+//> `Pausing`       - count down the current `pause`
+//> `Halt`          - freeze the LEDs forever
+//> `Demo`          - run the built-in animation (no content found)
+union type PlayerState {
+    CheckMagic()
+    ReadCmd()
+    ReadPattern()
+    ReadDelay()
+    ReadPause()
+    ReadJumpLow()
+    ReadJumpHigh()
+    Waiting()
+    Pausing()
+    Halt()
+    Demo()
+}
+
+//> Plays an LED animation read from the SPI flash.
+mod AnimationPlayer {
+    @frequency("12 MHz")
+    incoming clock : Clock
+    incoming reset : Reset
+
+    // SPI flash pins, passed through to the reader.
+    outgoing flash_cs   : Bit
+    outgoing flash_sck  : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    //> The LED pattern: bit N lights LED N.
+    outgoing leds : Word[5]
+
+    // Byte fetches from the flash.
+    mod reader of flash::SpiFlashReader {
+        it.clock := clock
+        it.reset := reset
+        it.addr  := fetch_addr
+        it.start := fetch_start
+        it.miso  := flash_miso
+    }
+
+    flash_cs   := reader.cs
+    flash_sck  := reader.sck
+    flash_mosi := reader.mosi
+
+    // The animation sits at 0x040000 and `pc` stays below 2^16, so
+    // the flash address is just the base's top bits joined with pc.
+    wire fetch_addr : Word[24] {
+        it := word(0x04w8, pc)
+    }
+
+    wire fetch_byte : Word[8] {
+        it := reader.read_byte
+    }
+
+    // True while the player waits for a fetch to finish.
+    wire reading : Bit {
+        it := match state {
+            case @CheckMagic()   => true
+            case @ReadCmd()      => true
+            case @ReadPattern()  => true
+            case @ReadDelay()    => true
+            case @ReadPause()    => true
+            case @ReadJumpLow()  => true
+            case @ReadJumpHigh() => true
+            else                 => false
+        }
+    }
+
+    // Start a fetch whenever the player is in a reading state and
+    // the reader is idle.  The cycle `done` pulses is skipped so
+    // every fetch samples a settled address.
+    wire fetch_start : Bit {
+        it := reading && !reader.busy && !reader.done
+    }
+
+    // The player's program counter: a byte offset from the start of
+    // the animation region (byte 0 is the magic).
+    reg pc : Word[16] on clock
+
+    reg state : PlayerState on clock
+
+    // The pattern currently shown (held during `Halt`).
+    reg led_pattern : Word[5] on clock
+
+    // The remaining ticks of the current `wait`.
+    reg wait_ticks : Word[8] on clock
+    // Counts one tick: 2^17 cycles, from 0 to 0x1FFFF.
+    reg tick_timer : Word[17] on clock
+
+    // The remaining quarter-seconds of the current `pause`.
+    reg pause_quarters : Word[8] on clock
+    // Counts one quarter-second: 3,000,000 cycles at 12 MHz,
+    // from 0 to 2,999,999.
+    reg quarter_timer : Word[22] on clock
+
+    // The low byte of a `jump` target, held while fetching the high one.
+    reg jump_low : Word[8] on clock
+
+    // Free-running counter for the built-in demo animation.  Its
+    // top bits pick the demo step, so the sweep advances once per
+    // 2^19 cycles (~44 ms).
+    reg demo_counter : Word[23] on clock {
+        it <= when {
+            case reset => 0
+            else => it + 1
+        }
+    }
+
+    wire demo_step : Word[3] {
+        it := demo_counter[22..19]
+    }
+
+    // Knight-rider sweep: one LED walks up the board and back down.
+    wire demo_pattern : Word[5] {
+        it := match demo_step {
+            case 0 => 0b00001w5
+            case 1 => 0b00010w5
+            case 2 => 0b00100w5
+            case 3 => 0b01000w5
+            case 4 => 0b10000w5
+            case 5 => 0b01000w5
+            case 6 => 0b00100w5
+            else  => 0b00010w5
+        }
+    }
+
+    leds := match state {
+        case @Demo() => demo_pattern
+        else => led_pattern
+    }
+
+    when {
+        case reset {
+            state <= @CheckMagic()
+            pc <= 0
+            led_pattern <= 0w5
+            wait_ticks <= 0
+            tick_timer <= 0
+            pause_quarters <= 0
+            quarter_timer <= 0
+            jump_low <= 0w8
+        }
+        else match state {
+            case @CheckMagic() {
+                when {
+                    case reader.done && fetch_byte == 0x56 {
+                        pc <= 1
+                        state <= @ReadCmd()
+                    }
+                    case reader.done {
+                        state <= @Demo()
+                    }
+                }
+            }
+            case @ReadCmd() {
+                when {
+                    case reader.done {
+                        pc <= pc + 1
+                        match fetch_byte {
+                            case 0x01 { state <= @ReadPattern() }
+                            case 0x02 { state <= @ReadDelay() }
+                            case 0x03 { state <= @ReadJumpLow() }
+                            case 0x04 { state <= @ReadPause() }
+                            else { state <= @Halt() }
+                        }
+                    }
+                }
+            }
+            case @ReadPattern() {
+                when {
+                    case reader.done {
+                        pc <= pc + 1
+                        led_pattern <= fetch_byte[5..0]
+                        state <= @ReadCmd()
+                    }
+                }
+            }
+            case @ReadDelay() {
+                when {
+                    case reader.done {
+                        pc <= pc + 1
+                        wait_ticks <= fetch_byte
+                        tick_timer <= 0
+                        state <= @Waiting()
+                    }
+                }
+            }
+            case @ReadPause() {
+                when {
+                    case reader.done {
+                        pc <= pc + 1
+                        pause_quarters <= fetch_byte
+                        quarter_timer <= 0
+                        state <= @Pausing()
+                    }
+                }
+            }
+            case @ReadJumpLow() {
+                when {
+                    case reader.done {
+                        pc <= pc + 1
+                        jump_low <= fetch_byte
+                        state <= @ReadJumpHigh()
+                    }
+                }
+            }
+            case @ReadJumpHigh() {
+                when {
+                    case reader.done {
+                        pc <= word(fetch_byte, jump_low)
+                        state <= @ReadCmd()
+                    }
+                }
+            }
+            case @Waiting() {
+                when {
+                    case wait_ticks == 0 {
+                        state <= @ReadCmd()
+                    }
+                    case tick_timer == 0x1FFFF {
+                        tick_timer <= 0
+                        when {
+                            case wait_ticks > 1 {
+                                wait_ticks <= wait_ticks - 1
+                            }
+                            case wait_ticks <= 1 {
+                                state <= @ReadCmd()
+                            }
+                        }
+                    }
+                    else {
+                        tick_timer <= tick_timer + 1
+                    }
+                }
+            }
+            case @Pausing() {
+                when {
+                    case pause_quarters == 0 {
+                        state <= @ReadCmd()
+                    }
+                    case quarter_timer == 2_999_999 {
+                        quarter_timer <= 0
+                        when {
+                            case pause_quarters > 1 {
+                                pause_quarters <= pause_quarters - 1
+                            }
+                            case pause_quarters <= 1 {
+                                state <= @ReadCmd()
+                            }
+                        }
+                    }
+                    else {
+                        quarter_timer <= quarter_timer + 1
+                    }
+                }
+            }
+            // @Halt() and @Demo() hold everything.
+        }
+    }
+}

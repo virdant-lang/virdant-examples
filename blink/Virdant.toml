@@ -1,0 +1,5 @@
+[project]
+name = "blink"
+
+[prog]
+top = "top::Top"

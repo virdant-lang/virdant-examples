@@ -1,0 +1,129 @@
+//! SPI flash byte reader for the iCEstick's configuration flash.
+//!
+//! The reader fetches one byte at a time using the flash's READ
+//! command (0x03).  A fetch drives `cs` low, clocks out the command
+//! and a 24-bit address MSB-first on `mosi`, then clocks eight data
+//! bits in on `miso`.  Pulse `start` while the reader is idle to
+//! fetch the byte at `addr`; `busy` stays high while the fetch is in
+//! flight, and when it completes `done` pulses for one cycle with
+//! the result on `read_byte`.  A new fetch must not be started on the
+//! cycle `done` is high.
+//!
+//! The SPI clock runs at half the system clock (6 MHz at 12 MHz):
+//! one cycle with `sck` low presents the next `mosi` bit and
+//! captures `miso`, and the next cycle raises `sck` to clock the
+//! device.  Because the flash holds each `miso` bit steady while
+//! `sck` is low, the reader samples it on the way out of the low
+//! phase, a full system cycle after the edge that presented it.
+
+//> States of the fetch engine.
+//>
+//> `Idle`  - no fetch in progress (`cs` high)
+//> `Load`  - `sck` low: present the next `mosi` bit, capture `miso`
+//> `Raise` - `sck` high: the device clocks the bit
+enum type ReaderState {
+    Idle  = 0b01w2
+    Load  = 0b10
+    Raise = 0b11
+}
+
+//> Reads single bytes out of the SPI configuration flash.
+//>
+//> Pulse `start` while idle to fetch the byte at `addr`; when
+//> `done` pulses, `byte` holds the result.
+mod SpiFlashReader {
+    @frequency("12 MHz")
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Byte address to read, sampled when `start` fires.
+    incoming addr  : Word[24]
+    //> Starts a fetch; ignored unless the reader is idle.
+    incoming start : Bit
+
+    //> SPI pins.  `cs` is active low and idles high; `sck` idles low.
+    outgoing cs   : Bit
+    outgoing sck  : Bit
+    outgoing mosi : Bit
+    //> Data returned by the flash.
+    incoming miso : Bit
+
+    //> High while a fetch is in flight.
+    outgoing busy : Bit
+    //> Pulses for one cycle when `read_byte` is ready.
+    outgoing done : Bit
+    //> The byte most recently fetched.
+    outgoing read_byte : Word[8]
+
+    // The READ command and address, MSB-first, followed by eight
+    // unused bits that pad out the data phase.
+    reg out_shift : Word[40] on clock
+
+    // Data bits captured from `miso`, MSB-first.
+    reg in_shift : Word[8] on clock
+
+    // Index of the bit being transferred, 0 to 39: bits 0 to 31
+    // carry the READ command and the address, bits 32 to 39 the data.
+    reg bit_index : Word[6] on clock
+
+    reg state : ReaderState on clock
+
+    cs   := state == #Idle
+    sck  := state == #Raise
+    mosi := out_shift[39]
+    busy := state != #Idle
+    done := done_reg
+    read_byte := in_shift
+
+    // `done` pulses on the cycle after the last data bit, when the
+    // reader has already returned to idle.
+    reg done_reg : Bit on clock {
+        it <= when {
+            case reset => false
+            case state == #Raise && bit_index == 39 => true
+            else => false
+        }
+    }
+
+    when {
+        case reset {
+            state <= #Idle
+            out_shift <= 0w40
+            in_shift <= 0w8
+            bit_index <= 0
+        }
+        else match state {
+            case #Idle {
+                when {
+                    case start {
+                        out_shift <= word(0x03w8, addr, 0w8)
+                        bit_index <= 0
+                        state <= #Load
+                    }
+                }
+            }
+            case #Load {
+                // During the data phase the flash holds the current
+                // bit steady on `miso` while `sck` is low; capture
+                // it as the low phase ends.
+                in_shift <= mux(bit_index >= 32, word(in_shift[7..0], miso), in_shift)
+                state <= #Raise
+            }
+            case #Raise {
+                when {
+                    // Bits remain: shift the next one out.
+                    case bit_index != 39 {
+                        bit_index <= bit_index + 1
+                        out_shift <= word(out_shift[39..0], 0w1)
+                        state <= #Load
+                    }
+                    // Last bit done; the shift registers hold until
+                    // the next fetch reloads them.
+                    case bit_index == 39 {
+                        state <= #Idle
+                    }
+                }
+            }
+        }
+    }
+}

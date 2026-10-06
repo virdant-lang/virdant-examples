@@ -1,0 +1,20 @@
+import ice40
+
+mod Top for ice40::IceStick {
+    incoming clock : Clock
+    outgoing led1 : Bit { it := counter[21] }
+    outgoing led2 : Bit { it := counter[22] }
+    outgoing led3 : Bit { it := counter[20] }
+    outgoing led4 : Bit { it := false }
+    outgoing led5 : Bit { it := false }
+    incoming uart_rx : Bit { unused it }
+    outgoing uart_tx : Bit { it := false }
+    outgoing flash_cs   : Bit { it := true }
+    outgoing flash_clk  : Bit { it := false }
+    outgoing flash_mosi : Bit { it := false }
+    incoming flash_miso : Bit { unused it }
+
+    reg counter : Word[32] on clock {
+        it <= it + 1
+    }
+}

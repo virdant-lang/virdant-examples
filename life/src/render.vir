@@ -1,0 +1,311 @@
+//! VT100 frame renderer for the 8x8 Game of Life world.
+//!
+//! The state lives on `state_grid`'s ports with no read latency, so
+//! the renderer is a single flat FSM, stalled by `out.ready` for
+//! each byte: an optional preamble (clear screen, hide cursor, boot
+//! frame only), 16 terminal rows of zoomed grid (two rows per grid
+//! row, 33..48), and a status line (row 22).  `busy` falls back to
+//! zero -- and the FSM back to `Idle` -- the instant the last status
+//! byte is accepted; a `draw` pulse that arrives mid-frame is the
+//! caller's responsibility to latch (see `src/control.vir`).
+//!
+//! The plan's phase-3 synthesis gate came in at 1506 ICESTORM_LCs
+//! against the HX1K's 1280 -- over budget by 226.  Per the plan's
+//! fallback order, the help line (row 20, ~58 bytes of constant
+//! text behind a 58-arm match) is cut here rather than golfing the
+//! B3/S23 rule itself; the key table lives in the README instead.
+
+import uart
+
+//> States of the frame renderer.
+//>
+//> `Idle`         - waiting for `draw`
+//> `Preamble`     - boot frame only: clear screen, hide cursor
+//> `RowPrefix`    - position the cursor for terminal row `row`
+//> `RowCells`     - the row's 16 characters (8 cells, 2 chars each)
+//> `StatusPrefix` - position the cursor for the status line (row 22)
+//> `Status`       - the status line's text
+union type RenderState {
+    Idle()
+    Preamble(idx : Word[4])
+    RowPrefix(row : Word[4], idx : Word[3])
+    RowCells(row : Word[4], idx : Word[4])
+    StatusPrefix(idx : Word[3])
+    Status(idx : Word[5])
+}
+
+//> Renders one VT100 frame per `draw` pulse.
+mod Vt100Renderer {
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Pulse: begin emitting one frame.  Ignored while busy.
+    incoming draw : Bit
+    //> Sampled when `draw` fires: include the clear-screen / hide-
+    //> cursor preamble (boot frame only).
+    incoming first_frame : Bit
+
+    //> Bit `y*8 + x` is cell `(x, y)`, straight off `LifeBlock`.
+    incoming state_grid  : Word[64]
+    incoming running     : Bit
+    incoming speed_level : Word[4]
+    //> BCD: thousands, hundreds, tens, ones (four 4-bit nibbles).
+    incoming generation  : Word[16]
+
+    client socket out of uart::UartByte
+    //> High from the cycle `draw` is accepted until the last status
+    //> byte is taken.
+    outgoing busy : Bit
+
+    busy := match state {
+        case @Idle() => false
+        else => true
+    }
+
+    out.data := match state {
+        case @Idle() => @Invalid()
+        else => @Valid(tx_byte)
+    }
+
+    // A byte is sent the cycle the sender accepts it.
+    wire byte_sent : Bit {
+        it := out.ready
+    }
+
+    // -- Row-cell addressing --------------------------------------
+    // Two terminal rows (3..18) are walked per grid row, and two
+    // characters per cell, so `row[4..1]` and `idx[4..1]` each
+    // divide by two to recover the grid row / cell column.  Both
+    // characters of a cell are identical, so parity does not matter.
+    // (The raw fields are pulled out as their own wires first, then
+    // sliced separately -- slicing them in the same expression that
+    // destructures them chains two range-selects, which Icarus
+    // rejects.)
+    wire row_cell_row_raw : Word[4] {
+        it := match state {
+            case @RowCells(row, dontcare) => row
+            else => 0w4
+        }
+    }
+    wire row_cell_idx_raw : Word[4] {
+        it := match state {
+            case @RowCells(dontcare, idx) => idx
+            else => 0w4
+        }
+    }
+    wire row_cell_grid_row : Word[3] {
+        it := row_cell_row_raw[4..1]
+    }
+    wire row_cell_col : Word[3] {
+        it := row_cell_idx_raw[4..1]
+    }
+    wire row_cell_index : Word[6] {
+        it := word(row_cell_grid_row, row_cell_col)
+    }
+    wire row_cell_alive : Bit {
+        it := state_grid[dyn row_cell_index]
+    }
+
+    // -- Status line fields -----------------------------------------
+    wire speed_hex_char : Word[8] {
+        it := match speed_level {
+            case 0  => 0x30w8   // '0'
+            case 1  => 0x31w8
+            case 2  => 0x32w8
+            case 3  => 0x33w8
+            case 4  => 0x34w8
+            case 5  => 0x35w8
+            case 6  => 0x36w8
+            case 7  => 0x37w8
+            case 8  => 0x38w8
+            case 9  => 0x39w8
+            case 10 => 0x41w8   // 'A'
+            case 11 => 0x42w8
+            case 12 => 0x43w8
+            case 13 => 0x44w8
+            case 14 => 0x45w8
+            case 15 => 0x46w8   // 'F'
+        }
+    }
+    wire gen_thousands_char : Word[8] { it := word(0x3w4, generation[16..12]) }
+    wire gen_hundreds_char  : Word[8] { it := word(0x3w4, generation[12..8]) }
+    wire gen_tens_char      : Word[8] { it := word(0x3w4, generation[8..4]) }
+    wire gen_ones_char      : Word[8] { it := word(0x3w4, generation[4..0]) }
+
+    // -- The byte mux -------------------------------------------------
+    // NOTE: written as `wire tx_byte : Word[8]` plus a plain `:=`
+    // below (not an `it`-block) -- an `it`-block here confuses name
+    // resolution for the nested `match idx { ... }` subjects, which
+    // are themselves pattern-bound from the outer `match state`.
+    wire tx_byte : Word[8]
+    tx_byte := match state {
+        case @Idle() => 0w8
+
+        // ESC [ 2 J ESC [ ? 2 5 l : clear screen, hide cursor.
+        case @Preamble(idx) => match idx {
+            case 0 => 0x1bw8
+            case 1 => 0x5bw8   // '['
+            case 2 => 0x32w8   // '2'
+            case 3 => 0x4aw8   // 'J'
+            case 4 => 0x1bw8
+            case 5 => 0x5bw8   // '['
+            case 6 => 0x3fw8   // '?'
+            case 7 => 0x32w8   // '2'
+            case 8 => 0x35w8   // '5'
+            case 9 => 0x6cw8   // 'l'
+            else => dontcare
+        }
+
+        // ESC [ <row> ; 3 3 H : position the cursor at column 33
+        // of terminal row `row + 3` (3..18), zero-padded to two
+        // decimal digits (a valid CSI parameter, like any other
+        // decimal with leading zeros).
+        case @RowPrefix(row, idx) => match idx {
+            case 0 => 0x1bw8
+            case 1 => 0x5bw8   // '['
+            case 2 match row {
+                case 0 => 0x30w8
+                case 1 => 0x30w8
+                case 2 => 0x30w8
+                case 3 => 0x30w8
+                case 4 => 0x30w8
+                case 5 => 0x30w8
+                case 6 => 0x30w8
+                case 7 => 0x31w8
+                case 8 => 0x31w8
+                case 9 => 0x31w8
+                case 10 => 0x31w8
+                case 11 => 0x31w8
+                case 12 => 0x31w8
+                case 13 => 0x31w8
+                case 14 => 0x31w8
+                case 15 => 0x31w8
+            }
+            case 3 match row {
+                case 0 => 0x33w8
+                case 1 => 0x34w8
+                case 2 => 0x35w8
+                case 3 => 0x36w8
+                case 4 => 0x37w8
+                case 5 => 0x38w8
+                case 6 => 0x39w8
+                case 7 => 0x30w8
+                case 8 => 0x31w8
+                case 9 => 0x32w8
+                case 10 => 0x33w8
+                case 11 => 0x34w8
+                case 12 => 0x35w8
+                case 13 => 0x36w8
+                case 14 => 0x37w8
+                case 15 => 0x38w8
+            }
+            case 4 => 0x3bw8   // ';'
+            case 5 => 0x33w8   // '3'
+            case 6 => 0x33w8   // '3'
+            case 7 => 0x48w8   // 'H'
+        }
+
+        // Sixteen characters: '#' '#' for a live cell, ' ' ' '
+        // for a dead one.
+        case @RowCells(row, idx) => mux(row_cell_alive, 0x23w8, 0x20w8)
+
+        // ESC [ 2 2 ; 1 H : position the cursor at the status line.
+        case @StatusPrefix(idx) => match idx {
+            case 0 => 0x1bw8
+            case 1 => 0x5bw8   // '['
+            case 2 => 0x32w8   // '2'
+            case 3 => 0x32w8   // '2'
+            case 4 => 0x3bw8   // ';'
+            case 5 => 0x31w8   // '1'
+            case 6 => 0x48w8   // 'H'
+            else => dontcare
+        }
+
+        // "R SPEED:_ GEN:____" / "P SPEED:_ GEN:____"
+        case @Status(idx) => match idx {
+            case 0  => mux(running, 0x52w8, 0x50w8)   // 'R' / 'P'
+            case 1  => 0x20w8   // ' '
+            case 2  => 0x53w8   // 'S'
+            case 3  => 0x50w8   // 'P'
+            case 4  => 0x45w8   // 'E'
+            case 5  => 0x45w8   // 'E'
+            case 6  => 0x44w8   // 'D'
+            case 7  => 0x3aw8   // ':'
+            case 8  => speed_hex_char
+            case 9  => 0x20w8   // ' '
+            case 10 => 0x47w8   // 'G'
+            case 11 => 0x45w8   // 'E'
+            case 12 => 0x4ew8   // 'N'
+            case 13 => 0x3aw8   // ':'
+            case 14 => gen_thousands_char
+            case 15 => gen_hundreds_char
+            case 16 => gen_tens_char
+            case 17 => gen_ones_char
+            else => dontcare
+        }
+    }
+
+    // -- The state machine --------------------------------------------
+    // NOTE: written as `reg state : RenderState on clock` plus a
+    // plain top-level `when` below (not an `it`-block), for the same
+    // reason as `tx_byte` above.
+    reg state : RenderState on clock
+    when {
+        case reset { state <= @Idle() }
+        else match state {
+            case @Idle() {
+                when {
+                    case draw match first_frame {
+                        case true  { state <= @Preamble(0) }
+                        case false { state <= @RowPrefix(0, 0) }
+                    }
+                }
+            }
+            case @Preamble(idx) {
+                when {
+                    case byte_sent match idx {
+                        case 9 { state <= @RowPrefix(0, 0) }
+                        else   { state <= @Preamble(idx + 1) }
+                    }
+                }
+            }
+            case @RowPrefix(row, idx) {
+                when {
+                    case byte_sent match idx {
+                        case 7 { state <= @RowCells(row, 0) }
+                        else   { state <= @RowPrefix(row, idx + 1) }
+                    }
+                }
+            }
+            case @RowCells(row, idx) {
+                when {
+                    case byte_sent match idx {
+                        case 15 {
+                            when {
+                                case row == 15 { state <= @StatusPrefix(0) }
+                                else            { state <= @RowPrefix(row + 1, 0) }
+                            }
+                        }
+                        else { state <= @RowCells(row, idx + 1) }
+                    }
+                }
+            }
+            case @StatusPrefix(idx) {
+                when {
+                    case byte_sent match idx {
+                        case 6 { state <= @Status(0) }
+                        else   { state <= @StatusPrefix(idx + 1) }
+                    }
+                }
+            }
+            case @Status(idx) {
+                when {
+                    case byte_sent match idx {
+                        case 17 { state <= @Idle() }
+                        else    { state <= @Status(idx + 1) }
+                    }
+                }
+            }
+        }
+    }
+}

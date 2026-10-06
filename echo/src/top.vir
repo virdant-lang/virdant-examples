@@ -1,0 +1,116 @@
+//! UART echo server for the iCEstick board.
+//!
+//! Every byte that arrives on `uart_rx` is sent back out on `uart_tx`
+//! with its ASCII case inverted: uppercase letters become lowercase
+//! and vice versa, while all other bytes pass through unchanged.
+//! A power-on reset holds the UART cores in reset while the clock
+//! settles, then releases them.  LED1 lights while a byte is being
+//! echoed back out; the other LEDs stay off.
+
+import ice40
+import uart
+
+mod Top for ice40::IceStick {
+    incoming clock : Clock
+
+    incoming uart_rx : Bit
+    outgoing uart_tx : Bit
+
+    // User LEDs D1-D5; LED1 is the echo activity indicator.
+    outgoing led1 : Bit
+    outgoing led2 : Bit
+    outgoing led3 : Bit
+    outgoing led4 : Bit
+    outgoing led5 : Bit
+
+    // SPI flash (unused by this design).
+    outgoing flash_cs   : Bit
+    outgoing flash_clk  : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    // Power-on reset.  iCE40 registers power up at zero, so the
+    // counter starts at 0 and runs up to its max, holding `reset`
+    // high for the first 2^16 cycles (~5.5 ms at 12 MHz) before
+    // releasing the design into normal operation.
+    reg reset_counter : Word[16] on clock {
+        when {
+            case it != 0xFFFF { it <= it + 1w16 }
+        }
+    }
+
+    wire reset : Reset {
+        it := reset_counter != 0xFFFF
+    }
+
+    mod receiver of uart::UartReceiver {
+        it.clock := clock
+        it.reset := reset
+        it.rx    := uart_rx
+    }
+
+    mod sender of uart::UartSender {
+        it.clock := clock
+        it.reset := reset
+    }
+
+    // The byte currently recovered from the line, if any.  When the
+    // receiver has no byte ready the value is don't-care (held at 0);
+    // `recv_valid` gates its use below.
+    wire recv_byte : Word[8] {
+        it := match receiver.out.data {
+            case @Valid(byte) => byte
+            case @Invalid() => 0w8
+        }
+    }
+
+    wire recv_valid : Bit {
+        it := match receiver.out.data {
+            case @Valid(dontcare) => true
+            case @Invalid() => false
+        }
+    }
+
+    // ASCII letters live in two ranges; toggling bit 5 (0x20) swaps
+    // their case.  Everything else is passed through untouched.
+    wire is_upper : Bit {
+        it := recv_byte >= 0x41 && recv_byte <= 0x5A
+    }
+    wire is_lower : Bit {
+        it := recv_byte >= 0x61 && recv_byte <= 0x7A
+    }
+    wire is_letter : Bit {
+        it := is_upper || is_lower
+    }
+
+    wire echo_byte : Word[8] {
+        it := when {
+            case is_letter => recv_byte ^ 0x20
+            else => recv_byte
+        }
+    }
+
+    // Echo path with case inversion.  The sender accepts a byte only
+    // when idle, so the receiver is allowed to drop its byte on the
+    // same cycle the sender latches the case-inverted value.
+    receiver.out.ready := sender.inp.ready
+
+    sender.inp.data := when {
+        case recv_valid => @Valid(echo_byte)
+        else => @Invalid()
+    }
+
+    uart_tx := sender.tx
+
+    // LED1 lights only while a frame is in flight; the rest stay off.
+    led1 := sender.busy
+    led2 := false
+    led3 := false
+    led4 := false
+    led5 := false
+
+    flash_cs := true
+    flash_clk := false
+    flash_mosi := false
+    unused flash_miso
+}

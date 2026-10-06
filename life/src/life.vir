@@ -1,0 +1,1225 @@
+//! Conway's Game of Life, one circuit per cell.
+//!
+//! `LifeCell` is a single flip-flop plus the B3/S23 neighbor rule,
+//! wired once and instantiated 64 times by `LifeBlock`, an 8x8 tile
+//! with its boundary exposed as ports.  No wrap logic lives inside
+//! the tile -- the torus (or a larger tiling) is wired by whatever
+//! instantiates `LifeBlock` (see `src/top.vir`).
+
+//> One Game of Life cell: a state flip-flop plus the B3/S23 rule.
+//>
+//> All eight neighbors arrive as wires; `state` updates on `advance`.
+//> `load_seed` takes priority over `advance` so a cell can be
+//> reseeded even while the design is paused.
+mod LifeCell {
+    incoming clock : Clock
+    incoming reset : Reset
+
+    // The eight neighbors.
+    incoming north     : Bit
+    incoming south     : Bit
+    incoming west      : Bit
+    incoming east      : Bit
+    incoming northwest : Bit
+    incoming northeast : Bit
+    incoming southwest : Bit
+    incoming southeast : Bit
+
+    // Update strobes (load_seed wins if both fire).
+    incoming advance   : Bit
+    incoming load_seed : Bit
+    incoming seed_bit  : Bit
+
+    outgoing state : Bit
+
+    // Row sums first: the north-row trio and south-row trio each sum
+    // to 2 bits (0..3), and the west/east pair sums to 2 bits (0..2).
+    wire north_trio_sum : Word[2] {
+        it := word(0w1, northwest) + word(0w1, north) + word(0w1, northeast)
+    }
+    wire south_trio_sum : Word[2] {
+        it := word(0w1, southwest) + word(0w1, south) + word(0w1, southeast)
+    }
+    wire side_sum : Word[2] {
+        it := word(0w1, west) + word(0w1, east)
+    }
+
+    // Combine the three partial sums into the eight-neighbor count
+    // `n` (0..8).  The classic B3/S23 rule is `next = (n == 3) |
+    // (state & (n == 2))` -- born on exactly 3 neighbors, survives
+    // on 2 (plus itself) or 3.  This is algebraically the same as
+    // folding the cell's own state into a nine-cell total `t` and
+    // checking `(t == 3) | (state & (t == 4))`, but it drops one
+    // term from the adder (no `+ state`), which is worth a LUT or
+    // two per cell at this scale -- see the README's note on the
+    // phase-3 synthesis gate.
+    wire neighbor_count : Word[4] {
+        it := word(0w2, north_trio_sum) + word(0w2, south_trio_sum) + word(0w2, side_sum)
+    }
+
+    wire next_state : Bit {
+        it := neighbor_count == 3 || (state_reg && neighbor_count == 2)
+    }
+
+    reg state_reg : Bit on clock {
+        when {
+            case reset     { it <= false }
+            case load_seed { it <= seed_bit }
+            case advance   { it <= next_state }
+        }
+    }
+    state := state_reg
+}
+
+//> An 8x8 Game of Life tile with its boundary exposed as ports.
+//>
+//> Wrap (torus or tiling) is wired by the instantiator (see
+//> `src/top.vir`); nothing about the wrap is knowable inside the
+//> block.  There is no FSM and no `busy`: the block is pure state
+//> plus wiring, and every cell updates in the same cycle `advance`
+//> pulses.
+mod LifeBlock {
+    incoming clock     : Clock
+    incoming reset     : Reset
+    //> Pulses once per generation; all 64 cells latch simultaneously.
+    incoming advance   : Bit
+    //> Loads every cell from the LFSR in one cycle and clears
+    //> `generation`.
+    incoming randomize : Bit
+
+    // Boundary: each edge is the 8 cells along it, aligned by column
+    // (north/south) or row (west/east); the four corners are exposed
+    // separately.  "*_out" presents this tile's edge to a neighbor;
+    // "*_in" is the neighbor's edge, wired in by the instantiator.
+    incoming north_in : Word[8]   // bit x = cell (x, -1)
+    incoming south_in : Word[8]   // bit x = cell (x, 8)
+    incoming west_in  : Word[8]   // bit y = cell (-1, y)
+    incoming east_in  : Word[8]   // bit y = cell (8, y)
+    incoming nw_in : Bit
+    incoming ne_in : Bit
+    incoming sw_in : Bit
+    incoming se_in : Bit
+
+    outgoing north_out : Word[8]  // row 0
+    outgoing south_out : Word[8]  // row 7
+    outgoing west_out  : Word[8]  // column 0
+    outgoing east_out  : Word[8]  // column 7
+    outgoing nw_out : Bit
+    outgoing ne_out : Bit
+    outgoing sw_out : Bit
+    outgoing se_out : Bit
+
+    //> Bit `y*8 + x` is cell `(x, y)`.
+    outgoing state_grid : Word[64]
+    //> Generations since the last `randomize`, as four BCD digits
+    //> (thousands, hundreds, tens, ones), wrapping at 9999.
+    outgoing generation : Word[16]
+
+    // A 64-bit Fibonacci LFSR (taps at degrees 64, 63, 61, 60; fixed
+    // nonzero seed) feeds `randomize`.  It runs free on every cycle
+    // so each randomize draws a fresh, unpredictable 64-bit vector;
+    // `scripts/life.py` mirrors it bit-for-bit.
+    wire lfsr_feedback : Bit {
+        it := lfsr[63] ^^ lfsr[62] ^^ lfsr[60] ^^ lfsr[59]
+    }
+
+    reg lfsr : Word[64] on clock {
+        it <= mux(reset, 1w64, word(it[63..0], lfsr_feedback))
+    }
+
+    //> Generations since the last `randomize`, as four cascaded BCD
+    //> decades; wraps silently at 9999 -> 0.
+    reg gen_ones      : Word[4] on clock
+    reg gen_tens      : Word[4] on clock
+    reg gen_hundreds  : Word[4] on clock
+    reg gen_thousands : Word[4] on clock
+
+    when {
+        case reset {
+            gen_ones <= 0
+            gen_tens <= 0
+            gen_hundreds <= 0
+            gen_thousands <= 0
+        }
+        case randomize {
+            gen_ones <= 0
+            gen_tens <= 0
+            gen_hundreds <= 0
+            gen_thousands <= 0
+        }
+        case advance match gen_ones {
+            case 9 {
+                gen_ones <= 0
+                match gen_tens {
+                    case 9 {
+                        gen_tens <= 0
+                        match gen_hundreds {
+                            case 9 {
+                                gen_hundreds <= 0
+                                match gen_thousands {
+                                    case 9 { gen_thousands <= 0 }
+                                    else { gen_thousands <= gen_thousands + 1 }
+                                }
+                            }
+                            else { gen_hundreds <= gen_hundreds + 1 }
+                        }
+                    }
+                    else { gen_tens <= gen_tens + 1 }
+                }
+            }
+            else { gen_ones <= gen_ones + 1 }
+        }
+    }
+
+    generation := word(gen_thousands, gen_hundreds, gen_tens, gen_ones)
+
+    // The 8x8 grid of cells.  Virdant has no generate loops, so every
+    // instance and every neighbor wire is written out explicitly --
+    // verbose, but it means every torus connection is visible here,
+    // not hidden in index arithmetic.
+    mod cell_0_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[0]
+        it.south := cell_0_1.state
+        it.west := west_in[0]
+        it.east := cell_1_0.state
+        it.northwest := nw_in
+        it.northeast := north_in[1]
+        it.southwest := west_in[1]
+        it.southeast := cell_1_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[0]
+    }
+
+    mod cell_1_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[1]
+        it.south := cell_1_1.state
+        it.west := cell_0_0.state
+        it.east := cell_2_0.state
+        it.northwest := north_in[0]
+        it.northeast := north_in[2]
+        it.southwest := cell_0_1.state
+        it.southeast := cell_2_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[1]
+    }
+
+    mod cell_2_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[2]
+        it.south := cell_2_1.state
+        it.west := cell_1_0.state
+        it.east := cell_3_0.state
+        it.northwest := north_in[1]
+        it.northeast := north_in[3]
+        it.southwest := cell_1_1.state
+        it.southeast := cell_3_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[2]
+    }
+
+    mod cell_3_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[3]
+        it.south := cell_3_1.state
+        it.west := cell_2_0.state
+        it.east := cell_4_0.state
+        it.northwest := north_in[2]
+        it.northeast := north_in[4]
+        it.southwest := cell_2_1.state
+        it.southeast := cell_4_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[3]
+    }
+
+    mod cell_4_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[4]
+        it.south := cell_4_1.state
+        it.west := cell_3_0.state
+        it.east := cell_5_0.state
+        it.northwest := north_in[3]
+        it.northeast := north_in[5]
+        it.southwest := cell_3_1.state
+        it.southeast := cell_5_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[4]
+    }
+
+    mod cell_5_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[5]
+        it.south := cell_5_1.state
+        it.west := cell_4_0.state
+        it.east := cell_6_0.state
+        it.northwest := north_in[4]
+        it.northeast := north_in[6]
+        it.southwest := cell_4_1.state
+        it.southeast := cell_6_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[5]
+    }
+
+    mod cell_6_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[6]
+        it.south := cell_6_1.state
+        it.west := cell_5_0.state
+        it.east := cell_7_0.state
+        it.northwest := north_in[5]
+        it.northeast := north_in[7]
+        it.southwest := cell_5_1.state
+        it.southeast := cell_7_1.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[6]
+    }
+
+    mod cell_7_0 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := north_in[7]
+        it.south := cell_7_1.state
+        it.west := cell_6_0.state
+        it.east := east_in[0]
+        it.northwest := north_in[6]
+        it.northeast := ne_in
+        it.southwest := cell_6_1.state
+        it.southeast := east_in[1]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[7]
+    }
+
+    mod cell_0_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_0.state
+        it.south := cell_0_2.state
+        it.west := west_in[1]
+        it.east := cell_1_1.state
+        it.northwest := west_in[0]
+        it.northeast := cell_1_0.state
+        it.southwest := west_in[2]
+        it.southeast := cell_1_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[8]
+    }
+
+    mod cell_1_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_0.state
+        it.south := cell_1_2.state
+        it.west := cell_0_1.state
+        it.east := cell_2_1.state
+        it.northwest := cell_0_0.state
+        it.northeast := cell_2_0.state
+        it.southwest := cell_0_2.state
+        it.southeast := cell_2_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[9]
+    }
+
+    mod cell_2_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_0.state
+        it.south := cell_2_2.state
+        it.west := cell_1_1.state
+        it.east := cell_3_1.state
+        it.northwest := cell_1_0.state
+        it.northeast := cell_3_0.state
+        it.southwest := cell_1_2.state
+        it.southeast := cell_3_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[10]
+    }
+
+    mod cell_3_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_0.state
+        it.south := cell_3_2.state
+        it.west := cell_2_1.state
+        it.east := cell_4_1.state
+        it.northwest := cell_2_0.state
+        it.northeast := cell_4_0.state
+        it.southwest := cell_2_2.state
+        it.southeast := cell_4_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[11]
+    }
+
+    mod cell_4_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_0.state
+        it.south := cell_4_2.state
+        it.west := cell_3_1.state
+        it.east := cell_5_1.state
+        it.northwest := cell_3_0.state
+        it.northeast := cell_5_0.state
+        it.southwest := cell_3_2.state
+        it.southeast := cell_5_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[12]
+    }
+
+    mod cell_5_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_0.state
+        it.south := cell_5_2.state
+        it.west := cell_4_1.state
+        it.east := cell_6_1.state
+        it.northwest := cell_4_0.state
+        it.northeast := cell_6_0.state
+        it.southwest := cell_4_2.state
+        it.southeast := cell_6_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[13]
+    }
+
+    mod cell_6_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_0.state
+        it.south := cell_6_2.state
+        it.west := cell_5_1.state
+        it.east := cell_7_1.state
+        it.northwest := cell_5_0.state
+        it.northeast := cell_7_0.state
+        it.southwest := cell_5_2.state
+        it.southeast := cell_7_2.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[14]
+    }
+
+    mod cell_7_1 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_0.state
+        it.south := cell_7_2.state
+        it.west := cell_6_1.state
+        it.east := east_in[1]
+        it.northwest := cell_6_0.state
+        it.northeast := east_in[0]
+        it.southwest := cell_6_2.state
+        it.southeast := east_in[2]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[15]
+    }
+
+    mod cell_0_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_1.state
+        it.south := cell_0_3.state
+        it.west := west_in[2]
+        it.east := cell_1_2.state
+        it.northwest := west_in[1]
+        it.northeast := cell_1_1.state
+        it.southwest := west_in[3]
+        it.southeast := cell_1_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[16]
+    }
+
+    mod cell_1_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_1.state
+        it.south := cell_1_3.state
+        it.west := cell_0_2.state
+        it.east := cell_2_2.state
+        it.northwest := cell_0_1.state
+        it.northeast := cell_2_1.state
+        it.southwest := cell_0_3.state
+        it.southeast := cell_2_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[17]
+    }
+
+    mod cell_2_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_1.state
+        it.south := cell_2_3.state
+        it.west := cell_1_2.state
+        it.east := cell_3_2.state
+        it.northwest := cell_1_1.state
+        it.northeast := cell_3_1.state
+        it.southwest := cell_1_3.state
+        it.southeast := cell_3_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[18]
+    }
+
+    mod cell_3_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_1.state
+        it.south := cell_3_3.state
+        it.west := cell_2_2.state
+        it.east := cell_4_2.state
+        it.northwest := cell_2_1.state
+        it.northeast := cell_4_1.state
+        it.southwest := cell_2_3.state
+        it.southeast := cell_4_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[19]
+    }
+
+    mod cell_4_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_1.state
+        it.south := cell_4_3.state
+        it.west := cell_3_2.state
+        it.east := cell_5_2.state
+        it.northwest := cell_3_1.state
+        it.northeast := cell_5_1.state
+        it.southwest := cell_3_3.state
+        it.southeast := cell_5_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[20]
+    }
+
+    mod cell_5_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_1.state
+        it.south := cell_5_3.state
+        it.west := cell_4_2.state
+        it.east := cell_6_2.state
+        it.northwest := cell_4_1.state
+        it.northeast := cell_6_1.state
+        it.southwest := cell_4_3.state
+        it.southeast := cell_6_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[21]
+    }
+
+    mod cell_6_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_1.state
+        it.south := cell_6_3.state
+        it.west := cell_5_2.state
+        it.east := cell_7_2.state
+        it.northwest := cell_5_1.state
+        it.northeast := cell_7_1.state
+        it.southwest := cell_5_3.state
+        it.southeast := cell_7_3.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[22]
+    }
+
+    mod cell_7_2 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_1.state
+        it.south := cell_7_3.state
+        it.west := cell_6_2.state
+        it.east := east_in[2]
+        it.northwest := cell_6_1.state
+        it.northeast := east_in[1]
+        it.southwest := cell_6_3.state
+        it.southeast := east_in[3]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[23]
+    }
+
+    mod cell_0_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_2.state
+        it.south := cell_0_4.state
+        it.west := west_in[3]
+        it.east := cell_1_3.state
+        it.northwest := west_in[2]
+        it.northeast := cell_1_2.state
+        it.southwest := west_in[4]
+        it.southeast := cell_1_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[24]
+    }
+
+    mod cell_1_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_2.state
+        it.south := cell_1_4.state
+        it.west := cell_0_3.state
+        it.east := cell_2_3.state
+        it.northwest := cell_0_2.state
+        it.northeast := cell_2_2.state
+        it.southwest := cell_0_4.state
+        it.southeast := cell_2_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[25]
+    }
+
+    mod cell_2_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_2.state
+        it.south := cell_2_4.state
+        it.west := cell_1_3.state
+        it.east := cell_3_3.state
+        it.northwest := cell_1_2.state
+        it.northeast := cell_3_2.state
+        it.southwest := cell_1_4.state
+        it.southeast := cell_3_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[26]
+    }
+
+    mod cell_3_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_2.state
+        it.south := cell_3_4.state
+        it.west := cell_2_3.state
+        it.east := cell_4_3.state
+        it.northwest := cell_2_2.state
+        it.northeast := cell_4_2.state
+        it.southwest := cell_2_4.state
+        it.southeast := cell_4_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[27]
+    }
+
+    mod cell_4_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_2.state
+        it.south := cell_4_4.state
+        it.west := cell_3_3.state
+        it.east := cell_5_3.state
+        it.northwest := cell_3_2.state
+        it.northeast := cell_5_2.state
+        it.southwest := cell_3_4.state
+        it.southeast := cell_5_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[28]
+    }
+
+    mod cell_5_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_2.state
+        it.south := cell_5_4.state
+        it.west := cell_4_3.state
+        it.east := cell_6_3.state
+        it.northwest := cell_4_2.state
+        it.northeast := cell_6_2.state
+        it.southwest := cell_4_4.state
+        it.southeast := cell_6_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[29]
+    }
+
+    mod cell_6_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_2.state
+        it.south := cell_6_4.state
+        it.west := cell_5_3.state
+        it.east := cell_7_3.state
+        it.northwest := cell_5_2.state
+        it.northeast := cell_7_2.state
+        it.southwest := cell_5_4.state
+        it.southeast := cell_7_4.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[30]
+    }
+
+    mod cell_7_3 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_2.state
+        it.south := cell_7_4.state
+        it.west := cell_6_3.state
+        it.east := east_in[3]
+        it.northwest := cell_6_2.state
+        it.northeast := east_in[2]
+        it.southwest := cell_6_4.state
+        it.southeast := east_in[4]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[31]
+    }
+
+    mod cell_0_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_3.state
+        it.south := cell_0_5.state
+        it.west := west_in[4]
+        it.east := cell_1_4.state
+        it.northwest := west_in[3]
+        it.northeast := cell_1_3.state
+        it.southwest := west_in[5]
+        it.southeast := cell_1_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[32]
+    }
+
+    mod cell_1_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_3.state
+        it.south := cell_1_5.state
+        it.west := cell_0_4.state
+        it.east := cell_2_4.state
+        it.northwest := cell_0_3.state
+        it.northeast := cell_2_3.state
+        it.southwest := cell_0_5.state
+        it.southeast := cell_2_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[33]
+    }
+
+    mod cell_2_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_3.state
+        it.south := cell_2_5.state
+        it.west := cell_1_4.state
+        it.east := cell_3_4.state
+        it.northwest := cell_1_3.state
+        it.northeast := cell_3_3.state
+        it.southwest := cell_1_5.state
+        it.southeast := cell_3_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[34]
+    }
+
+    mod cell_3_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_3.state
+        it.south := cell_3_5.state
+        it.west := cell_2_4.state
+        it.east := cell_4_4.state
+        it.northwest := cell_2_3.state
+        it.northeast := cell_4_3.state
+        it.southwest := cell_2_5.state
+        it.southeast := cell_4_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[35]
+    }
+
+    mod cell_4_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_3.state
+        it.south := cell_4_5.state
+        it.west := cell_3_4.state
+        it.east := cell_5_4.state
+        it.northwest := cell_3_3.state
+        it.northeast := cell_5_3.state
+        it.southwest := cell_3_5.state
+        it.southeast := cell_5_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[36]
+    }
+
+    mod cell_5_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_3.state
+        it.south := cell_5_5.state
+        it.west := cell_4_4.state
+        it.east := cell_6_4.state
+        it.northwest := cell_4_3.state
+        it.northeast := cell_6_3.state
+        it.southwest := cell_4_5.state
+        it.southeast := cell_6_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[37]
+    }
+
+    mod cell_6_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_3.state
+        it.south := cell_6_5.state
+        it.west := cell_5_4.state
+        it.east := cell_7_4.state
+        it.northwest := cell_5_3.state
+        it.northeast := cell_7_3.state
+        it.southwest := cell_5_5.state
+        it.southeast := cell_7_5.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[38]
+    }
+
+    mod cell_7_4 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_3.state
+        it.south := cell_7_5.state
+        it.west := cell_6_4.state
+        it.east := east_in[4]
+        it.northwest := cell_6_3.state
+        it.northeast := east_in[3]
+        it.southwest := cell_6_5.state
+        it.southeast := east_in[5]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[39]
+    }
+
+    mod cell_0_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_4.state
+        it.south := cell_0_6.state
+        it.west := west_in[5]
+        it.east := cell_1_5.state
+        it.northwest := west_in[4]
+        it.northeast := cell_1_4.state
+        it.southwest := west_in[6]
+        it.southeast := cell_1_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[40]
+    }
+
+    mod cell_1_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_4.state
+        it.south := cell_1_6.state
+        it.west := cell_0_5.state
+        it.east := cell_2_5.state
+        it.northwest := cell_0_4.state
+        it.northeast := cell_2_4.state
+        it.southwest := cell_0_6.state
+        it.southeast := cell_2_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[41]
+    }
+
+    mod cell_2_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_4.state
+        it.south := cell_2_6.state
+        it.west := cell_1_5.state
+        it.east := cell_3_5.state
+        it.northwest := cell_1_4.state
+        it.northeast := cell_3_4.state
+        it.southwest := cell_1_6.state
+        it.southeast := cell_3_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[42]
+    }
+
+    mod cell_3_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_4.state
+        it.south := cell_3_6.state
+        it.west := cell_2_5.state
+        it.east := cell_4_5.state
+        it.northwest := cell_2_4.state
+        it.northeast := cell_4_4.state
+        it.southwest := cell_2_6.state
+        it.southeast := cell_4_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[43]
+    }
+
+    mod cell_4_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_4.state
+        it.south := cell_4_6.state
+        it.west := cell_3_5.state
+        it.east := cell_5_5.state
+        it.northwest := cell_3_4.state
+        it.northeast := cell_5_4.state
+        it.southwest := cell_3_6.state
+        it.southeast := cell_5_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[44]
+    }
+
+    mod cell_5_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_4.state
+        it.south := cell_5_6.state
+        it.west := cell_4_5.state
+        it.east := cell_6_5.state
+        it.northwest := cell_4_4.state
+        it.northeast := cell_6_4.state
+        it.southwest := cell_4_6.state
+        it.southeast := cell_6_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[45]
+    }
+
+    mod cell_6_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_4.state
+        it.south := cell_6_6.state
+        it.west := cell_5_5.state
+        it.east := cell_7_5.state
+        it.northwest := cell_5_4.state
+        it.northeast := cell_7_4.state
+        it.southwest := cell_5_6.state
+        it.southeast := cell_7_6.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[46]
+    }
+
+    mod cell_7_5 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_4.state
+        it.south := cell_7_6.state
+        it.west := cell_6_5.state
+        it.east := east_in[5]
+        it.northwest := cell_6_4.state
+        it.northeast := east_in[4]
+        it.southwest := cell_6_6.state
+        it.southeast := east_in[6]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[47]
+    }
+
+    mod cell_0_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_5.state
+        it.south := cell_0_7.state
+        it.west := west_in[6]
+        it.east := cell_1_6.state
+        it.northwest := west_in[5]
+        it.northeast := cell_1_5.state
+        it.southwest := west_in[7]
+        it.southeast := cell_1_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[48]
+    }
+
+    mod cell_1_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_5.state
+        it.south := cell_1_7.state
+        it.west := cell_0_6.state
+        it.east := cell_2_6.state
+        it.northwest := cell_0_5.state
+        it.northeast := cell_2_5.state
+        it.southwest := cell_0_7.state
+        it.southeast := cell_2_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[49]
+    }
+
+    mod cell_2_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_5.state
+        it.south := cell_2_7.state
+        it.west := cell_1_6.state
+        it.east := cell_3_6.state
+        it.northwest := cell_1_5.state
+        it.northeast := cell_3_5.state
+        it.southwest := cell_1_7.state
+        it.southeast := cell_3_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[50]
+    }
+
+    mod cell_3_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_5.state
+        it.south := cell_3_7.state
+        it.west := cell_2_6.state
+        it.east := cell_4_6.state
+        it.northwest := cell_2_5.state
+        it.northeast := cell_4_5.state
+        it.southwest := cell_2_7.state
+        it.southeast := cell_4_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[51]
+    }
+
+    mod cell_4_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_5.state
+        it.south := cell_4_7.state
+        it.west := cell_3_6.state
+        it.east := cell_5_6.state
+        it.northwest := cell_3_5.state
+        it.northeast := cell_5_5.state
+        it.southwest := cell_3_7.state
+        it.southeast := cell_5_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[52]
+    }
+
+    mod cell_5_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_5.state
+        it.south := cell_5_7.state
+        it.west := cell_4_6.state
+        it.east := cell_6_6.state
+        it.northwest := cell_4_5.state
+        it.northeast := cell_6_5.state
+        it.southwest := cell_4_7.state
+        it.southeast := cell_6_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[53]
+    }
+
+    mod cell_6_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_5.state
+        it.south := cell_6_7.state
+        it.west := cell_5_6.state
+        it.east := cell_7_6.state
+        it.northwest := cell_5_5.state
+        it.northeast := cell_7_5.state
+        it.southwest := cell_5_7.state
+        it.southeast := cell_7_7.state
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[54]
+    }
+
+    mod cell_7_6 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_5.state
+        it.south := cell_7_7.state
+        it.west := cell_6_6.state
+        it.east := east_in[6]
+        it.northwest := cell_6_5.state
+        it.northeast := east_in[5]
+        it.southwest := cell_6_7.state
+        it.southeast := east_in[7]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[55]
+    }
+
+    mod cell_0_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_0_6.state
+        it.south := south_in[0]
+        it.west := west_in[7]
+        it.east := cell_1_7.state
+        it.northwest := west_in[6]
+        it.northeast := cell_1_6.state
+        it.southwest := sw_in
+        it.southeast := south_in[1]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[56]
+    }
+
+    mod cell_1_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_1_6.state
+        it.south := south_in[1]
+        it.west := cell_0_7.state
+        it.east := cell_2_7.state
+        it.northwest := cell_0_6.state
+        it.northeast := cell_2_6.state
+        it.southwest := south_in[0]
+        it.southeast := south_in[2]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[57]
+    }
+
+    mod cell_2_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_2_6.state
+        it.south := south_in[2]
+        it.west := cell_1_7.state
+        it.east := cell_3_7.state
+        it.northwest := cell_1_6.state
+        it.northeast := cell_3_6.state
+        it.southwest := south_in[1]
+        it.southeast := south_in[3]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[58]
+    }
+
+    mod cell_3_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_3_6.state
+        it.south := south_in[3]
+        it.west := cell_2_7.state
+        it.east := cell_4_7.state
+        it.northwest := cell_2_6.state
+        it.northeast := cell_4_6.state
+        it.southwest := south_in[2]
+        it.southeast := south_in[4]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[59]
+    }
+
+    mod cell_4_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_4_6.state
+        it.south := south_in[4]
+        it.west := cell_3_7.state
+        it.east := cell_5_7.state
+        it.northwest := cell_3_6.state
+        it.northeast := cell_5_6.state
+        it.southwest := south_in[3]
+        it.southeast := south_in[5]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[60]
+    }
+
+    mod cell_5_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_5_6.state
+        it.south := south_in[5]
+        it.west := cell_4_7.state
+        it.east := cell_6_7.state
+        it.northwest := cell_4_6.state
+        it.northeast := cell_6_6.state
+        it.southwest := south_in[4]
+        it.southeast := south_in[6]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[61]
+    }
+
+    mod cell_6_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_6_6.state
+        it.south := south_in[6]
+        it.west := cell_5_7.state
+        it.east := cell_7_7.state
+        it.northwest := cell_5_6.state
+        it.northeast := cell_7_6.state
+        it.southwest := south_in[5]
+        it.southeast := south_in[7]
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[62]
+    }
+
+    mod cell_7_7 of LifeCell {
+        it.clock := clock
+        it.reset := reset
+        it.north := cell_7_6.state
+        it.south := south_in[7]
+        it.west := cell_6_7.state
+        it.east := east_in[7]
+        it.northwest := cell_6_6.state
+        it.northeast := east_in[6]
+        it.southwest := south_in[6]
+        it.southeast := se_in
+        it.advance := advance
+        it.load_seed := randomize
+        it.seed_bit := lfsr[63]
+    }
+
+
+    state_grid := word(
+        cell_7_7.state, cell_6_7.state, cell_5_7.state, cell_4_7.state, cell_3_7.state, cell_2_7.state, cell_1_7.state, cell_0_7.state,
+        cell_7_6.state, cell_6_6.state, cell_5_6.state, cell_4_6.state, cell_3_6.state, cell_2_6.state, cell_1_6.state, cell_0_6.state,
+        cell_7_5.state, cell_6_5.state, cell_5_5.state, cell_4_5.state, cell_3_5.state, cell_2_5.state, cell_1_5.state, cell_0_5.state,
+        cell_7_4.state, cell_6_4.state, cell_5_4.state, cell_4_4.state, cell_3_4.state, cell_2_4.state, cell_1_4.state, cell_0_4.state,
+        cell_7_3.state, cell_6_3.state, cell_5_3.state, cell_4_3.state, cell_3_3.state, cell_2_3.state, cell_1_3.state, cell_0_3.state,
+        cell_7_2.state, cell_6_2.state, cell_5_2.state, cell_4_2.state, cell_3_2.state, cell_2_2.state, cell_1_2.state, cell_0_2.state,
+        cell_7_1.state, cell_6_1.state, cell_5_1.state, cell_4_1.state, cell_3_1.state, cell_2_1.state, cell_1_1.state, cell_0_1.state,
+        cell_7_0.state, cell_6_0.state, cell_5_0.state, cell_4_0.state, cell_3_0.state, cell_2_0.state, cell_1_0.state, cell_0_0.state
+    )
+
+    north_out := word(cell_7_0.state, cell_6_0.state, cell_5_0.state, cell_4_0.state, cell_3_0.state, cell_2_0.state, cell_1_0.state, cell_0_0.state)
+    south_out := word(cell_7_7.state, cell_6_7.state, cell_5_7.state, cell_4_7.state, cell_3_7.state, cell_2_7.state, cell_1_7.state, cell_0_7.state)
+    west_out  := word(cell_0_7.state, cell_0_6.state, cell_0_5.state, cell_0_4.state, cell_0_3.state, cell_0_2.state, cell_0_1.state, cell_0_0.state)
+    east_out  := word(cell_7_7.state, cell_7_6.state, cell_7_5.state, cell_7_4.state, cell_7_3.state, cell_7_2.state, cell_7_1.state, cell_7_0.state)
+
+    nw_out := cell_0_0.state
+    ne_out := cell_7_0.state
+    sw_out := cell_0_7.state
+    se_out := cell_7_7.state
+}

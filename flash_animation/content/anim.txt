@@ -1,0 +1,26 @@
+# Bouncing chaser for the iCEstick's five green LEDs.
+#
+# One tick is 2^17 clock cycles, about 10.9 ms at 12 MHz.
+# Bit 0 of a pattern is LED 1; bit 4 is LED 5.
+# A pause holds the current pattern for 0.25 to 1.00 seconds.
+
+loop:
+    set 0b00001
+    wait 1
+    set 0b00010
+    wait 1
+    set 0b00100
+    wait 1
+    set 0b01000
+    wait 1
+    set 0b10000      # reach the far end
+    wait 1
+    pause 0.25       # short beat at the turn
+    set 0b01000
+    wait 1
+    set 0b00100
+    wait 1
+    set 0b00010
+    wait 1
+    pause 1.00       # let the last frame linger, then start over
+    jump loop

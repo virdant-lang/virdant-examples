@@ -1,0 +1,68 @@
+//! Flash-driven LED animation for the iCEstick board.
+//!
+//! The design plays a tiny bytecode "movie" for the five green LEDs
+//! straight out of the SPI configuration flash, at offset 0x040000
+//! (256 KiB, well above the bitstream).  Upload the bitstream with
+//! `make upload`, program the animation with `make upload-content`,
+//! and the board plays whatever the flash says -- change the show
+//! by reprogramming flash content, no rebuild required.
+//!
+//! Without content in the flash (missing magic byte) the board
+//! falls back to a built-in knight-rider sweep.
+//!
+//! See `src/anim.vir` for the bytecode format and `content/anim.txt`
+//! for the animation this project ships with.
+
+import ice40
+import anim
+
+mod Top for ice40::IceStick {
+    incoming clock : Clock
+
+    // UART pins are unused by this design; the line idles high.
+    incoming uart_rx : Bit { unused it }
+    outgoing uart_tx : Bit { it := true }
+
+    // User LEDs D1-D5.
+    outgoing led1 : Bit
+    outgoing led2 : Bit
+    outgoing led3 : Bit
+    outgoing led4 : Bit
+    outgoing led5 : Bit
+
+    // SPI flash, driven by the animation player.
+    outgoing flash_cs   : Bit
+    outgoing flash_clk  : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    // Power-on reset.  iCE40 registers power up at zero, so the
+    // counter starts at 0 and runs up to its max, holding `reset`
+    // high for the first 2^16 cycles (~5.5 ms at 12 MHz) before
+    // releasing the design into normal operation.
+    reg reset_counter : Word[16] on clock {
+        when {
+            case it != 0xFFFF { it <= it + 1w16 }
+        }
+    }
+
+    wire reset : Reset {
+        it := reset_counter != 0xFFFF
+    }
+
+    mod player of anim::AnimationPlayer {
+        it.clock := clock
+        it.reset := reset
+        it.flash_miso := flash_miso
+    }
+
+    flash_cs   := player.flash_cs
+    flash_clk  := player.flash_sck
+    flash_mosi := player.flash_mosi
+
+    led1 := player.leds[0]
+    led2 := player.leds[1]
+    led3 := player.leds[2]
+    led4 := player.leds[3]
+    led5 := player.leds[4]
+}

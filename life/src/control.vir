@@ -1,0 +1,282 @@
+//! Key decode, run/pause, speed, and the tick scheduler.
+//!
+//! `KeyboardControl` describes what the *user* wants -- it never
+//! touches the grid directly.  It drives three pulses into the rest
+//! of the design: `advance` and `randomize` (one-cycle pulses into
+//! `LifeBlock`) and `draw` (one-cycle pulse into `Vt100Renderer`),
+//! sequenced so a render is always in flight or complete before the
+//! engine moves again.
+//!
+//! A single three-state sequencer (`Idle -> IssueEngine ->
+//! WaitRenderIdle -> IssueDraw`) issues all of this work.  It has
+//! four triggers, checked in priority order: boot (once, at power
+//! on: randomize plus one frame, paused), `R` (randomize), `space`
+//! (single step), and the periodic tick while running.  `LifeBlock`
+//! has no `busy`, so only the renderer gates the sequencer.
+
+import uart
+
+//> States of the four-trigger work sequencer.
+//>
+//> `Idle`          - waiting for a pending request
+//> `IssueEngine`   - pulse `advance` or `randomize` for one cycle
+//> `WaitRenderIdle`- wait for the renderer to be free
+//> `IssueDraw`     - pulse `draw` for one cycle
+//>
+//> `first_frame` threads through unchanged; it is true only for the
+//> boot request, and tells the renderer to run its clear-screen
+//> preamble.
+union type SeqState {
+    Idle()
+    IssueEngine(randomize_op : Bit, first_frame : Bit)
+    WaitRenderIdle(first_frame : Bit)
+    IssueDraw(first_frame : Bit)
+}
+
+//> Decodes terminal keys into run/pause, speed, single-step, and
+//> randomize requests, and schedules the engine/render work that
+//> satisfies them.
+mod KeyboardControl {
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Keys typed at the terminal.
+    server socket inp of uart::UartByte {
+        it.ready := true
+    }
+
+    //> High while `Vt100Renderer` is mid-frame.
+    incoming render_busy : Bit
+
+    //> One-cycle pulse: advance `LifeBlock` by one generation.
+    outgoing advance : Bit
+    //> One-cycle pulse: reseed `LifeBlock` from its LFSR.
+    outgoing randomize : Bit
+    //> One-cycle pulse: ask `Vt100Renderer` to emit one frame.
+    outgoing draw : Bit
+    //> True only for the boot frame (clear screen, hide cursor).
+    outgoing first_frame : Bit
+
+    //> Running (lit LED) or paused (dark LED).
+    outgoing running : Bit
+    //> Current speed level, 0 (slowest) to 15 (fastest).
+    outgoing speed_level : Word[4]
+
+    running := running_reg
+    speed_level := speed_level_reg
+
+    // -- Key decode -----------------------------------------------------
+    wire key_byte : Word[8] {
+        it := match inp.data {
+            case @Valid(byte) => byte
+            case @Invalid() => 0w8
+        }
+    }
+    wire key_fires : Bit {
+        it := match inp.data {
+            case @Valid(dontcare) => true
+            case @Invalid() => false
+        }
+    }
+
+    // Letters are matched in either case; everything else is a
+    // single fixed code point.
+    wire key_is_s     : Bit { it := key_byte == 0x53 || key_byte == 0x73 }
+    wire key_is_r     : Bit { it := key_byte == 0x52 || key_byte == 0x72 }
+    wire key_is_space : Bit { it := key_byte == 0x20 }
+    wire key_is_minus : Bit { it := key_byte == 0x2d }
+    wire key_is_plus  : Bit { it := key_byte == 0x3d || key_byte == 0x2b }
+    wire key_is_zero  : Bit { it := key_byte == 0x30 }
+
+    reg running_reg : Bit on clock {
+        when {
+            case reset { it <= false }
+            case key_fires && key_is_s { it <= !it }
+        }
+    }
+
+    reg speed_level_reg : Word[4] on clock {
+        when {
+            case reset { it <= 8w4 }
+            case key_fires && key_is_minus { it <= mux(it == 0, it, it - 1) }
+            case key_fires && key_is_plus  { it <= mux(it == 15, it, it + 1) }
+            case key_fires && key_is_zero  { it <= 8w4 }
+        }
+    }
+
+    // -- Pending-request flags ------------------------------------------
+    // Priority at `Idle`, highest first: boot, randomize, step, tick.
+    //
+    // Gating on `!render_busy` too (not just `seq_idle`) matters: the
+    // sequencer returns to `Idle` the cycle right after it pulses
+    // `draw`, which is also the cycle the renderer's own busy flag
+    // first goes high in response.  Without this, a tick that was
+    // already pending would be consumed immediately -- issuing a
+    // second `advance` while the first frame is still mid-draw, and
+    // tearing it (half the rows old generation, half the next).
+    wire ready_for_request : Bit {
+        it := match seq_state {
+            case @Idle() => !render_busy
+            else => false
+        }
+    }
+
+    wire consume_boot : Bit {
+        it := ready_for_request && boot_pending
+    }
+    wire consume_randomize : Bit {
+        it := ready_for_request && !boot_pending && randomize_pending
+    }
+    wire consume_step : Bit {
+        it := ready_for_request && !boot_pending && !randomize_pending && step_pending
+    }
+    wire consume_tick : Bit {
+        it := ready_for_request && !boot_pending && !randomize_pending && !step_pending && tick_pending
+    }
+
+    //> One-shot: set at power on, consumed by the first boot request.
+    reg boot_pending : Bit on clock {
+        when {
+            case reset { it <= true }
+            case consume_boot { it <= false }
+        }
+    }
+
+    //> Set by `R`; cleared once the sequencer issues the reseed.
+    reg randomize_pending : Bit on clock {
+        when {
+            case reset { it <= false }
+            case key_fires && key_is_r { it <= true }
+            case consume_randomize { it <= false }
+        }
+    }
+
+    //> Set by `space`; cleared once the sequencer issues the step.
+    reg step_pending : Bit on clock {
+        when {
+            case reset { it <= false }
+            case key_fires && key_is_space { it <= true }
+            case consume_step { it <= false }
+        }
+    }
+
+    //> Set on each tick while running (edges while paused, including
+    //> spurious ones from a `speed_level` change mid-pause, never
+    //> set it); cleared on pause, on `R` (which supersedes any
+    //> pending tick), or once consumed.
+    reg tick_pending : Bit on clock {
+        when {
+            case reset { it <= false }
+            case key_fires && key_is_r { it <= false }
+            case key_fires && key_is_s && running_reg { it <= false }
+            case consume_tick { it <= false }
+            case tick_edge && running_reg { it <= true }
+        }
+    }
+
+    // -- Tick scheduler ---------------------------------------------------
+    // A divide-by-3 prescaler brings the 12 MHz system clock down to
+    // 4 MHz; a 30-bit free-running counter on that enable is wide
+    // enough that `speed_level` can select any bit from 13 to 28.
+    reg prescaler : Word[2] on clock {
+        it <= mux(reset || it == 2, 0w2, it + 1)
+    }
+
+    wire prescaler_tick : Bit {
+        it := prescaler == 2
+    }
+
+    //> Restarts on resume, and whenever the speed level changes: the
+    //> selected counter bit changes identity with the level, so
+    //> holding old bits across a change could otherwise register as
+    //> a spurious edge.
+    reg tick_counter : Word[30] on clock {
+        when {
+            case reset { it <= 0 }
+            case key_fires && key_is_s && !running_reg { it <= 0 }
+            case key_fires && (key_is_minus || key_is_plus || key_is_zero) { it <= 0 }
+            case prescaler_tick { it <= it + 1 }
+        }
+    }
+
+    // `speed_level` 0..15 selects counter bit 28..13: level 8 picks
+    // bit 20, whose rising edges land every 2^21 / 4 MHz =~ 0.52 s.
+    wire selected_bit : Bit {
+        it := match speed_level_reg {
+            case 0  => tick_counter[28]
+            case 1  => tick_counter[27]
+            case 2  => tick_counter[26]
+            case 3  => tick_counter[25]
+            case 4  => tick_counter[24]
+            case 5  => tick_counter[23]
+            case 6  => tick_counter[22]
+            case 7  => tick_counter[21]
+            case 8  => tick_counter[20]
+            case 9  => tick_counter[19]
+            case 10 => tick_counter[18]
+            case 11 => tick_counter[17]
+            case 12 => tick_counter[16]
+            case 13 => tick_counter[15]
+            case 14 => tick_counter[14]
+            case 15 => tick_counter[13]
+        }
+    }
+
+    reg prev_selected_bit : Bit on clock {
+        when {
+            case reset { it <= false }
+            else { it <= selected_bit }
+        }
+    }
+
+    wire tick_edge : Bit {
+        it := selected_bit && !prev_selected_bit
+    }
+
+    // -- The work sequencer -----------------------------------------------
+    reg seq_state : SeqState on clock
+    when {
+        case reset { seq_state <= @Idle() }
+        else match seq_state {
+            case @Idle() {
+                when {
+                    case consume_boot      { seq_state <= @IssueEngine(true, true) }
+                    case consume_randomize { seq_state <= @IssueEngine(true, false) }
+                    case consume_step      { seq_state <= @IssueEngine(false, false) }
+                    case consume_tick      { seq_state <= @IssueEngine(false, false) }
+                }
+            }
+            case @IssueEngine(randomize_op, first_frame) {
+                seq_state <= @WaitRenderIdle(first_frame)
+            }
+            case @WaitRenderIdle(first_frame) {
+                when {
+                    case !render_busy { seq_state <= @IssueDraw(first_frame) }
+                }
+            }
+            case @IssueDraw(dontcare) {
+                seq_state <= @Idle()
+            }
+        }
+    }
+
+    advance := match seq_state {
+        case @IssueEngine(randomize_op, dontcare) => !randomize_op
+        else => false
+    }
+
+    randomize := match seq_state {
+        case @IssueEngine(randomize_op, dontcare) => randomize_op
+        else => false
+    }
+
+    draw := match seq_state {
+        case @IssueDraw(dontcare) => true
+        else => false
+    }
+
+    first_frame := match seq_state {
+        case @IssueDraw(frame_is_first) => frame_is_first
+        else => false
+    }
+}

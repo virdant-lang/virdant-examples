@@ -1,0 +1,294 @@
+//! UART sender and receiver (8 data bits, no parity, one stop bit).
+//!
+//! Both modules assume a 12 MHz system clock.
+//! With `cycles_per_bit` set to 104, the line rate is 115200 baud.
+//!
+//! A byte enters the sender and leaves the receiver through the
+//! `UartByte` socket, a single-byte channel with valid/ready
+//! handshaking.
+
+//> A single-byte UART data channel with valid/ready handshaking.
+//>
+//> `data` carries the byte being transferred.
+//> `ready` is high when the receiving side can accept it.
+socket UartByte {
+    cosi data : Valid[Word[8]]
+    soci ready : Bit
+}
+
+//> State shared by `UartSender` and `UartReceiver`.
+//>
+//> `Idle`  - no frame in progress (line idle)
+//> `Start` - handling the start bit
+//> `Data`  - sending or receiving the eight data bits
+//> `Stop`  - handling the stop bit
+union type UartState {
+    Idle()
+    Start()
+    Data()
+    Stop()
+}
+
+//> Serializes one byte at a time onto the `tx` line.
+//>
+//> A byte is accepted through the `inp` socket whenever the sender is
+//> idle.  It is then framed as: start bit (0), eight data bits
+//> least-significant first, and one stop bit (1).
+//> Each bit lasts `cycles_per_bit` clock cycles.
+@baud(115200)
+mod UartSender {
+    @frequency("12 MHz")
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Byte to transmit, accepted when `inp.ready` is high.
+    server socket inp of UartByte {
+        it.ready := is_idle
+    }
+
+    //> Serial output (idles high).
+    outgoing tx   : Bit
+    //> High while a frame is being transmitted.
+    outgoing busy : Bit
+
+    //> Clocks per bit; 104 gives 115200 baud at 12 MHz.
+    wire cycles_per_bit : Word[16] {
+        it := 104
+    }
+
+    reg state        : UartState on clock
+    reg bit_index    : Word[4]  on clock
+    reg baud_counter : Word[16] on clock
+    reg shift        : Word[8]  on clock
+
+    wire is_idle : Bit {
+        it := match state {
+            case @Idle() => true
+            else => false
+        }
+    }
+
+    wire baud_tick : Bit {
+        it := baud_counter == (cycles_per_bit - 1)
+    }
+
+    tx := match state {
+        case @Idle()  => true
+        case @Start() => false
+        case @Data()  => shift[0]
+        case @Stop()  => true
+    }
+
+    busy := match state {
+        case @Idle() => false
+        else => true
+    }
+
+    when {
+        case reset {
+            state <= @Idle()
+            bit_index <= 0
+            baud_counter <= 0
+            shift <= 0w8
+        }
+        else match state {
+            case @Idle() {
+                // Latch the byte and begin the start bit.
+                match inp.data {
+                    case @Valid(payload) {
+                        shift <= payload
+                        state <= @Start()
+                    }
+                }
+            }
+            case @Start() {
+                when {
+                    case baud_tick {
+                        state <= @Data()
+                        bit_index <= 0
+                        baud_counter <= 0
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+            case @Data() {
+                when {
+                    case baud_tick {
+                        baud_counter <= 0
+                        when {
+                            case bit_index == 7 {
+                                state <= @Stop()
+                            }
+                            else {
+                                bit_index <= bit_index + 1
+                                // Shift the next bit into the LSB position.
+                                shift <= word(0w1, shift[8..1])
+                            }
+                        }
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+            case @Stop() {
+                when {
+                    case baud_tick {
+                        state <= @Idle()
+                        baud_counter <= 0
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+        }
+    }
+}
+
+//> Deserializes bytes from the `rx` line.
+//>
+//> The `rx` line is double-registered for metastability.  A falling
+//> edge starts a frame; the start bit is checked at its midpoint to
+//> reject glitches, then each data bit is sampled at the middle of its
+//> bit period.  Completed bytes appear on the `out` socket and are held
+//> valid until the consumer accepts them.
+@baud(115200)
+mod UartReceiver {
+    @frequency("12 MHz")
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Serial input (idles high).
+    incoming rx : Bit
+
+    //> Bytes recovered from the line.
+    client socket out of UartByte {
+        it.data := when {
+            case data_valid => @Valid(data_reg)
+            else => @Invalid()
+        }
+    }
+
+    //> Clocks per bit; 104 gives 115200 baud at 12 MHz.
+    wire cycles_per_bit : Word[16] {
+        it := 104
+    }
+    //> Half a bit period, used to reach the middle of the start bit.
+    wire half_period : Word[16] {
+        it := 52
+    }
+
+    reg state        : UartState on clock
+    reg bit_index    : Word[4]  on clock
+    reg baud_counter : Word[16] on clock
+    reg shift        : Word[8]  on clock
+
+    // Synchronize the asynchronous input using the builtin Sync module.
+    mod rx_sync of Sync {
+        it.inp := rx
+        it.clock := clock
+    }
+
+    // True on the cycle the stop bit is sampled at its midpoint.
+    wire rx_done : Bit {
+        it := match state {
+            case @Stop() => baud_counter == (cycles_per_bit - 1)
+            else => false
+        }
+    }
+
+    // The consumer accepts a byte when it asserts `out.ready`.
+    wire out_fires : Bit {
+        it := data_valid && out.ready
+    }
+
+    when {
+        case reset {
+            state <= @Idle()
+            bit_index <= 0
+            baud_counter <= 0
+            shift <= 0w8
+        }
+        else match state {
+            case @Idle() {
+                // A low on the line marks the start of a frame.
+                when {
+                    case !rx_sync.out {
+                        state <= @Start()
+                    }
+                }
+            }
+            case @Start() {
+                when {
+                    case baud_counter == (half_period - 1) {
+                        // Confirm the start bit is still low at its middle.
+                        when {
+                            case !rx_sync.out {
+                                state <= @Data()
+                                bit_index <= 0
+                                shift <= 0w8
+                                baud_counter <= 0
+                            }
+                            else {
+                                state <= @Idle()
+                            }
+                        }
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+            case @Data() {
+                when {
+                    case baud_counter == (cycles_per_bit - 1) {
+                        // Sample at the middle of the bit, MSB-first shift
+                        // so the first bit received lands in the LSB.
+                        shift <= word(rx_sync.out, shift[8..1])
+                        baud_counter <= 0
+                        when {
+                            case bit_index == 7 {
+                                state <= @Stop()
+                            }
+                            else {
+                                bit_index <= bit_index + 1
+                            }
+                        }
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+            case @Stop() {
+                when {
+                    case baud_counter == (cycles_per_bit - 1) {
+                        state <= @Idle()
+                        baud_counter <= 0
+                    }
+                    else {
+                        baud_counter <= baud_counter + 1
+                    }
+                }
+            }
+        }
+    }
+
+    reg data_reg : Word[8] on clock {
+        when {
+            case reset { it <= 0w8 }
+            case rx_done { it <= shift }
+        }
+    }
+
+    reg data_valid : Bit on clock {
+        when {
+            case reset { it <= false }
+            case rx_done { it <= true }
+            case out_fires { it <= false }
+        }
+    }
+}

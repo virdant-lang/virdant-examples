@@ -1,0 +1,221 @@
+# Showcase -- a medley in five movements for the iCEstick's LEDs.
+#
+# bit 0 of a pattern is LED 1; bit 4 is LED 5.
+# One tick is 2^17 clock cycles, about 10.9 ms at 12 MHz.
+# A pause holds the current pattern for 0.25 to 1.00 seconds.
+# `pause 0.25` lets the next frame follow as fast as the player can
+# fetch it, which reads as a shimmer on the real board.
+
+loop:
+
+    # I. Warm-up: a slow solo walk, pausing on every step.
+    set 0b00001
+    pause 0.25
+    set 0b00010
+    pause 0.25
+    set 0b00100
+    pause 0.50
+    set 0b01000
+    pause 0.25
+    set 0b10000
+    pause 0.75
+
+    # II. The chase: knight-rider sweeps that accelerate to a blur.
+    set 0b01000
+    wait 2
+    set 0b00100
+    wait 2
+    set 0b00010
+    wait 2
+    set 0b00001
+    wait 1
+    set 0b00010
+    wait 1
+    set 0b00100
+    wait 1
+    set 0b01000
+    wait 1
+    set 0b10000
+    wait 1
+    set 0b01000
+    wait 1
+    set 0b00100
+    wait 1
+    set 0b00010
+    wait 1
+    set 0b00001
+    wait 1
+    set 0b00010
+    pause 0.25
+    set 0b00100
+    pause 0.25
+    set 0b01000
+    pause 0.25
+    set 0b10000
+    pause 0.50
+
+    # III. Convergence: the edges close on the middle, then release.
+    set 0b10001
+    wait 2
+    set 0b01010
+    wait 2
+    set 0b00100
+    pause 0.75
+    set 0b01010
+    wait 1
+    set 0b10001
+    wait 1
+    set 0b00000
+    pause 0.25
+
+    # IV. Binary count-up: the LEDs count 1 to 31, accelerating
+    # from a dignified pace to a strobe.
+    set 0b00001
+    wait 2
+    set 0b00010
+    wait 2
+    set 0b00011
+    wait 2
+    set 0b00100
+    wait 2
+    set 0b00101
+    wait 2
+    set 0b00110
+    wait 2
+    set 0b00111
+    wait 2
+    set 0b01000
+    wait 1
+    set 0b01001
+    wait 1
+    set 0b01010
+    wait 1
+    set 0b01011
+    wait 1
+    set 0b01100
+    wait 1
+    set 0b01101
+    wait 1
+    set 0b01110
+    wait 1
+    set 0b01111
+    wait 1
+    set 0b10000
+    pause 0.25
+    set 0b10001
+    pause 0.25
+    set 0b10010
+    pause 0.25
+    set 0b10011
+    pause 0.25
+    set 0b10100
+    pause 0.25
+    set 0b10101
+    pause 0.25
+    set 0b10110
+    pause 0.25
+    set 0b10111
+    pause 0.25
+    set 0b11000
+    pause 0.25
+    set 0b11001
+    pause 0.25
+    set 0b11010
+    pause 0.25
+    set 0b11011
+    pause 0.25
+    set 0b11100
+    pause 0.25
+    set 0b11101
+    pause 0.25
+    set 0b11110
+    pause 0.25
+    set 0b11111
+    wait 1
+
+    # V. Count-down and finale: 31 falls back to zero at full
+    # speed, decelerating into a strobe, a held breath, and a
+    # heartbeat before the show starts over.
+    set 0b11110
+    pause 0.25
+    set 0b11101
+    pause 0.25
+    set 0b11100
+    pause 0.25
+    set 0b11011
+    pause 0.25
+    set 0b11010
+    pause 0.25
+    set 0b11001
+    pause 0.25
+    set 0b11000
+    pause 0.25
+    set 0b10111
+    pause 0.25
+    set 0b10110
+    pause 0.25
+    set 0b10101
+    pause 0.25
+    set 0b10100
+    pause 0.25
+    set 0b10011
+    pause 0.25
+    set 0b10010
+    pause 0.25
+    set 0b10001
+    pause 0.25
+    set 0b10000
+    pause 0.25
+    set 0b01111
+    pause 0.25
+    set 0b01110
+    wait 1
+    set 0b01101
+    wait 1
+    set 0b01100
+    wait 1
+    set 0b01011
+    wait 1
+    set 0b01010
+    wait 1
+    set 0b01001
+    wait 1
+    set 0b01000
+    wait 1
+    set 0b00111
+    wait 1
+    set 0b00110
+    wait 1
+    set 0b00101
+    wait 1
+    set 0b00100
+    wait 1
+    set 0b00010
+    wait 1
+    set 0b00001
+    wait 1
+    set 0b00000
+    pause 0.25
+
+    # The finale: strobe, hold everything, then a heartbeat.
+    set 0b11111
+    wait 1
+    set 0b00000
+    wait 1
+    set 0b11111
+    wait 1
+    set 0b00000
+    wait 1
+    set 0b11111
+    pause 1.00
+    set 0b00000
+    wait 1
+    set 0b11111
+    pause 0.25
+    set 0b00000
+    wait 1
+    set 0b11111
+    pause 0.25
+    set 0b00000
+    pause 0.75
+    jump loop

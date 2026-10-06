@@ -1,0 +1,120 @@
+//! Conway's Game of Life for the iCEstick -- one circuit per cell.
+//!
+//! An 8x8 Game of Life world where the B3/S23 rule is hardware in
+//! every cell (see `src/life.vir`).  The world plays out on a VT100
+//! terminal over the iCEstick's USB UART at 115200 baud, with
+//! keyboard control: `S` to run/pause, space to single-step, `-`
+//! `=`/`+` and `0` for speed, and `R` to randomize.  See
+//! `src/control.vir` for the key table and `src/render.vir` for the
+//! screen layout.
+//!
+//! The torus wrap -- the only place the world's topology exists --
+//! is eight wires below, folding `LifeBlock`'s exposed boundary back
+//! onto itself.
+
+import ice40
+import uart
+import life
+import render
+import control
+
+mod Top for ice40::IceStick {
+    incoming clock : Clock
+
+    incoming uart_rx : Bit
+    outgoing uart_tx : Bit
+
+    // User LEDs D1-D5: led1..led4 are the speed level (binary, bit 0
+    // on led1), led5 is running (lit) / paused (dark).
+    outgoing led1 : Bit
+    outgoing led2 : Bit
+    outgoing led3 : Bit
+    outgoing led4 : Bit
+    outgoing led5 : Bit
+
+    // SPI flash (unused by this design).
+    outgoing flash_cs   : Bit
+    outgoing flash_clk  : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    // Power-on reset.  iCE40 registers power up at zero, so the
+    // counter starts at 0 and runs up to its max, holding `reset`
+    // high for the first 2^16 cycles (~5.5 ms at 12 MHz) before
+    // releasing the design into normal operation.
+    reg reset_counter : Word[16] on clock {
+        when {
+            case it != 0xFFFF { it <= it + 1w16 }
+        }
+    }
+
+    wire reset : Reset {
+        it := reset_counter != 0xFFFF
+    }
+
+    mod receiver of uart::UartReceiver {
+        it.clock := clock
+        it.reset := reset
+        it.rx    := uart_rx
+    }
+
+    mod sender of uart::UartSender {
+        it.clock := clock
+        it.reset := reset
+        unused it.busy
+    }
+
+    uart_tx := sender.tx
+
+    mod grid of life::LifeBlock {
+        it.clock := clock
+        it.reset := reset
+        it.advance   := keyboard.advance
+        it.randomize := keyboard.randomize
+    }
+
+    // The torus wrap: row 7 wraps above row 0, column 7 wraps beside
+    // column 0, and the diagonal corners wrap to their opposite
+    // corner.  This is the only place the world's topology exists;
+    // `LifeBlock` itself has no wrap logic at all.
+    grid.north_in := grid.south_out
+    grid.south_in := grid.north_out
+    grid.west_in  := grid.east_out
+    grid.east_in  := grid.west_out
+    grid.nw_in    := grid.se_out
+    grid.ne_in    := grid.sw_out
+    grid.sw_in    := grid.ne_out
+    grid.se_in    := grid.nw_out
+
+    mod renderer of render::Vt100Renderer {
+        it.clock := clock
+        it.reset := reset
+        it.draw         := keyboard.draw
+        it.first_frame  := keyboard.first_frame
+        it.state_grid   := grid.state_grid
+        it.running      := keyboard.running
+        it.speed_level  := keyboard.speed_level
+        it.generation   := grid.generation
+    }
+
+    renderer.out :=: sender.inp
+
+    mod keyboard of control::KeyboardControl {
+        it.clock := clock
+        it.reset := reset
+        it.render_busy := renderer.busy
+    }
+
+    keyboard.inp :=: receiver.out
+
+    led1 := keyboard.speed_level[0]
+    led2 := keyboard.speed_level[1]
+    led3 := keyboard.speed_level[2]
+    led4 := keyboard.speed_level[3]
+    led5 := keyboard.running
+
+    flash_cs := true
+    flash_clk := false
+    flash_mosi := false
+    unused flash_miso
+}
