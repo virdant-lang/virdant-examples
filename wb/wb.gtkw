@@ -1,31 +1,31 @@
 [*]
 [*] GTKWave Analyzer v3.3.121 (w)1999-2024 BSI
-[*] Sun Oct 18 14:58:02 2026
+[*] Sun Oct 18 15:29:38 2026
 [*]
 [dumpfile] "/home/vircodificat/projects/virdant-examples/wb/build/tb.vcd"
-[dumpfile_mtime] "Sun Oct 18 14:57:44 2026"
-[dumpfile_size] 5571
+[dumpfile_mtime] "Sun Oct 18 15:29:24 2026"
+[dumpfile_size] 26483235
 [savefile] "/home/vircodificat/projects/virdant-examples/wb/wb.gtkw"
-[timestart] 7400
-[size] 1440 881
+[timestart] 0
+[size] 1317 808
 [pos] -1 -1
-*-15.000000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+*-34.000000 72919 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
 [treeopen] Tb.
 [sst_width] 278
 [signals_width] 214
 [sst_expanded] 1
-[sst_vpaned_height] 255
-@29
-Tb.wb.clock
+[sst_vpaned_height] 228
 @28
-Tb.dut.\wishbone.cyc
-Tb.dut.\wishbone.stb
-Tb.dut.\wishbone.we
+Tb.clock
+Tb.cyc
+@23
+Tb.addr[31:0]
 @22
-Tb.dut.\wishbone.addr[31:0]
-Tb.dut.\wishbone.wr_data[31:0]
-Tb.dut.\wishbone.rd_data[31:0]
+Tb.rd_data[31:0]
+Tb.wr_data[31:0]
 @28
-Tb.dut.\wishbone.ack
+Tb.we
+Tb.rx
+Tb.tx
 [pattern_trace] 1
 [pattern_trace] 0

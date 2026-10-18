@@ -1,13 +1,4 @@
-socket Wishbone {
-    cosi cyc : Bit
-    cosi stb : Bit
-    cosi we : Bit
-    cosi addr : Word[32]
-    cosi wr_data : Word[32]
-
-    soci ack : Bit
-    soci rd_data : Word[32]
-}
+import wishbone
 
 ext mod Memory {
     incoming clock : Clock
@@ -20,7 +11,7 @@ ext mod Memory {
 mod WishboneMemory {
     incoming clock : Clock
 
-    server socket wishbone of Wishbone {
+    server socket wishbone of wishbone::Wishbone {
         it.ack := ack
         it.rd_data := memory.rd_data
     }

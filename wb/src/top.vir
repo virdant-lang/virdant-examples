@@ -1,12 +1,23 @@
-import wishbone_memory
+//! Top-level wrapper exposing the NS8520 UART on the Wishbone bus.
+
+import ns8520
+import wishbone
 
 export mod Top {
     incoming clock : Clock
+    incoming reset : Bit
+    incoming rx : Bit
+    outgoing tx : Bit
+    outgoing uart_clock : Bit
 
-    server socket wishbone of wishbone_memory::Wishbone
+    server socket wishbone of wishbone::Wishbone
 
-    mod wishbone_memory of wishbone_memory::WishboneMemory {
+    mod ns8520 of ns8520::Ns8520 {
         it.clock := clock
+        it.reset := reset
+        it.rx := rx
+        tx := it.tx
+        uart_clock := it.uart_clock
         wishbone :=: it.wishbone
     }
 }

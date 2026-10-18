@@ -1,0 +1,586 @@
+//! NS8520 UART controller with a Wishbone-classic slave interface.
+//!
+//! Minimal functionality: transmit and receive bytes over UART at a
+//! fixed baud rate of 115200 baud from a 48 MHz clock (26 clocks per
+//! 16x sample tick, 416 clocks per bit).
+//!
+//! Both directions use an 8-deep FIFO. The TX FIFO feeds a shift-out
+//! serializer; the RX FIFO is filled by a 16x oversampling receiver.
+//!
+//! Register map (byte address shown; word-aligned Wishbone access):
+//!   0x0 - RBR/THR : read = received byte, write = byte to transmit
+//!   0x4 - LSR     : line status register (read only)
+//!
+//! LSR bits:
+//!   bit 0 - DR   : data ready (RX FIFO not empty)
+//!   bit 1 - OE   : overrun (a received byte was dropped because the
+//!                  RX FIFO was full; cleared by reading the LSR)
+//!   bit 5 - THRE : transmitter holding register empty (TX FIFO has
+//!                  room for another byte)
+//!   bit 6 - TEMT : transmitter empty (TX FIFO drained and serializer
+//!                  idle)
+//!
+//! A write to the THR while the TX FIFO is full is acknowledged on the
+//! bus but silently dropped; software should poll THRE first.
+
+import wishbone
+
+//> Serial line state shared by the transmitter and receiver FSMs.
+//>
+//> `Idle` - line is high, waiting for work (transmitter) or for the
+//>          start-bit falling edge (receiver)
+//> `Start` - sending / timing the start bit
+//> `Bit` - sending / sampling data bits, LSB first
+//> `Stop` - sending / sampling the stop bit
+enum type UartState {
+    Idle = 0b00w2
+    Start = 0b01
+    Bit = 0b10
+    Stop = 0b11
+}
+
+//> NS8520 UART: a Wishbone-mapped serial port.
+mod Ns8520 {
+    incoming clock : Clock
+    incoming reset : Reset
+
+    //> Serial input line (idle high).
+    incoming rx : Bit
+    //> Serial output line (idle high).
+    outgoing tx : Bit {
+        it := tx_line
+    }
+    //> Debug aid: a Bit that toggles once per bit time (115200 toggles
+    //> per second at 115200 baud), so UART frames can be aligned
+    //> against it in a waveform viewer.
+    //>
+    //> Inverted (180 degree phase shift) relative to the free-running
+    //> baud counter, so the rising edge lands a half bit time before
+    //> the counter's would.
+    outgoing uart_clock : Bit {
+        it := !uart_clock_tick
+    }
+
+    //> Wishbone slave interface.
+    server socket wishbone of wishbone::Wishbone {
+        it.ack := it.cyc && it.stb
+
+        it.rd_data := when {
+            case sel_lsr => zext(word(0w1, temt, thre, 0w3, overrun, rx_ready))
+            case sel_rbr => word(0w24, rx0)
+            else => 0w32
+        }
+    }
+
+    // ─── Address decode ─────────────────────────────────────────────
+    // Byte addresses: 0x0 = RBR/THR, 0x4 = LSR (bit 2 of the address).
+    wire sel_lsr : Bit {
+        it := wishbone.addr[2]
+    }
+    wire sel_rbr : Bit {
+        it := !sel_lsr
+    }
+
+    // ─── TX FIFO ────────────────────────────────────────────────────
+    // An 8-deep shift-up FIFO: `tx0` is the head (the next byte the
+    // serializer will send), new bytes enter at the tail (slot index
+    // equal to the current count), and a pop shifts every remaining
+    // byte up one slot.
+    // ─── Baud-rate tick (debug) ─────────────────────────────────────
+    // Free-running counter: one toggle every 416 clocks, i.e. once per
+    // bit period.
+    reg uart_clock_counter : Word[9] on clock {
+        it <= when {
+            case reset => 0w9
+            case it == 415w9 => 0w9
+            else => it + 1w9
+        }
+    }
+
+    reg uart_clock_tick : Bit on clock {
+        it <= when {
+            case reset => true
+            case uart_clock_counter == 415w9 => !it
+            else => it
+        }
+    }
+
+    wire tx_push : Bit {
+        it := wishbone.cyc && wishbone.stb && wishbone.we && sel_rbr && tx_count < 8w4
+    }
+    // The serializer pops a byte as it leaves Idle; gated on !tx_push so
+    // a simultaneous write and pop always resolve in favor of the push.
+    wire tx_pop : Bit {
+        it := tx_state == #Idle && tx_count > 0w4 && !tx_push
+    }
+
+    reg tx0 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 1w4 {
+                it <= tx1
+            }
+            case tx_pop && tx_count == 1w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 0w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx1 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 2w4 {
+                it <= tx2
+            }
+            case tx_pop && tx_count == 2w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 1w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx2 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 3w4 {
+                it <= tx3
+            }
+            case tx_pop && tx_count == 3w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 2w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx3 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 4w4 {
+                it <= tx4
+            }
+            case tx_pop && tx_count == 4w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 3w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx4 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 5w4 {
+                it <= tx5
+            }
+            case tx_pop && tx_count == 5w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 4w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx5 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 6w4 {
+                it <= tx6
+            }
+            case tx_pop && tx_count == 6w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 5w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx6 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count > 7w4 {
+                it <= tx7
+            }
+            case tx_pop && tx_count == 7w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 6w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx7 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case tx_pop && tx_count == 8w4 && tx_push {
+                it <= wishbone.wr_data[8..0]
+            }
+            case !tx_pop && tx_push && tx_count == 7w4 {
+                it <= wishbone.wr_data[8..0]
+            }
+        }
+    }
+
+    reg tx_count : Word[4] on clock {
+        it <= when {
+            case reset => 0w4
+            case tx_push && !tx_pop => it + 1w4
+            case tx_pop && !tx_push => it - 1w4
+            else => it
+        }
+    }
+
+    // ─── TX status (LSR bits 5 and 6) ───────────────────────────────
+    wire thre : Bit {
+        it := tx_count < 8w4
+    }
+    wire temt : Bit {
+        it := tx_count == 0w4 && tx_state == #Idle
+    }
+
+    // ─── Transmitter ────────────────────────────────────────────────
+    // Sends start, 8 data bits (LSB first), and stop, one bit every
+    // 416 clocks (115200 baud at 48 MHz).
+
+    reg tx_state : UartState on clock {
+        it <= when {
+            case reset => #Idle
+            else match it {
+                case #Idle when {
+                    case tx_pop => #Start
+                    else => it
+                }
+                case #Start when {
+                    case tx_pulse == 0w9 => #Bit
+                    else => it
+                }
+                case #Bit when {
+                    case tx_pulse == 0w9 && tx_bitnum == 7w3 => #Stop
+                    else => it
+                }
+                case #Stop when {
+                    case tx_pulse == 0w9 => #Idle
+                    else => it
+                }
+            }
+        }
+    }
+
+    // One-bit countdown, reloaded at every bit boundary.
+    reg tx_pulse : Word[9] on clock {
+        it <= when {
+            case reset => 0w9
+            case tx_state == #Idle && tx_pop => 415w9
+            else match tx_state {
+                case #Start when {
+                    case it == 0w9 => 415w9
+                    else => it - 1w9
+                }
+                case #Bit when {
+                    case it == 0w9 => 415w9
+                    else => it - 1w9
+                }
+                case #Stop when {
+                    case it == 0w9 => 0w9
+                    else => it - 1w9
+                }
+                else => 0w9
+            }
+        }
+    }
+
+    reg tx_bitnum : Word[3] on clock {
+        it <= when {
+            case reset => 0w3
+            case tx_state == #Start && tx_pulse == 0w9 => 0w3
+            case tx_state == #Bit && tx_pulse == 0w9 && it < 7w3 => it + 1w3
+            else => it
+        }
+    }
+
+    // Shift register: bit [0] is the next bit to transmit.
+    reg tx_shift : Word[8] on clock {
+        it <= when {
+            case reset => 0w8
+            case tx_pop => tx0
+            case tx_state == #Bit && tx_pulse == 0w9 => word(0w1, it[8..1])
+            else => it
+        }
+    }
+
+    reg tx_line : Bit on clock {
+        it <= when {
+            case reset => true
+            case tx_state == #Idle => true
+            case tx_state == #Start => false
+            case tx_state == #Bit => tx_shift[0]
+            case tx_state == #Stop => true
+            else => it
+        }
+    }
+
+    // ─── RX FIFO ────────────────────────────────────────────────────
+    // An 8-deep shift-up FIFO: `rx0` is the head (the byte read from
+    // the RBR), new bytes enter at the tail, and a pop shifts every
+    // remaining byte up one slot.
+    wire rx_push_raw : Bit {
+        it := rx_state == #Stop && rx_pulse == 0w9
+    }
+    wire rx_push : Bit {
+        it := rx_push_raw && rx_count < 8w4
+    }
+    wire rbr_read_raw : Bit {
+        it := wishbone.cyc && wishbone.stb && !wishbone.we && sel_rbr && rx_count > 0w4
+    }
+    // The RBR pop is delayed one cycle past the bus strobe so that the
+    // byte being popped is still presented on rd_data during the
+    // acknowledge cycle of the read.
+    reg rbr_strobe : Bit on clock {
+        it <= when {
+            case reset => false
+            case rbr_read_raw && !it => true
+            else => false
+        }
+    }
+    wire rx_pop : Bit {
+        it := rbr_strobe
+    }
+
+    reg rx0 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 1w4 {
+                it <= rx1
+            }
+            case rx_pop && rx_count == 1w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 0w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx1 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 2w4 {
+                it <= rx2
+            }
+            case rx_pop && rx_count == 2w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 1w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx2 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 3w4 {
+                it <= rx3
+            }
+            case rx_pop && rx_count == 3w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 2w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx3 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 4w4 {
+                it <= rx4
+            }
+            case rx_pop && rx_count == 4w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 3w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx4 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 5w4 {
+                it <= rx5
+            }
+            case rx_pop && rx_count == 5w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 4w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx5 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 6w4 {
+                it <= rx6
+            }
+            case rx_pop && rx_count == 6w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 5w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx6 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case rx_pop && rx_count > 7w4 {
+                it <= rx7
+            }
+            case rx_pop && rx_count == 7w4 && rx_push {
+                it <= rx_shift
+            }
+            case !rx_pop && rx_push && rx_count == 6w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx7 : Word[8] on clock {
+        when {
+            case reset => 0w8
+            case !rx_pop && rx_push && rx_count == 7w4 {
+                it <= rx_shift
+            }
+        }
+    }
+
+    reg rx_count : Word[4] on clock {
+        it <= when {
+            case reset => 0w4
+            case rx_push && !rx_pop => it + 1w4
+            case rx_pop && !rx_push => it - 1w4
+            else => it
+        }
+    }
+
+    // ─── RX status (LSR bits 0 and 1) ───────────────────────────────
+    wire rx_ready : Bit {
+        it := rx_count > 0w4
+    }
+
+    // A delayed LSR-read strobe, so that a read of the LSR still
+    // observes the current status before the clear takes effect.
+    reg lsr_strobe : Bit on clock {
+        it <= when {
+            case reset => false
+            case wishbone.cyc && wishbone.stb && !wishbone.we && sel_lsr && !it => true
+            else => false
+        }
+    }
+
+    // Overrun: a byte arrived while the RX FIFO was full and was
+    // dropped. Cleared by a read of the LSR, as on a real ns8520.
+    reg overrun : Bit on clock {
+        it <= when {
+            case reset => false
+            case rx_push_raw && rx_count == 8w4 => true
+            case lsr_strobe => false
+            else => it
+        }
+    }
+
+    // ─── Receiver ───────────────────────────────────────────────────
+    // Oversampling receiver: after the start-bit falling edge it waits
+    // half a bit time (208 clocks) to reach the center of the start
+    // bit, then samples each data bit 416 clocks later. The stop bit
+    // is sampled slightly early (384 clocks after bit 7) so that the
+    // sample always lands inside the stop bit even with accumulated
+    // baud error.
+
+    reg rx_state : UartState on clock {
+        it <= when {
+            case reset => #Idle
+            else match it {
+                case #Idle when {
+                    case !rx => #Start
+                    else => it
+                }
+                case #Start when {
+                    case rx_pulse == 0w9 => #Bit
+                    else => it
+                }
+                case #Bit when {
+                    case rx_pulse == 0w9 && rx_bitnum == 7w3 => #Stop
+                    else => it
+                }
+                case #Stop when {
+                    case rx_pulse == 0w9 => #Idle
+                    else => it
+                }
+            }
+        }
+    }
+
+    // Bit-phase countdown, reloaded at every state transition.
+    reg rx_pulse : Word[9] on clock {
+        it <= when {
+            case reset => 0w9
+            else match rx_state {
+                case #Idle when {
+                    case !rx => 207w9
+                    else => 0w9
+                }
+                case #Start when {
+                    case it == 0w9 => 415w9
+                    else => it - 1w9
+                }
+                case #Bit when {
+                    case it == 0w9 when {
+                        case rx_bitnum < 7w3 => 415w9
+                        else => 383w9
+                    }
+                    else => it - 1w9
+                }
+                case #Stop when {
+                    case it == 0w9 => 0w9
+                    else => it - 1w9
+                }
+            }
+        }
+    }
+
+    reg rx_bitnum : Word[3] on clock {
+        it <= when {
+            case reset => 0w3
+            case rx_state == #Start && rx_pulse == 0w9 => 0w3
+            case rx_state == #Bit && rx_pulse == 0w9 && it < 7w3 => it + 1w3
+            else => it
+        }
+    }
+
+    // Shift register: bits are shifted in from the MSB side so that
+    // after 8 captures the received byte sits in [7..0] LSB first.
+    reg rx_shift : Word[8] on clock {
+        it <= when {
+            case reset => 0w8
+            case rx_state == #Bit && rx_pulse == 0w9 => word(rx, it[8..1])
+            else => it
+        }
+    }
+}
