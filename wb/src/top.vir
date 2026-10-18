@@ -1,0 +1,12 @@
+import wishbone_memory
+
+export mod Top {
+    incoming clock : Clock
+
+    server socket wishbone of wishbone_memory::Wishbone
+
+    mod wishbone_memory of wishbone_memory::WishboneMemory {
+        it.clock := clock
+        wishbone :=: it.wishbone
+    }
+}
