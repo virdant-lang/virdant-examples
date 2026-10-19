@@ -1,0 +1,38 @@
+[*]
+[*] GTKWave Analyzer v3.3.121 (w)1999-2024 BSI
+[*] Mon Oct 19 18:18:29 2026
+[*]
+[dumpfile] "/home/vircodificat/projects/virdant-examples/spi_flash/build/spi_flash_tb.vcd"
+[dumpfile_mtime] "Mon Oct 19 18:17:52 2026"
+[dumpfile_size] 1167978
+[savefile] "/home/vircodificat/projects/virdant-examples/spi_flash/spi_flash.gtkw"
+[timestart] 0
+[size] 1000 600
+[pos] -1 -1
+*-17.000000 60000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+[treeopen] spi_flash_tb.
+[sst_width] 278
+[signals_width] 165
+[sst_expanded] 1
+[sst_vpaned_height] 157
+@28
+spi_flash_tb.clock
+@200
+-
+@28
+spi_flash_tb.dut.\spi.clk
+spi_flash_tb.dut.\spi.cs
+spi_flash_tb.dut.\spi.di
+spi_flash_tb.dut.\spi.do
+@200
+-
+@23
+spi_flash_tb.dut.read_data[32:0]
+@28
+spi_flash_tb.dut.device_ready
+@22
+spi_flash_tb.addr[23:0]
+spi_flash_tb.dut.state[4:0]
+spi_flash_tb.dut.bit_idx[4:0]
+[pattern_trace] 1
+[pattern_trace] 0

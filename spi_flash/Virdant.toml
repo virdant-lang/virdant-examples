@@ -1,0 +1,5 @@
+[project]
+name = "spi_flash"
+
+[prog]
+top = "top::Top"

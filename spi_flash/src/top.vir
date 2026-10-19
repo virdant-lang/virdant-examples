@@ -1,0 +1,100 @@
+socket Spi {
+    cosi clk : Bit
+    cosi cs  : Bit
+    cosi do  : Bit
+    soci di  : Bit
+
+}
+
+enum type SpiState {
+    Idle     = 0b0001w4
+    Send     = 0b0010
+    Read     = 0b0100
+    Done     = 0b1000
+}
+
+mod SpiFlashController {
+    incoming clock : Clock
+
+    outgoing device_ready : Bit {
+        it := state == #Idle
+    }
+
+    incoming read_addr : Valid[Word[24]]
+
+    outgoing reg read_data : Valid[Word[32]] on clock {
+        it <= match state {
+            case #Done => @Valid(read_buf)
+            else => @Invalid()
+        }
+    }
+
+    client socket spi of Spi {
+        it.cs := state == #Idle
+        it.clk := clock_tick
+
+
+        it.do := match state {
+            case #Idle => true
+            // 0x03 = READ command, followed by 24-bit address (MSB first)
+            case #Send => word(0x03w8, addr)[dyn bit_idx]
+            else => true
+        }
+    }
+
+    reg state : SpiState on clock {
+        initial it <= #Idle
+    }
+
+    reg bit_idx : Word[5] on clock {
+        initial it <= 0
+    }
+    reg addr : Word[24] on clock
+    reg clock_tick : Bit on clock
+
+    reg read_buf : Word[32] on clock
+
+    match state {
+        case #Idle {
+            match read_addr {
+                case @Valid(read_addr) {
+                    addr <= read_addr
+                    bit_idx <= 31
+                    clock_tick <= false
+                    state <= #Send
+                }
+            }
+        }
+        case #Send {
+            clock_tick <= !clock_tick
+            when {
+                case clock_tick when {
+                    case bit_idx == 0 {
+                        state <= #Read
+                        read_buf <= 0
+                    }
+                    else {
+                        bit_idx <= bit_idx - 1
+                    }
+                }
+            }
+        }
+        case #Read {
+            clock_tick <= !clock_tick
+            when {
+                case clock_tick when {
+                    case bit_idx == 0 {
+                        state <= #Done
+                    }
+                    else {
+                        bit_idx <= bit_idx - 1
+                        read_buf <= word(read_buf[31..0], spi.di)
+                    }
+                }
+            }
+        }
+        case #Done {
+            state <= #Idle
+        }
+    }
+}
