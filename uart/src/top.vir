@@ -1,0 +1,66 @@
+enum type UartState {
+    Idle
+    Start
+    Data
+    Stop
+}
+
+mod UartSender {
+    @frequency("48 MHz")
+    incoming clock : Clock
+    incoming data_send : Valid[Word[8]]
+    outgoing ready : Bit {
+        it := state == #Idle
+    }
+
+    outgoing tx : Bit {
+        it := match state {
+            case #Idle  => true
+            case #Start => false
+            case #Data  => data_buf[dyn bit_idx]
+            case #Stop  => true
+        }
+    }
+
+    reg state : UartState on clock {
+        initial it <= #Idle
+    }
+
+    wire can_send_next_bit : Bit {
+        it := state == #Idle || baud_counter == 0
+    }
+
+    reg baud_counter : Word[9] on clock {
+        initial it <= 0
+        it <= mux(can_send_next_bit, 420, it - 1)
+    }
+
+    reg bit_idx : Word[3] on clock
+    reg data_buf : Word[8] on clock
+
+    when {
+        case can_send_next_bit match state {
+            case #Idle match data_send {
+                case @Valid(data) {
+                    data_buf <= data
+                    state <= #Start
+                }
+            }
+            case #Start {
+                bit_idx <= 0
+                state <= #Data
+            }
+            case #Data {
+                bit_idx <= bit_idx + 1
+                when {
+                    case bit_idx == 7 {
+                        state <= #Stop
+                    }
+                }
+            }
+            case #Stop {
+                state <= #Idle
+            }
+        }
+    }
+}

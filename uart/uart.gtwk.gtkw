@@ -1,0 +1,30 @@
+[*]
+[*] GTKWave Analyzer v3.3.121 (w)1999-2024 BSI
+[*] Tue Oct 20 04:46:20 2026
+[*]
+[dumpfile] "/home/vircodificat/projects/virdant-examples/uart/build/uart_sender_tb.vcd"
+[dumpfile_mtime] "Tue Oct 20 04:44:45 2026"
+[dumpfile_size] 5153
+[savefile] "/home/vircodificat/projects/virdant-examples/uart/uart.gtwk.gtkw"
+[timestart] 0
+[size] 1000 600
+[pos] -1 -1
+*-16.000000 0 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+[treeopen] uart_sender_tb.
+[sst_width] 278
+[signals_width] 229
+[sst_expanded] 1
+[sst_vpaned_height] 157
+@28
+uart_sender_tb.dut.clock
+uart_sender_tb.dut.tx
+uart_sender_tb.dut.bit_idx[2:0]
+@22
+uart_sender_tb.dut.data_send[8:0]
+@23
+uart_sender_tb.dut.data_buf[7:0]
+@22
+uart_sender_tb.dut.state[3:0]
+uart_sender_tb.dut.baud_counter[15:0]
+[pattern_trace] 1
+[pattern_trace] 0
