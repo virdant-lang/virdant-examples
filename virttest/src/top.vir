@@ -1,0 +1,115 @@
+//! HELLO, WORLD! demo for the virt::Virt platform (virtual FPGA).
+//!
+//! A behavioral memory (external Verilog, `ext/Memory.sv`) is preloaded
+//! with "HELLO, WORLD!\n\r\0".  A state machine walks it from address 0,
+//! sending every byte over the UART (115200 8N1) until it reaches the
+//! '\0' terminator (which is not sent), then rewinds the address to 0 —
+//! so the simulator prints "HELLO, WORLD!\r\n" forever.
+//!
+//! Run:
+//!   virt build --top=Top     # runs `vir build`, then Verilator
+//!   ./build/Top              # stdin/stdout are the UART
+
+import virt
+
+enum type UartFsmState {
+    Idle  = 0b00w2
+    Start = 0b01
+    Bit   = 0b10
+    Stop  = 0b11
+}
+
+//> Behavioral message memory, preloaded with "HELLO, WORLD!\n\r\0".
+//> Implemented in `ext/Memory.sv`; combinational read.
+ext mod Memory {
+    //> Read address (0..15).
+    incoming addr : Word[4]
+    //> Byte stored at `addr`.
+    outgoing data : Word[8]
+}
+
+export mod Top for virt::Virt {
+    incoming clock : Clock
+    outgoing tx : Bit
+    incoming rx : Bit
+    outgoing spi_ck : Bit
+    outgoing spi_cs : Bit
+    outgoing spi_mosi : Bit
+    incoming spi_miso : Bit
+
+    //> Exit request: this demo never exits.
+    outgoing exit : Valid[Word[8]] { it := @Invalid() }
+
+    // ─── Behavioral message memory ───
+    mod mem of Memory {
+        it.addr := i
+    }
+    wire mem_data : Word[8] { it := mem.data }
+
+    // ─── Reader state machine ───
+    // Address `i` walks the memory.  Whenever the sender is Idle, the
+    // byte at `i` is transmitted (unless it is the '\0' terminator,
+    // which is skipped) and `i` advances.  On '\0', `i` rewinds to 0.
+    reg i : Word[4] on clock {
+        it <= when {
+            case ustate == #Idle && mem_data == 0w8 => 0w4
+            case ustate == #Idle => it + 1w4
+            else => it
+        }
+    }
+
+    // ─── UART transmitter (115200 baud at 48 MHz ≈ 417 cycles/bit) ───
+    reg ustate : UartFsmState on clock {
+        it <= when {
+            case it == #Idle && mem_data != 0w8 => #Start
+            case it == #Start && upulse == 0w9 => #Bit
+            case it == #Bit && upulse == 0w9 && ubitnum == 7w3 => #Stop
+            case it == #Stop && upulse == 0w9 => #Idle
+            else => it
+        }
+    }
+
+    reg ushift : Word[8] on clock {
+        it <= when {
+            case ustate == #Idle && mem_data != 0w8 => mem_data
+            case ustate == #Bit && upulse == 0w9 => word(0w1, it[8..1])
+            else => it
+        }
+    }
+
+    reg upulse : Word[9] on clock {
+        it <= when {
+            case ustate == #Idle => 417w9
+            case it == 0w9 => 417w9
+            else => it - 1w9
+        }
+    }
+
+    reg ubitnum : Word[3] on clock {
+        it <= when {
+            case ustate == #Start && upulse == 0w9 => 0w3
+            case ustate == #Bit && upulse == 0w9 && it < 7w3 => it + 1w3
+            else => it
+        }
+    }
+
+    reg utx : Bit on clock {
+        it <= when {
+            case ustate == #Idle => true
+            case ustate == #Start => false
+            case ustate == #Bit => ushift[0]
+            case ustate == #Stop => true
+            else => it
+        }
+    }
+
+    tx := utx
+
+    // ─── SPI flash pins idle (unused by this demo) ───
+    spi_ck := false
+    spi_cs := true
+    spi_mosi := false
+
+    unused rx
+    unused spi_miso
+}

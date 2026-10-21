@@ -1,0 +1,157 @@
+//! VGA test pattern for the `virt::VirtVga` virtual FPGA: VESA 640x480@60
+//! off the 50 MHz board clock with a /2 divider (25 MHz pixel clock),
+//! Nexys4-style active-high syncs, and a colour gradient.
+//!
+//! Run:
+//!   virt build --top=Top     # runs `vir build`, then Verilator
+//!   ./build/Top              # SDL2 window renders the gradient
+
+import virt
+
+//> `VgaTiming` generates the VESA 640x480@60 timing from a 25 MHz
+//> pixel clock (the 50 MHz board clock divided by two).
+//>
+//> It drives the horizontal and vertical counters, the frame counter,
+//> and the active-high sync pulses.  `frame` wraps at 256, so it
+//> completes a full cycle every ~4.3 s.
+mod VgaTiming {
+    incoming clock : Clock
+
+    // ─── Pixel clock: 25 MHz = 50 MHz / 2 ───
+    reg tick : Bit on clock {
+        it <= !it
+    }
+
+    // ─── VESA 640x480@60 counters ───
+    // x: [0,96) sync, [96,144) back porch, [144,784) visible, [784,800) front.
+    reg x_count : Word[10] on clock {
+        when {
+            case tick && it < 799w10 {
+                it <= it + 1w10
+            }
+            case tick {
+                it <= 0w10
+            }
+        }
+    }
+    outgoing x : Word[10] {
+        it := x_count
+    }
+
+    // y: [0,2) sync, [2,35) back porch, [35,515) visible, [515,525) front.
+    reg y_count : Word[10] on clock {
+        when {
+            case tick && x_count == 799w10 && it < 524w10 {
+                it <= it + 1w10
+            }
+            case tick && x_count == 799w10 {
+                it <= 0w10
+            }
+        }
+    }
+    outgoing y : Word[10] {
+        it := y_count
+    }
+
+    reg frame_count : Word[8] on clock {
+        when {
+            case tick && x_count == 799w10 && y_count == 524w10 {
+                it <= it + 1w8
+            }
+        }
+    }
+    outgoing frame : Word[8] {
+        it := frame_count
+    }
+
+    // ─── Syncs (Nexys4-style active-high) ───
+    outgoing hs : Bit {
+        it := x_count < 96w10
+    }
+    outgoing vs : Bit {
+        it := y_count < 2w10
+    }
+}
+
+//> `GradientPattern` renders the drifting colour gradient.
+//>
+//> Red tracks the x coordinate, green tracks the y coordinate, and
+//> blue tracks the x coordinate at a finer scale.
+//> Each channel is offset by a slice of the frame counter so the
+//> pattern drifts slowly: `frame[8..4]` changes every 16 frames
+//> (~0.27 s) and completes a full cycle every ~4.3 s.
+//>
+//> The blanking region is don't-care; the monitor crops it.
+mod GradientPattern {
+    incoming x : Word[10]
+    incoming y : Word[10]
+    incoming frame : Word[8]
+
+    outgoing r : Word[4] {
+        it := x[10..6] + frame[4..0]
+    }
+    outgoing g : Word[4] {
+        it := y[10..6] + frame[4..0]
+    }
+    outgoing b : Word[4] {
+        when {
+            case y >= 35w10 {
+                it := x[6..2] + frame[4..0]
+            }
+            else {
+                it := 15w4
+            }
+        }
+    }
+}
+
+export mod Top for virt::VirtVga {
+    incoming clock : Clock
+
+    // UART idle.
+    outgoing tx : Bit {
+        it := true
+    }
+    incoming rx : Bit
+
+    // Exit after 4 frames.
+    outgoing exit : Valid[Word[8]] {
+        it := @Invalid()
+    }
+
+    // SPI flash idle.
+    outgoing spi_ck : Bit {
+        it := false
+    }
+    outgoing spi_cs : Bit {
+        it := true
+    }
+    outgoing spi_mosi : Bit {
+        it := false
+    }
+    incoming spi_miso : Bit
+
+    // VGA output (RGB444 + syncs).
+    outgoing vga_r : Word[4]
+    outgoing vga_g : Word[4]
+    outgoing vga_b : Word[4]
+    outgoing vga_hs : Bit
+    outgoing vga_vs : Bit
+
+    mod timing of VgaTiming {
+        it.clock := clock
+    }
+    mod gradient of GradientPattern {
+        it.x := timing.x
+        it.y := timing.y
+        it.frame := timing.frame
+        vga_r := it.r
+        vga_g := it.g
+        vga_b := it.b
+        vga_hs := timing.hs
+        vga_vs := timing.vs
+    }
+
+    unused rx
+    unused spi_miso
+}
