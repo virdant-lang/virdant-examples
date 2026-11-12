@@ -1,0 +1,47 @@
+//! Minimal execution environment for wasm modules.
+//!
+//! Instantiates the wasm machine and realizes its import surface:
+//! the guest's `print` import is piped, one character per cycle, to
+//! the platform's `debug` port; a returning start function raises
+//! `exit` with the guest's exit code.
+
+import wasm_machine
+
+//> Execution environment hosting a wasm module.
+//>
+//> The environment exposes exactly one import to the guest,
+//> `print(char : u8)`: each call forwards one character out of
+//> `debug`. When the guest's start function returns, `exit` reads
+//> `@Valid(0)`; a trap yields the nonzero trap code instead.
+pub mod ExecutionEnvironment {
+    incoming clock    : Clock
+    incoming spi_miso : Bit
+
+    //> Flash window size, wired straight through to the machine.
+    incoming window_size : Word[14]
+
+    //> SPI flash clock, from the flash reader.
+    outgoing spi_ck : Bit
+    //> SPI flash chip select, from the flash reader.
+    outgoing spi_cs : Bit
+    //> SPI flash controller-out data, from the flash reader.
+    outgoing spi_mosi : Bit
+
+    //> Characters written by the guest's `print` import.
+    outgoing debug : Valid[Word[8]]
+
+    //> Guest exit code, valid once the start function has returned.
+    outgoing exit : Valid[Word[8]]
+
+    mod machine of wasm_machine::Machine {
+        it.clock        := clock
+        it.spi_miso     := spi_miso
+        it.window_size  := window_size
+    }
+
+    spi_ck   := machine.spi_ck
+    spi_cs   := machine.spi_cs
+    spi_mosi := machine.spi_mosi
+    debug    := machine.char_out
+    exit     := machine.halted_code
+}

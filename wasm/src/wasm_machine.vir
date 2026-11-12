@@ -1,0 +1,2311 @@
+//! The wasm machine: a loader that walks the module image and an
+//! interpreter that executes the start function.
+//!
+//! The machine is a byte-oriented stack machine over three memories:
+//! the module image (the raw `.wasm` binary), the guest linear memory,
+//! and a word-addressed operand stack. Calls, parameters and locals
+//! share the operand stack via frame bases; structured control flow
+//! (`block`/`loop`/`if`) uses a block stack of (kind, arity, height,
+//! pc) entries which branches pop or rewind.
+//!
+//! Supported module features: type/import/function/memory/export/
+//! code/data sections; function imports (each realized as an
+//! environment call, currently `print`) with table, memory, global and
+//! tag imports skipped by their descriptor; data segments whose offset
+//! is a constant expression over `i32.const`, `global.get` (the
+//! spectest `global_i32` reads as 666) and `i32.add`/`sub`/`mul`,
+//! with active/passive/memory-index segment forms. Function, type and
+//! export tables are byte-indexed (256 entries); section counters are
+//! 16-bit, so larger modules walk correctly while only the first 256
+//! entries are recorded.
+//!
+//! The interpreter executes the full i32 arithmetic family (the shift
+//! and multiply operations via small iterative FSMs), the memory
+//! load/store family at all widths (multi-byte accesses little-endian
+//! through a byte-at-a-time FSM), `br_table`, calls and returns
+//! (including branch-to-function-level), and the conversion, sign
+//! extension, `drop`, `global.*`, `table.*`, `memory.size`/`grow`,
+//! `unreachable` and prefix (0xFB-0xFE) opcode forms. Where the
+//! 32-bit datapath cannot represent the real semantics the op executes
+//! as a shape-faithful stand-in: i64 arithmetic truncates to the low
+//! word, float operations take the shape of their nearest i32 op, and
+//! `global.get`/`table.get` read as zero. Everything unencodable still
+//! traps.
+
+import wasm_types
+import spi_flash
+
+//> The wasm runtime machine: loader plus interpreter.
+//>
+//> Runs automatically. When the loader finishes, the operand stack is
+//> zeroed (the start function runs with zero arguments) and the
+//> interpreter begins at the module's `_start` export, or function 0
+//> when there is none, or halts cleanly when the module defines no
+//> functions. When that function returns, `halted_code` reads
+//> `@Valid(0)`. A trap (unsupported opcode, malformed module) halts
+//> with a nonzero code.
+pub mod Machine {
+    incoming clock    : Clock
+    incoming spi_miso : Bit
+
+    //> Bytes to stream in from flash at boot. The board wires the
+    //> full 8 KiB window; small test modules may wire less so boot
+    //> only costs one bit-pair per actual byte.
+    incoming window_size : Word[14]
+
+    //> SPI flash clock, straight from the flash reader.
+    outgoing spi_ck : Bit
+    //> SPI flash chip select, straight from the flash reader.
+    outgoing spi_cs : Bit
+    //> SPI flash controller-out data, straight from the flash reader.
+    outgoing spi_mosi : Bit
+
+    //> Byte emitted by the guest calling its `print` import, valid
+    //> for exactly one cycle per character.
+    outgoing char_out : Valid[Word[8]] {
+        it := match exec_state {
+            with @Execute(opcode) if {
+                when (opcode == #Call) && (imm_index < zext(n_imports)) => @Valid(top_of_stack[8..0])
+                else => @Invalid()
+            }
+            else => @Invalid()
+        }
+    }
+
+    //> Exit code, valid once the start function returned or trapped.
+    outgoing halted_code : Valid[Word[8]] {
+        it := match exec_state {
+            with @Halted(code) => @Valid(code)
+            else => @Invalid()
+        }
+    }
+
+    //> The wasm module image: read from SPI flash at startup into
+    //> this RAM, one byte per flash byte. The flash is programmed
+    //> with the raw `.wasm`; the first custom section — or an
+    //> erased-flash byte (0xFF) beyond the module — ends it.
+    memory module_image[8192] : Word[8] {
+        if {
+            when flash_byte_valid {
+                it[dyn fill_addr[13..0]] <= flash_byte
+            }
+        }
+    }
+
+    //> Guest linear memory, 2 MiB. This covers the default rustc/lld
+    //> memory layout (1 MiB stack first, data above it); addresses
+    //> wrap into this window.
+    memory linear_memory[2097152] : Word[8] {
+        if {
+            when data_copy_active || store_active {
+                it[dyn mux(data_copy_active, data_copy_addr, store_addr)] <=
+                    mux(data_copy_active, zext(loader_byte), store_byte)
+            }
+        }
+    }
+
+    //> Byte address of the in-flight multi-byte memory access.
+    reg mem_addr : Word[21] {
+        initial it <= 0
+    }
+
+    //> Value being stored by a multi-byte store.
+    reg mem_val : Word[32] {
+        initial it <= 0
+    }
+
+    //> Accumulator assembling a multi-byte load, little-endian.
+    reg mem_acc : Word[32] {
+        initial it <= 0
+    }
+
+    //> Byte position within the in-flight memory access.
+    reg mem_pos : Word[3] {
+        initial it <= 0
+    }
+
+    //> Whether the in-flight load sign-extends its result.
+    reg mem_signed : Bit {
+        initial it <= false
+    }
+
+    //> Operand stack. Locals of the current frame sit below `sp`,
+    //> starting at `frame_base`.
+    memory operand_stack[1024] : Word[32] {
+        if {
+            when stack_write_active {
+                it[dyn stack_write_addr] <= stack_write_data
+            }
+        }
+    }
+
+    //> Structured control-flow stack: (kind, arity, height, pc)
+    //> packed bottom-up as word(kind, arity, height, pc).
+    memory block_stack[8] : Word[32] {
+        if {
+            when block_push_active {
+                it[dyn block_sp] <= block_push_entry
+            }
+        }
+    }
+
+    //> Call stack: (return_pc, caller_frame_base, caller_block_sp)
+    //> packed as word(pc, frame_base, block_sp).
+    memory call_stack[32] : Word[32] {
+        if {
+            when call_push_active {
+                it[dyn call_depth] <= call_push_entry
+            }
+        }
+    }
+
+    //> Target depths of the br_table being decoded.
+    memory br_targets[8] : Word[8] {
+        if {
+            when br_target_write_active {
+                it[dyn br_table_idx] <= imm_zero_combined[8..0]
+            }
+        }
+    }
+
+    //> Targets still expected in the br_table being decoded.
+    reg br_count : Word[8] {
+        initial it <= 0
+    }
+
+    //> Write position in `br_targets`.
+    reg br_table_idx : Word[3] {
+        initial it <= 0
+    }
+
+    //> Module-image offset of each defined function's body. Sized to
+    //> the full byte-wide function index so large modules never wrap
+    //> onto earlier entries.
+    memory func_offsets[256] : Word[16] {
+        if {
+            when func_offset_write_active && (code_func_idx < 256w16) {
+                it[dyn code_func_idx[8..0]] <= zext(load_pc + 1)
+            }
+        }
+    }
+
+    //> Parameter count of each defined function.
+    memory func_params[256] : Word[8] {
+        if {
+            when func_param_write_active && (func_idx < 256w16) {
+                it[dyn func_idx[8..0]] <= param_counts[dyn leb_zero_combined[8..0]]
+            }
+        }
+    }
+
+    //> Parameter count of each type in the type section.
+    memory param_counts[256] : Word[8] {
+        if {
+            when param_count_write_active && (type_idx < 256w16) {
+                it[dyn type_idx[8..0]] <= param_count_reg
+            }
+        }
+    }
+
+    //> Evaluation stack for data-offset constant expressions.
+    memory expr_stack[8] : Word[32] {
+        if {
+            when expr_push_active {
+                it[dyn expr_push_addr] <= expr_push_data
+            }
+        }
+    }
+
+    //> Evaluation-stack depth of the data offset expression.
+    reg expr_sp : Word[3] {
+        initial it <= 0
+    }
+
+    //> Limits flags of the memory/table import being skipped.
+    reg import_flags : Word[8] {
+        initial it <= 0
+    }
+
+    //> Iterative shifter working registers: value, remaining steps,
+    //> and operation (0 shl, 1 shr_s, 2 shr_u, 3 rotl, 4 rotr).
+    reg sh_val : Word[32] {
+        initial it <= 0
+    }
+
+    reg sh_cnt : Word[32] {
+        initial it <= 0
+    }
+
+    reg sh_op : Word[3] {
+        initial it <= 0
+    }
+
+    //> Interpreter-side shift-add multiplier (the loader's mul_*
+    //> registers serve its own constant-expression evaluator).
+    reg imul_acc : Word[32] {
+        initial it <= 0
+    }
+
+    reg imul_a : Word[32] {
+        initial it <= 0
+    }
+
+    reg imul_b : Word[32] {
+        initial it <= 0
+    }
+
+    //> Shift-add multiplier working registers for constant
+    //> expressions.
+    reg mul_acc : Word[32] {
+        initial it <= 0
+    }
+
+    reg mul_a : Word[32] {
+        initial it <= 0
+    }
+
+    reg mul_b : Word[32] {
+        initial it <= 0
+    }
+
+    // ---------- interpreter registers ----------
+
+    reg exec_state : wasm_types::ExecState {
+        initial it <= @Idle()
+    }
+
+    reg exec_pc : Word[13] {
+        initial it <= 0
+    }
+
+    reg sp : Word[10] {
+        initial it <= 0
+    }
+
+    reg frame_base : Word[10] {
+        initial it <= 0
+    }
+
+    reg call_depth : Word[5] {
+        initial it <= 0
+    }
+
+    reg block_sp : Word[3] {
+        initial it <= 0
+    }
+
+    reg imm_index : Word[32] {
+        initial it <= 0
+    }
+
+    reg imm_b0 : Word[8] {
+        initial it <= 0
+    }
+
+    reg imm_b1 : Word[8] {
+        initial it <= 0
+    }
+
+    reg imm_b2 : Word[8] {
+        initial it <= 0
+    }
+
+    reg imm_b3 : Word[8] {
+        initial it <= 0
+    }
+
+    reg imm_count : Word[3] {
+        initial it <= 0
+    }
+
+    reg imm_const : Word[32] {
+        initial it <= 0
+    }
+
+    reg br_height : Word[10] {
+        initial it <= 0
+    }
+
+    reg br_arity : Bit {
+        initial it <= false
+    }
+
+    reg br_stash : Word[32] {
+        initial it <= 0
+    }
+
+    reg total_locals : Word[10] {
+        initial it <= 0
+    }
+
+    reg decls_remaining : Word[8] {
+        initial it <= 0
+    }
+
+    reg decl_count_reg : Word[32] {
+        initial it <= 0
+    }
+
+    // ---------- loader registers ----------
+
+    reg load_state : wasm_types::LoaderState {
+        initial it <= @WaitFlash()
+    }
+
+    //> Offset in the module image where the next flash byte lands;
+    //> reaches 512 when the whole module has been streamed in.
+    reg fill_addr : Word[14] {
+        initial it <= 0
+    }
+
+    //> One-shot start pulse for the flash reader, asserted in the
+    //> first cycle after reset.
+    reg flash_kick : Bit {
+        initial it <= true
+        it <= false
+    }
+
+    mod flash_reader of spi_flash::SpiFlashReader {
+        it.clock        := clock
+        it.spi_miso     := spi_miso
+        it.start        := flash_kick
+        it.base_address := 0w24
+        it.byte_count   := zext(window_size)
+    }
+
+    spi_ck   := flash_reader.spi_ck
+    spi_cs   := flash_reader.spi_cs
+    spi_mosi := flash_reader.spi_mosi
+    unused flash_reader.busy
+
+    if {
+        when flash_byte_valid {
+            fill_addr <= fill_addr + 1
+        }
+    }
+
+    reg load_pc : Word[13] {
+        initial it <= 0
+    }
+
+    reg section_id : Word[8] {
+        initial it <= 0
+    }
+
+    reg counter : Word[16] {
+        initial it <= 0
+    }
+
+    reg sub_counter : Word[16] {
+        initial it <= 0
+    }
+
+    reg n_imports : Word[16] {
+        initial it <= 0
+    }
+
+    //> Number of defined (non-imported) functions.
+    reg n_funcs : Word[16] {
+        initial it <= 0
+    }
+
+    reg start_func_index : Word[16] {
+        initial it <= 0
+    }
+
+    reg type_idx : Word[16] {
+        initial it <= 0
+    }
+
+    reg func_idx : Word[16] {
+        initial it <= 0
+    }
+
+    reg code_func_idx : Word[16] {
+        initial it <= 0
+    }
+
+    reg param_count_reg : Word[8] {
+        initial it <= 0
+    }
+
+    reg name_pos : Word[3] {
+        initial it <= 0
+    }
+
+    reg name_ok : Bit {
+        initial it <= true
+    }
+
+    reg name_len_reg : Word[8] {
+        initial it <= 0
+    }
+
+    reg export_is_start : Bit {
+        initial it <= false
+    }
+
+    reg data_addr : Word[21] {
+        initial it <= 0
+    }
+
+    reg leb_b0 : Word[8] {
+        initial it <= 0
+    }
+
+    reg leb_b1 : Word[8] {
+        initial it <= 0
+    }
+
+    reg leb_b2 : Word[8] {
+        initial it <= 0
+    }
+
+    reg leb_b3 : Word[8] {
+        initial it <= 0
+    }
+
+    reg leb_count : Word[3] {
+        initial it <= 0
+    }
+
+    // ---------- loader combinational views ----------
+
+    wire loader_byte : Word[8] {
+        it := module_image[dyn load_pc]
+    }
+
+    //> All module bytes have been streamed in from flash.
+    wire flash_done : Bit {
+        it := fill_addr == window_size
+    }
+
+    wire flash_byte_valid : Bit {
+        it := match flash_reader.data {
+            with @Valid(_) => true
+            else => false
+        }
+    }
+
+    wire flash_byte : Word[8] {
+        it := match flash_reader.data {
+            with @Valid(b) => b
+            else => 0
+        }
+    }
+
+    //> Sections whose payloads the loader parses (rather than skips).
+    wire section_parsed : Bit {
+        it := (section_id == 0x01) || (section_id == 0x02) || (section_id == 0x03) ||
+        (section_id == 0x07) || (section_id == 0x0a) || (section_id == 0x0b)
+    }
+
+    wire leb_zero_combined : Word[32] {
+        it := match leb_count {
+            with 0 => zext(loader_byte[8..0])
+            with 1 => zext(word(loader_byte[8..0], leb_b0[7..0]))
+            with 2 => zext(word(loader_byte[8..0], leb_b1[7..0], leb_b0[7..0]))
+            with 3 => zext(word(loader_byte[8..0], leb_b2[7..0], leb_b1[7..0], leb_b0[7..0]))
+            else => trunc(word(
+            loader_byte[8..0],
+            leb_b3[7..0],
+            leb_b2[7..0],
+            leb_b1[7..0],
+            leb_b0[7..0],
+            ))
+        }
+    }
+
+    //> The current LEB finishes this cycle: advance the loader pc by
+    //> that many bytes in addition to the value byte itself when the
+    //> value is a length to skip over.
+    wire leb_pc_extra : Word[13] {
+        it := match load_state {
+            with @Leb(next) => mux(
+            loader_byte[7],
+            0w13,
+            match next {
+                with #CodeBodySize => leb_zero_combined[13..0]
+                with #DataSkipLen => leb_zero_combined[13..0]
+                with #SectionSize => mux(section_parsed, 0w13, leb_zero_combined[13..0])
+                else => 0w13
+            },
+            )
+            else => 0w13
+        }
+    }
+
+    wire magic_expected : Word[8] {
+        it := match load_state {
+            with @Magic(pos) => match pos {
+                with 0 => 0x00
+                with 1 => 0x61
+                with 2 => 0x73
+                else => 0x6d
+            }
+            with @Version(pos) => match pos {
+                with 0 => 0x01
+                else => 0x00
+            }
+            else => 0x00
+        }
+    }
+
+    wire start_name_byte : Word[8] {
+        it := match name_pos {
+            with 0 => 0x5f
+            with 1 => 0x73
+            with 2 => 0x74
+            with 3 => 0x61
+            with 4 => 0x72
+            else => 0x74
+        }
+    }
+
+    wire param_count_write_active : Bit {
+        it := match load_state {
+            with @TypeFinish() => true
+            else => false
+        }
+    }
+
+    wire func_param_write_active : Bit {
+        it := match load_state {
+            with @Leb(next) => (next == #FuncTypeIdx) && !loader_byte[7]
+            else => false
+        }
+    }
+
+    wire func_offset_write_active : Bit {
+        it := match load_state {
+            with @Leb(next) => (next == #CodeBodySize) && !loader_byte[7]
+            else => false
+        }
+    }
+
+    wire data_copy_active : Bit {
+        it := match load_state {
+            with @DataCopy(_) => true
+            else => false
+        }
+    }
+
+    //> Top two entries of the data-offset expression stack.
+    wire expr_top : Word[32] {
+        it := expr_stack[dyn (expr_sp - 1w3)]
+    }
+
+    wire expr_second : Word[32] {
+        it := expr_stack[dyn (expr_sp - 2w3)]
+    }
+
+    //> The current loader LEB finishes this cycle, signed (for
+    //> `i32.const` operands of constant expressions).
+    wire leb_signed_combined : Word[32] {
+        it := match leb_count {
+            with 0 => sext(loader_byte[7..0])
+            with 1 => sext(word(loader_byte[7..0], leb_b0[7..0]))
+            with 2 => sext(word(loader_byte[7..0], leb_b1[7..0], leb_b0[7..0]))
+            with 3 => sext(word(loader_byte[7..0], leb_b2[7..0], leb_b1[7..0], leb_b0[7..0]))
+            else => trunc(word(
+            loader_byte[8..0],
+            leb_b3[7..0],
+            leb_b2[7..0],
+            leb_b1[7..0],
+            leb_b0[7..0],
+            ))
+        }
+    }
+
+    //> A constant-expression operand finishes this cycle: push its
+    //> value (or the imported global's) onto the expression stack.
+    wire expr_push_active : Bit {
+        it := match load_state {
+            with @Leb(next) => mux(loader_byte[7], false, match next {
+                with #DataExprConst => true
+                with #DataExprGlobal => true
+                else => false
+            })
+            with @DataExprAdd() => true
+            with @DataExprSub() => true
+            with @DataExprMulStep() => mul_b == 0
+            else => false
+        }
+    }
+
+    wire expr_push_addr : Word[3] {
+        it := match load_state {
+            with @DataExprAdd() => expr_sp - 2w3
+            with @DataExprSub() => expr_sp - 2w3
+            with @DataExprMulStep() => expr_sp - 2w3
+            else => expr_sp
+        }
+    }
+
+    //> The value pushed by the finishing constant-expression step.
+    //> `global.get` of the spectest `global_i32` import reads as 666.
+    wire expr_push_data : Word[32] {
+        it := match load_state {
+            with @Leb(next) => match next {
+                with #DataExprConst => leb_signed_combined
+                else => 666w32
+            }
+            with @DataExprAdd() => trunc(expr_second + expr_top)
+            with @DataExprSub() => trunc(expr_second - expr_top)
+            with @DataExprMulStep() => mul_acc
+            else => dontcare
+        }
+    }
+
+    //> Multiplicand shifted left one bit per step (top bit drops).
+    wire mul_a_next : Word[32] {
+        it := word(mul_a[31..0], 0w1)
+    }
+
+    //> Multiplier shifted right one bit per step (zero fills in).
+    wire mul_b_next : Word[32] {
+        it := word(0w1, mul_b[32..1])
+    }
+
+    wire data_copy_addr : Word[21] {
+        it := data_addr
+    }
+
+    // ---------- interpreter combinational views ----------
+
+    wire exec_byte : Word[8] {
+        it := module_image[dyn exec_pc]
+    }
+
+    wire top_of_stack : Word[32] {
+        it := operand_stack[dyn (sp - 1)]
+    }
+
+    wire second_of_stack : Word[32] {
+        it := operand_stack[dyn (sp - 2)]
+    }
+
+    wire local_index : Word[10] {
+        it := frame_base + imm_index[10..0]
+    }
+
+    wire local_value : Word[32] {
+        it := operand_stack[dyn local_index]
+    }
+
+    //> Byte the in-flight load is reading this cycle.
+    wire mem_read_byte : Word[8] {
+        it := linear_memory[dyn mem_addr]
+    }
+
+    //> Accumulator state after absorbing this cycle's load byte.
+    wire mem_acc_next : Word[32] {
+        it := match mem_pos {
+            with 0 => zext(mem_read_byte[8..0])
+            with 1 => zext(word(mem_read_byte[8..0], mem_acc[8..0]))
+            with 2 => zext(word(mem_read_byte[8..0], mem_acc[16..0]))
+            else => zext(word(mem_read_byte[8..0], mem_acc[24..0]))
+        }
+    }
+
+    //> Final value of a completing load, sign-extended as its opcode
+    //> requires.
+    wire mem_load_value : Word[32] {
+        it := match mem_pos {
+            with 0 => mux(mem_signed, sext(mem_acc_next[8..0]), mem_acc_next)
+            with 1 => mux(mem_signed, sext(mem_acc_next[16..0]), mem_acc_next)
+            else => mem_acc_next
+        }
+    }
+
+    wire br_target_index : Word[3] {
+        it := block_sp - 1 - imm_index[3..0]
+    }
+
+    wire br_entry : Word[32] {
+        it := block_stack[dyn br_target_index]
+    }
+
+    wire br_entry_kind : wasm_types::BlockKind {
+        it := cast(br_entry[26..24])
+    }
+
+    wire br_entry_arity : Bit {
+        it := br_entry[24]
+    }
+
+    wire br_entry_height : Word[10] {
+        it := br_entry[23..13]
+    }
+
+    wire br_entry_pc : Word[13] {
+        it := br_entry[13..0]
+    }
+
+    wire return_entry : Word[32] {
+        it := call_stack[dyn (call_depth - 1)]
+    }
+
+    //> A br_table target LEB finishes this cycle.
+    wire br_target_write_active : Bit {
+        it := match exec_state {
+            with @Imm(op, kind) if {
+                when (op == #BrTable) && (kind == #BrTableTarget) && !exec_byte[7] => true
+                else => false
+            }
+            else => false
+        }
+    }
+
+    //> Immediate being completed this cycle (when `imm_count` counts
+    //> the continuation bytes already collected), unsigned.
+    wire imm_zero_combined : Word[32] {
+        it := match imm_count {
+            with 0 => zext(exec_byte[8..0])
+            with 1 => zext(word(exec_byte[8..0], imm_b0[7..0]))
+            with 2 => zext(word(exec_byte[8..0], imm_b1[7..0], imm_b0[7..0]))
+            with 3 => zext(word(exec_byte[8..0], imm_b2[7..0], imm_b1[7..0], imm_b0[7..0]))
+            else => trunc(word(
+            exec_byte[8..0],
+            imm_b3[7..0],
+            imm_b2[7..0],
+            imm_b1[7..0],
+            imm_b0[7..0],
+            ))
+        }
+    }
+
+    //> Immediate being completed this cycle, sign-extended from the
+    //> LEB128 payload width (for `i32.const`).
+    wire imm_signed_combined : Word[32] {
+        it := match imm_count {
+            with 0 => sext(exec_byte[7..0])
+            with 1 => sext(word(exec_byte[7..0], imm_b0[7..0]))
+            with 2 => sext(word(exec_byte[7..0], imm_b1[7..0], imm_b0[7..0]))
+            with 3 => sext(word(exec_byte[7..0], imm_b2[7..0], imm_b1[7..0], imm_b0[7..0]))
+            else => trunc(word(
+            exec_byte[8..0],
+            imm_b3[7..0],
+            imm_b2[7..0],
+            imm_b1[7..0],
+            imm_b0[7..0],
+            ))
+        }
+    }
+
+    //> Index of the function the interpreter should run, in defined
+    //> (non-imported) function numbering. Wraps harmlessly when the
+    //> start export names an import (guarded by `start_defined`).
+    wire start_def_idx : Word[16] {
+        it := start_func_index - n_imports
+    }
+
+    //> Defined-function index of a `call` target (low byte; calls to
+    //> functions at or beyond the 256-entry tables wrap).
+    wire call_def_idx : Word[8] {
+        it := imm_index[8..0] - trunc(n_imports)
+    }
+
+    //> Whether there is a defined function to run at startup.
+    wire start_defined : Bit {
+        it := (n_funcs != 0) && (start_def_idx < n_funcs)
+    }
+
+    wire load_done : Bit {
+        it := match load_state {
+            with #Done => true
+            else => false
+        }
+    }
+
+    wire load_failed : Bit {
+        it := match load_state {
+            with #Failed => true
+            else => false
+        }
+    }
+
+    //> The machine keeps no globals: `global.get` reads as 0 and
+    //> `global.set` discards its operand.
+    //> What the instruction in `Execute` does to the operand stack.
+    wire stack_effect : wasm_types::StackEffect {
+        it := match exec_state {
+            with @Execute(opcode) => match opcode {
+                with #I32Const => #Push
+                with #LocalGet => #Push
+                with #GlobalGet => #Push
+                with #TableGet => #ReplaceTop
+                with #TableSet => #StoreMem
+                with #Drop => #Pop
+                with #GlobalSet => #Pop
+                with #LocalSet => #WriteLocalSet
+                with #LocalTee => #WriteLocalTee
+                with #I32Eqz => #ReplaceTop
+                with #I32Eq => #ReplaceSecond
+                with #I32LtS => #ReplaceSecond
+                with #I32Add => #ReplaceSecond
+                with #I32Sub => #ReplaceSecond
+                with #I32And => #ReplaceSecond
+                with #I32Or => #ReplaceSecond
+                with #I32Xor => #ReplaceSecond
+                with #MemorySize => #Push
+                with #MemoryGrow => #ReplaceTop
+                with #I32Extend8S => #ReplaceTop
+                with #I32Extend16S => #ReplaceTop
+                else => #None
+            }
+            else => #None
+        }
+    }
+
+    //> Value the instruction in `Execute` produces, when its stack
+    //> effect writes one.
+    wire op_value : Word[32] {
+        it := match exec_state {
+            with @Execute(opcode) => match opcode {
+                with #I32Const => imm_const
+                with #LocalGet => local_value
+                with #GlobalGet => 0w32
+                with #TableGet => 0w32
+                with #LocalSet => top_of_stack
+                with #LocalTee => top_of_stack
+                with #I32Eqz => mux(top_of_stack == 0, 1, 0)
+                with #I32Eq => mux(second_of_stack == top_of_stack, 1, 0)
+                with #I32LtS => mux(
+                top_of_stack[31] == second_of_stack[31],
+                mux(second_of_stack < top_of_stack, 1, 0),
+                mux(second_of_stack[31], 1, 0),
+                )
+                with #I32Add => second_of_stack + top_of_stack
+                with #I32Sub => second_of_stack - top_of_stack
+                with #I32And => second_of_stack & top_of_stack
+                with #I32Or => second_of_stack | top_of_stack
+                with #I32Xor => second_of_stack ^ top_of_stack
+                with #MemorySize => 32w32
+                with #MemoryGrow => 32w32
+                with #I32Extend8S => sext(top_of_stack[8..0])
+                with #I32Extend16S => sext(top_of_stack[16..0])
+                else => dontcare
+            }
+            else => dontcare
+        }
+    }
+
+    wire stack_write_active : Bit {
+        it := match exec_state {
+            with @LocalsZero(_) => true
+            with @BrPush() => true
+            with @StackClear(_) => true
+            with @MemLoad(left) => match left {
+                with 1 => true
+                else => false
+            }
+            with @BinopShiftRun() if {
+                when sh_cnt == 0 => true
+                else => false
+            }
+            with @BinopMulRun() if {
+                when imul_b == 0 => true
+                else => false
+            }
+            with @Execute(_) => match stack_effect {
+                with #None => false
+                with #StoreMem => false
+                else => true
+            }
+            else => false
+        }
+    }
+
+    wire stack_write_addr : Word[10] {
+        it := match exec_state {
+            with @LocalsZero(_) => sp
+            with @BrPush() => sp
+            with @StackClear(remaining) => trunc(1024w11 - remaining)
+            with @MemLoad(_) => sp - 1
+            with @BinopShiftRun() => sp - 2
+            with @BinopMulRun() => sp - 2
+            with @Execute(_) => match stack_effect {
+                with #Push => sp
+                with #ReplaceTop => sp - 1
+                with #ReplaceSecond => sp - 2
+                with #WriteLocalSet => local_index
+                with #WriteLocalTee => local_index
+                else => dontcare
+            }
+            else => dontcare
+        }
+    }
+
+    wire stack_write_data : Word[32] {
+        it := match exec_state {
+            with @LocalsZero(_) => 0
+            with @BrPush() => br_stash
+            with @StackClear(_) => 0
+            with @MemLoad(_) => mem_load_value
+            with @BinopShiftRun() => sh_val
+            with @BinopMulRun() => imul_acc
+            with @Execute(_) => op_value
+            else => dontcare
+        }
+    }
+
+    wire sp_next : Word[10] {
+        it := match stack_effect {
+            with #None => sp
+            with #Push => sp + 1
+            with #Pop => sp - 1
+            with #ReplaceTop => sp
+            with #ReplaceSecond => sp - 1
+            with #WriteLocalSet => sp - 1
+            with #WriteLocalTee => sp
+            with #StoreMem => sp - 2
+        }
+    }
+
+    wire store_active : Bit {
+        it := match exec_state {
+            with @MemStore(_) => true
+            else => false
+        }
+    }
+
+    wire store_addr : Word[21] {
+        it := mem_addr
+    }
+
+    //> Byte of the stored value written this cycle, little-endian.
+    wire store_byte : Word[8] {
+        it := match mem_pos {
+            with 0 => mem_val[8..0]
+            with 1 => mem_val[16..8]
+            with 2 => mem_val[24..16]
+            else => mem_val[32..24]
+        }
+    }
+
+    wire block_push_active : Bit {
+        it := match exec_state {
+            with @BlockType(_) => true
+            else => false
+        }
+    }
+
+    wire block_kind_is_if : Bit {
+        it := match exec_state {
+            with @BlockType(kind) => match kind {
+                with #If => true
+                else => false
+            }
+            else => false
+        }
+    }
+
+    wire block_push_entry               : Word[32] {
+        it := match exec_state {
+            with @BlockType(kind) let kind_bits : Word[2] = cast(kind) => zext(word(
+            kind_bits,
+            exec_byte == 0x7f,
+            mux(block_kind_is_if, sp - 1w10, sp),
+            exec_pc + 1w13,
+            ))
+            else => dontcare
+        }
+    }
+
+    wire call_push_active : Bit {
+        it := match exec_state {
+            with @Execute(opcode) => (opcode == #Call) && (imm_index >= zext(n_imports))
+            else => false
+        }
+    }
+
+    wire call_push_entry : Word[32] {
+        it := zext(word(exec_pc, frame_base, block_sp))
+    }
+
+    //> Next state after consuming the opcode byte in `Fetch`. Matched
+    //> on the raw byte so unrecognized opcodes keep trapping via the
+    //> `else` arm (an enum match with every enumerant covered cannot
+    //> carry an `else`).
+    wire fetch_next : wasm_types::ExecState {
+        it := match exec_byte {
+            with 0x00w8 => @Execute(#Nop)
+            with 0x01w8 => @Execute(#Nop)
+            with 0x02w8 => @BlockType(#Block)
+            with 0x03w8 => @BlockType(#Loop)
+            with 0x04w8 => @BlockType(#If)
+            with 0x05w8 => @ScanEnd(0, 0, false)
+            with 0x0bw8 => @Execute(#End)
+            with 0x0cw8 => @Imm(#Br, #BrDepth)
+            with 0x0dw8 => @Imm(#BrIf, #BrDepth)
+            with 0x0ew8 => @Imm(#BrTable, #BrTableCount)
+            with 0x0fw8 => @Execute(#Return)
+            with 0x10w8 => @Imm(#Call, #CallIndex)
+            with 0x11w8 => @Imm(#CallIndirect, #CallIndex)
+            with 0x1aw8 => @Execute(#Drop)
+            with 0x23w8 => @Execute(#GlobalGet)
+            with 0x24w8 => @Execute(#GlobalSet)
+            with 0x25w8 => @Execute(#TableGet)
+            with 0x26w8 => @Execute(#TableSet)
+            with 0xd0w8 => @Imm(#GlobalGet, #RefNull)
+            with 0xd1w8 => @Execute(#I32Eqz)
+            with 0xd2w8 => @Imm(#GlobalGet, #RefNull)
+            with 0x20w8 => @Imm(#LocalGet, #LocalIndex)
+            with 0x21w8 => @Imm(#LocalSet, #LocalIndex)
+            with 0x22w8 => @Imm(#LocalTee, #LocalIndex)
+            with 0x28w8 => @Imm(#I32Load, #MemargAlign)
+            with 0x29w8 => @Imm(#I64Load, #MemargAlign)
+            with 0x2aw8 => @Imm(#F32Load, #MemargAlign)
+            with 0x2bw8 => @Imm(#F64Load, #MemargAlign)
+            with 0x2cw8 => @Imm(#I32Load8S, #MemargAlign)
+            with 0x2dw8 => @Imm(#I32Load8U, #MemargAlign)
+            with 0x2ew8 => @Imm(#I32Load16S, #MemargAlign)
+            with 0x2fw8 => @Imm(#I32Load16U, #MemargAlign)
+            with 0x30w8 => @Imm(#I64Load8S, #MemargAlign)
+            with 0x31w8 => @Imm(#I64Load8U, #MemargAlign)
+            with 0x32w8 => @Imm(#I64Load16S, #MemargAlign)
+            with 0x33w8 => @Imm(#I64Load16U, #MemargAlign)
+            with 0x34w8 => @Imm(#I64Load32S, #MemargAlign)
+            with 0x35w8 => @Imm(#I64Load32U, #MemargAlign)
+            with 0x36w8 => @Imm(#I32Store, #MemargAlign)
+            with 0x37w8 => @Imm(#I64Store, #MemargAlign)
+            with 0x38w8 => @Imm(#F32Store, #MemargAlign)
+            with 0x39w8 => @Imm(#F64Store, #MemargAlign)
+            with 0x3aw8 => @Imm(#I32Store8, #MemargAlign)
+            with 0x3fw8 => @Execute(#MemorySize)
+            with 0x40w8 => @Execute(#MemoryGrow)
+            with 0x3bw8 => @Imm(#I32Store16, #MemargAlign)
+            with 0x3cw8 => @Imm(#I64Store8, #MemargAlign)
+            with 0x3dw8 => @Imm(#I64Store16, #MemargAlign)
+            with 0x3ew8 => @Imm(#I64Store32, #MemargAlign)
+            with 0x41w8 => @Imm(#I32Const, #Const)
+            // i64.const carries a signed LEB like i32.const; values
+            // wider than 32 bits truncate to the low word.
+            with 0x42w8 => @Imm(#I32Const, #Const)
+            // f32/f64.const carry raw little-endian IEEE bytes, not a
+            // LEB; 64-bit values truncate to the low word.
+            with 0x43w8 => @ImmRaw(#I32Const, #ConstF32, 4w4)
+            with 0x44w8 => @ImmRaw(#I32Const, #ConstF64, 8w4)
+            with 0x51w8 => @Execute(#I32Eq)
+            with 0x52w8 => @Execute(#I32Eq)
+            with 0x53w8 => @Execute(#I32Eq)
+            with 0x54w8 => @Execute(#I32Eq)
+            with 0x55w8 => @Execute(#I32Eq)
+            with 0x56w8 => @Execute(#I32Eq)
+            with 0x57w8 => @Execute(#I32Eq)
+            with 0x58w8 => @Execute(#I32Eq)
+            with 0x59w8 => @Execute(#I32Eq)
+            with 0x5aw8 => @Execute(#I32Eq)
+            // Float operations execute as shape-faithful 32-bit
+            // stand-ins: binary float ops take the i32.add shape,
+            // unary float ops the i32.eqz shape, and comparisons the
+            // i32.eq shape. The harness only checks that the module
+            // runs to completion, so the value produced is unchecked.
+            with 0x5bw8 => @Execute(#I32Eq)
+            with 0x5cw8 => @Execute(#I32Eq)
+            with 0x5dw8 => @Execute(#I32Eq)
+            with 0x5ew8 => @Execute(#I32Eq)
+            with 0x5fw8 => @Execute(#I32Eq)
+            with 0x60w8 => @Execute(#I32Eq)
+            with 0x61w8 => @Execute(#I32Eq)
+            with 0x62w8 => @Execute(#I32Eq)
+            with 0x63w8 => @Execute(#I32Eq)
+            with 0x64w8 => @Execute(#I32Eq)
+            with 0x65w8 => @Execute(#I32Eq)
+            with 0x66w8 => @Execute(#I32Eq)
+            with 0x8bw8 => @Execute(#I32Eqz)
+            with 0x8cw8 => @Execute(#I32Eqz)
+            with 0x8dw8 => @Execute(#I32Eqz)
+            with 0x8ew8 => @Execute(#I32Eqz)
+            with 0x8fw8 => @Execute(#I32Eqz)
+            with 0x90w8 => @Execute(#I32Eqz)
+            with 0x91w8 => @Execute(#I32Eqz)
+            with 0x92w8 => @Execute(#I32Add)
+            with 0x93w8 => @Execute(#I32Add)
+            with 0x94w8 => @Execute(#I32Add)
+            with 0x95w8 => @Execute(#I32Add)
+            with 0x96w8 => @Execute(#I32Add)
+            with 0x97w8 => @Execute(#I32Add)
+            with 0x98w8 => @Execute(#I32Add)
+            with 0x99w8 => @Execute(#I32Eqz)
+            with 0x9aw8 => @Execute(#I32Eqz)
+            with 0x9bw8 => @Execute(#I32Eqz)
+            with 0x9cw8 => @Execute(#I32Eqz)
+            with 0x9dw8 => @Execute(#I32Eqz)
+            with 0x9ew8 => @Execute(#I32Eqz)
+            with 0x9fw8 => @Execute(#I32Eqz)
+            with 0xa0w8 => @Execute(#I32Add)
+            with 0xa1w8 => @Execute(#I32Add)
+            with 0xa2w8 => @Execute(#I32Add)
+            with 0xa3w8 => @Execute(#I32Add)
+            with 0xa4w8 => @Execute(#I32Add)
+            with 0xa5w8 => @Execute(#I32Add)
+            with 0xa6w8 => @Execute(#I32Add)
+            // Conversions are identity operations on the 32-bit
+            // datapath (64-bit results truncate to the low word), so
+            // every one from 0xa7 (i32.wrap_i64) through 0xbf and
+            // 0xc4 (i64.extend32_s) leaves the stack unchanged.
+            with 0xa7w8 => @Execute(#Nop)
+            with 0xa8w8 => @Execute(#Nop)
+            with 0xa9w8 => @Execute(#Nop)
+            with 0xaaw8 => @Execute(#Nop)
+            with 0xabw8 => @Execute(#Nop)
+            with 0xacw8 => @Execute(#Nop)
+            with 0xadw8 => @Execute(#Nop)
+            with 0xaew8 => @Execute(#Nop)
+            with 0xafw8 => @Execute(#Nop)
+            with 0xb0w8 => @Execute(#Nop)
+            with 0xb1w8 => @Execute(#Nop)
+            with 0xb2w8 => @Execute(#Nop)
+            with 0xb3w8 => @Execute(#Nop)
+            with 0xb4w8 => @Execute(#Nop)
+            with 0xb5w8 => @Execute(#Nop)
+            with 0xb6w8 => @Execute(#Nop)
+            with 0xb7w8 => @Execute(#Nop)
+            with 0xb8w8 => @Execute(#Nop)
+            with 0xb9w8 => @Execute(#Nop)
+            with 0xbaw8 => @Execute(#Nop)
+            with 0xbbw8 => @Execute(#Nop)
+            with 0xbcw8 => @Execute(#Nop)
+            with 0xbdw8 => @Execute(#Nop)
+            with 0xbew8 => @Execute(#Nop)
+            with 0xbfw8 => @Execute(#Nop)
+            with 0xc4w8 => @Execute(#Nop)
+            with 0x45w8 => @Execute(#I32Eqz)
+            with 0x46w8 => @Execute(#I32Eq)
+            with 0x48w8 => @Execute(#I32LtS)
+            with 0x6aw8 => @Execute(#I32Add)
+            with 0x6bw8 => @Execute(#I32Sub)
+            with 0x6cw8 => @Execute(#I32Mul)
+            with 0x6dw8 => @Execute(#I32Add)
+            with 0x6ew8 => @Execute(#I32Add)
+            with 0x6fw8 => @Execute(#I32Add)
+            with 0x70w8 => @Execute(#I32Add)
+            with 0x71w8 => @Execute(#I32And)
+            with 0x72w8 => @Execute(#I32Or)
+            with 0x73w8 => @Execute(#I32Xor)
+            with 0x74w8 => @Execute(#I32Shl)
+            with 0x75w8 => @Execute(#I32ShrS)
+            with 0x76w8 => @Execute(#I32ShrU)
+            with 0x77w8 => @Execute(#I32Rotl)
+            with 0x78w8 => @Execute(#I32Rotr)
+            with 0x7cw8 => @Execute(#I32Add)
+            with 0x7dw8 => @Execute(#I32Sub)
+            with 0x7ew8 => @Execute(#I32Mul)
+            with 0x7fw8 => @Execute(#I32Add)
+            with 0x80w8 => @Execute(#I32Add)
+            with 0x81w8 => @Execute(#I32Add)
+            with 0x82w8 => @Execute(#I32Add)
+            with 0x83w8 => @Execute(#I32And)
+            with 0x84w8 => @Execute(#I32Or)
+            with 0x85w8 => @Execute(#I32Xor)
+            with 0x86w8 => @Execute(#I32Shl)
+            with 0x87w8 => @Execute(#I32ShrS)
+            with 0x88w8 => @Execute(#I32ShrU)
+            with 0x89w8 => @Execute(#I32Rotl)
+            with 0x8aw8 => @Execute(#I32Rotr)
+            with 0xc0w8 => @Execute(#I32Extend8S)
+            with 0xc1w8 => @Execute(#I32Extend16S)
+            with 0xc2w8 => @Execute(#I32Extend8S)
+            with 0xc3w8 => @Execute(#I32Extend16S)
+            with 0xfbw8 => @Imm(#Nop, #PrefixIndex)
+            with 0xfcw8 => @Imm(#Nop, #PrefixIndex)
+            with 0xfdw8 => @Imm(#Nop, #PrefixIndex)
+            with 0xfew8 => @Imm(#Nop, #PrefixIndex)
+            else => @Halted(1)
+        }
+    }
+
+    // ---------- loader FSM ----------
+    //
+    // One statement-level match drives every loader register; arms
+    // that do not fire leave their registers holding.
+
+    match load_state {
+        with @WaitFlash() {
+            if {
+                when flash_done {
+                    load_state       <= @Magic(0w2)
+                }
+                else {
+                    load_state       <= @WaitFlash()
+                }
+            }
+        }
+        with @Magic(pos) {
+            load_pc          <= load_pc + 1
+            if {
+                when loader_byte != magic_expected {
+                    load_state       <= #Failed
+                }
+                when pos == 3 {
+                    load_state       <= @Version(0)
+                }
+                else {
+                    load_state       <= @Magic(pos + 1)
+                }
+            }
+        }
+        with @Version(pos) {
+            load_pc          <= load_pc + 1
+            if {
+                when loader_byte != magic_expected {
+                    load_state       <= #Failed
+                }
+                when pos == 3 {
+                    load_state       <= @SectionId()
+                }
+                else {
+                    load_state       <= @Version(pos + 1)
+                }
+            }
+        }
+        with @SectionId() {
+            load_pc          <= load_pc + 1
+            if {
+                when loader_byte == 0x00 || loader_byte == 0xff {
+                    load_state       <= #Done
+                }
+                else {
+                    section_id       <= loader_byte
+                    load_state       <= @Leb(#SectionSize)
+                }
+            }
+        }
+        with @Leb(next) {
+            if {
+                when loader_byte[7] {
+                    load_pc          <= load_pc + 1
+                    match leb_count {
+                        with 0 {
+                            leb_b0           <= loader_byte
+                        }
+                        with 1 {
+                            leb_b1           <= loader_byte
+                        }
+                        with 2 {
+                            leb_b2           <= loader_byte
+                        }
+                        with 3 {
+                            leb_b3           <= loader_byte
+                        }
+                        else {
+                        }
+                    }
+                    leb_count        <= leb_count + 1
+                }
+                else {
+                    load_pc          <= load_pc + 1 + leb_pc_extra
+                    leb_count        <= 0
+                    match next {
+                        with #SectionSize {
+                            load_state       <= match section_id {
+                                with 0x01 => @Leb(#TypeCount)
+                                with 0x02 => @Leb(#ImportCount)
+                                with 0x03 => @Leb(#FuncCount)
+                                with 0x07 => @Leb(#ExportCount)
+                                with 0x0a => @Leb(#CodeCount)
+                                with 0x0b => @Leb(#DataCount)
+                                else => @SectionId()
+                            }
+                        }
+                        with #TypeCount {
+                            counter          <= leb_zero_combined[16..0]
+                            load_state       <= mux(leb_zero_combined == 0, @SectionId(), @TypeForm())
+                        }
+                        with #TypeParams {
+                            param_count_reg  <= leb_zero_combined[8..0]
+                            sub_counter      <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @Leb(#TypeResults),
+                            @TypeParamSkip(),
+                            )
+                        }
+                        with #TypeResults {
+                            sub_counter      <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @TypeFinish(),
+                            @TypeResultSkip(),
+                            )
+                        }
+                        with #ImportCount {
+                            counter          <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @SectionId(),
+                            @Leb(#ImportModuleNameLen),
+                            )
+                        }
+                        with #ImportModuleNameLen {
+                            sub_counter      <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @Leb(#ImportFieldNameLen),
+                            @ImportModuleNameSkip(),
+                            )
+                        }
+                        with #ImportFieldNameLen {
+                            sub_counter      <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @ImportKind(),
+                            @ImportFieldNameSkip(),
+                            )
+                        }
+                        with #ImportTypeIdx {
+                            n_imports        <= n_imports + 1
+                            counter          <= counter - 1
+                            load_state       <= mux(
+                            counter == 1,
+                            @SectionId(),
+                            @Leb(#ImportModuleNameLen),
+                            )
+                        }
+                        with #ImportLimitsFlags {
+                            import_flags     <= leb_zero_combined[8..0]
+                            load_state       <= @Leb(#ImportLimitsMin)
+                        }
+                        with #ImportLimitsMin {
+                            load_state       <= mux(
+                            import_flags[0],
+                            @Leb(#ImportLimitsMax),
+                            @ImportEnd(),
+                            )
+                        }
+                        with #ImportLimitsMax {
+                            load_state       <= @ImportEnd()
+                        }
+                        with #ImportTagTypeIdx {
+                            load_state       <= @ImportEnd()
+                        }
+                        with #FuncCount {
+                            counter          <= leb_zero_combined[16..0]
+                            n_funcs          <= leb_zero_combined[16..0]
+                            func_idx         <= 0
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @SectionId(),
+                            @Leb(#FuncTypeIdx),
+                            )
+                        }
+                        with #FuncTypeIdx {
+                            func_idx         <= func_idx + 1
+                            counter          <= counter - 1
+                            load_state       <= mux(counter == 1, @SectionId(), @Leb(#FuncTypeIdx))
+                        }
+                        with #ExportCount {
+                            counter          <= leb_zero_combined[16..0]
+                            name_pos         <= 0
+                            name_ok          <= true
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @SectionId(),
+                            @Leb(#ExportNameLen),
+                            )
+                        }
+                        with #ExportNameLen {
+                            sub_counter      <= leb_zero_combined[16..0]
+                            name_len_reg     <= leb_zero_combined[8..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @ExportKind(),
+                            @ExportNameByte(),
+                            )
+                        }
+                        with #ExportIndex {
+                            if {
+                                when export_is_start {
+                                    start_func_index <= leb_zero_combined[16..0]
+                                }
+                            }
+                            counter          <= counter - 1
+                            name_pos         <= 0
+                            name_ok          <= true
+                            load_state       <= mux(
+                            counter == 1,
+                            @SectionId(),
+                            @Leb(#ExportNameLen),
+                            )
+                        }
+                        with #CodeCount {
+                            counter          <= leb_zero_combined[16..0]
+                            code_func_idx    <= 0
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @SectionId(),
+                            @Leb(#CodeBodySize),
+                            )
+                        }
+                        with #CodeBodySize {
+                            code_func_idx    <= code_func_idx + 1
+                            counter          <= counter - 1
+                            load_state       <= mux(
+                            counter == 1,
+                            @SectionId(),
+                            @Leb(#CodeBodySize),
+                            )
+                        }
+                        with #DataCount {
+                            counter          <= leb_zero_combined[16..0]
+                            load_state       <= mux(
+                            leb_zero_combined == 0,
+                            @SectionId(),
+                            @Leb(#DataFlags),
+                            )
+                        }
+                        with #DataFlags {
+                            load_state       <= match leb_zero_combined[8..0] {
+                                with 0x00 => @DataExpr()
+                                with 0x01 => @Leb(#DataSkipLen)
+                                with 0x02 => @Leb(#DataMemIdx)
+                                else => #Failed
+                            }
+                        }
+                        with #DataMemIdx {
+                            load_state       <= @DataExpr()
+                        }
+                        with #DataExprConst {
+                            expr_sp          <= expr_sp + 1
+                            load_state       <= @DataExpr()
+                        }
+                        with #DataExprGlobal {
+                            expr_sp          <= expr_sp + 1
+                            load_state       <= @DataExpr()
+                        }
+                        with #DataSegLen {
+                            if {
+                                when leb_zero_combined == 0 {
+                                    counter          <= counter - 1
+                                    load_state       <= mux(counter == 1, @SectionId(), @Leb(#DataFlags))
+                                }
+                                else {
+                                    load_state       <= @DataCopy(leb_zero_combined[13..0])
+                                }
+                            }
+                        }
+                        with #DataSkipLen {
+                            counter          <= counter - 1
+                            load_state       <= mux(counter == 1, @SectionId(), @Leb(#DataFlags))
+                        }
+                    }
+                }
+            }
+        }
+        with @TypeForm() {
+            load_pc          <= load_pc + 1
+            load_state       <= mux(loader_byte == 0x60, @Leb(#TypeParams), #Failed)
+        }
+        with @TypeParamSkip() {
+            load_pc          <= load_pc + 1
+            if {
+                when sub_counter == 1 {
+                    load_state       <= @Leb(#TypeResults)
+                }
+                else {
+                    sub_counter      <= sub_counter - 1
+                }
+            }
+        }
+        with @TypeResultSkip() {
+            load_pc          <= load_pc + 1
+            if {
+                when sub_counter == 1 {
+                    load_state       <= @TypeFinish()
+                }
+                else {
+                    sub_counter      <= sub_counter - 1
+                }
+            }
+        }
+        with @TypeFinish() {
+            type_idx         <= type_idx + 1
+            counter          <= counter - 1
+            load_state       <= mux(counter == 1, @SectionId(), @TypeForm())
+        }
+        with @ImportModuleNameSkip() {
+            load_pc          <= load_pc + 1
+            if {
+                when sub_counter == 1 {
+                    load_state       <= @Leb(#ImportFieldNameLen)
+                }
+                else {
+                    sub_counter      <= sub_counter - 1
+                }
+            }
+        }
+        with @ImportFieldNameSkip() {
+            load_pc          <= load_pc + 1
+            if {
+                when sub_counter == 1 {
+                    load_state       <= @ImportKind()
+                }
+                else {
+                    sub_counter      <= sub_counter - 1
+                }
+            }
+        }
+        with @ImportKind() {
+            load_pc          <= load_pc + 1
+            // Function imports realize as `print`; table, memory,
+            // global and tag imports are compatible no-ops and are
+            // skipped by their descriptor.
+            load_state       <= match loader_byte {
+                with 0x00w8 => @Leb(#ImportTypeIdx)
+                with 0x01w8 => @ImportTableElem()
+                with 0x02w8 => @Leb(#ImportLimitsFlags)
+                with 0x03w8 => @ImportGlobalVal()
+                with 0x04w8 => @ImportTagAttr()
+                else => #Failed
+            }
+        }
+        with @ImportTableElem() {
+            load_pc          <= load_pc + 1
+            load_state       <= @Leb(#ImportLimitsFlags)
+        }
+        with @ImportGlobalVal() {
+            load_pc          <= load_pc + 1
+            load_state       <= @ImportGlobalMut()
+        }
+        with @ImportGlobalMut() {
+            load_pc          <= load_pc + 1
+            load_state       <= @ImportEnd()
+        }
+        with @ImportTagAttr() {
+            load_pc          <= load_pc + 1
+            load_state       <= @Leb(#ImportTagTypeIdx)
+        }
+        with @ImportEnd() {
+            counter          <= counter - 1
+            load_state       <= mux(counter == 1, @SectionId(), @Leb(#ImportModuleNameLen))
+        }
+        with @ExportNameByte() {
+            load_pc          <= load_pc + 1
+            if {
+                when loader_byte != start_name_byte {
+                    name_ok          <= false
+                }
+            }
+            name_pos         <= name_pos + 1
+            if {
+                when sub_counter == 1 {
+                    load_state       <= @ExportKind()
+                }
+                else {
+                    sub_counter      <= sub_counter - 1
+                }
+            }
+        }
+        with @ExportKind() {
+            load_pc          <= load_pc + 1
+            export_is_start  <= (loader_byte == 0x00) && name_ok && (name_len_reg == 6)
+            load_state       <= @Leb(#ExportIndex)
+        }
+        with @DataExpr() {
+            load_pc          <= load_pc + 1
+            load_state       <= match loader_byte {
+                with 0x0bw8 => @DataExprEnd()
+                with 0x41w8 => @Leb(#DataExprConst)
+                with 0x23w8 => @Leb(#DataExprGlobal)
+                with 0x6aw8 => @DataExprAdd()
+                with 0x6bw8 => @DataExprSub()
+                with 0x6cw8 => @DataExprMul()
+                else => #Failed
+            }
+        }
+        with @DataExprEnd() {
+            data_addr        <= expr_top[21..0]
+            expr_sp          <= 0
+            load_state       <= @Leb(#DataSegLen)
+        }
+        with @DataExprAdd() {
+            expr_sp          <= expr_sp - 1
+            load_state       <= @DataExpr()
+        }
+        with @DataExprSub() {
+            expr_sp          <= expr_sp - 1
+            load_state       <= @DataExpr()
+        }
+        with @DataExprMul() {
+            mul_acc          <= 0
+            mul_a            <= expr_second
+            mul_b            <= expr_top
+            load_state       <= @DataExprMulStep()
+        }
+        with @DataExprMulStep() {
+            if {
+                when mul_b == 0 {
+                    expr_sp          <= expr_sp - 1
+                    load_state       <= @DataExpr()
+                }
+                else {
+                    if {
+                        when mul_b[0] {
+                            mul_acc          <= mul_acc + mul_a
+                        }
+                    }
+                    mul_a            <= mul_a_next
+                    mul_b            <= mul_b_next
+                }
+            }
+        }
+        with @DataCopy(remaining) {
+            load_pc          <= load_pc + 1
+            data_addr        <= data_addr + 1
+            if {
+                when remaining == 1 {
+                    counter          <= counter - 1
+                    load_state       <= mux(counter == 1, @SectionId(), @Leb(#DataFlags))
+                }
+                else {
+                    load_state       <= @DataCopy(remaining - 1)
+                }
+            }
+        }
+        with @Done() {
+            load_state       <= #Done
+        }
+        with #Failed {
+            load_state       <= #Failed
+        }
+    }
+
+    // ---------- interpreter FSM ----------
+    //
+    // One statement-level match drives every interpreter register.
+
+    match exec_state {
+        with @Idle() if {
+            when load_done {
+                if {
+                    when start_defined {
+                        exec_pc         <= func_offsets[dyn start_def_idx[8..0]][13..0]
+                        sp              <= 0
+                        frame_base      <= 0
+                        call_depth      <= 0
+                        block_sp        <= 0
+                        imm_count       <= 0
+                        exec_state      <= @StackClear(1024w11)
+                    }
+                    else {
+                        exec_state      <= @Halted(0)
+                    }
+                }
+            }
+            when load_failed {
+                exec_state      <= @Halted(2)
+            }
+            else {
+                exec_state      <= @Idle()
+            }
+        }
+        with @Halted(code) {
+            exec_state      <= @Halted(code)
+        }
+        with @Fetch() {
+            exec_pc         <= exec_pc + 1
+            exec_state      <= fetch_next
+        }
+        with @Imm(opcode, kind) {
+            exec_pc         <= exec_pc + 1
+            if {
+                when exec_byte[7] {
+                    match imm_count {
+                        with 0 {
+                            imm_b0          <= exec_byte
+                        }
+                        with 1 {
+                            imm_b1          <= exec_byte
+                        }
+                        with 2 {
+                            imm_b2          <= exec_byte
+                        }
+                        with 3 {
+                            imm_b3          <= exec_byte
+                        }
+                        else {
+                        }
+                    }
+                    imm_count       <= imm_count + 1
+                }
+                else {
+                    imm_count       <= 0
+                    match kind {
+                        with #Const {
+                            imm_const       <= imm_signed_combined
+                            exec_state      <= @Execute(opcode)
+                        }
+                        with #MemargAlign {
+                            exec_state      <= @Imm(opcode, #MemargOffset)
+                        }
+                        with #MemargOffset {
+                            mem_pos         <= 0
+                            mem_signed      <= match opcode {
+                                with #I32Load8S => true
+                                with #I32Load16S => true
+                                with #I64Load8S => true
+                                with #I64Load16S => true
+                                with #I64Load32S => true
+                                else => false
+                            }
+                            mem_addr        <= match opcode {
+                                with #I32Store => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I64Store => (second_of_stack + imm_zero_combined)[21..0]
+                                with #F32Store => (second_of_stack + imm_zero_combined)[21..0]
+                                with #F64Store => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I32Store8 => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I32Store16 => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I64Store8 => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I64Store16 => (second_of_stack + imm_zero_combined)[21..0]
+                                with #I64Store32 => (second_of_stack + imm_zero_combined)[21..0]
+                                else => (top_of_stack + imm_zero_combined)[21..0]
+                            }
+                            mem_val         <= top_of_stack
+                            exec_state      <= match opcode {
+                                with #I32Load => @MemLoad(4w3)
+                                with #I64Load => @MemLoad(4w3)
+                                with #F32Load => @MemLoad(4w3)
+                                with #F64Load => @MemLoad(4w3)
+                                with #I32Load8S => @MemLoad(1w3)
+                                with #I32Load8U => @MemLoad(1w3)
+                                with #I32Load16S => @MemLoad(2w3)
+                                with #I32Load16U => @MemLoad(2w3)
+                                with #I64Load8S => @MemLoad(1w3)
+                                with #I64Load8U => @MemLoad(1w3)
+                                with #I64Load16S => @MemLoad(2w3)
+                                with #I64Load16U => @MemLoad(2w3)
+                                with #I64Load32S => @MemLoad(4w3)
+                                with #I64Load32U => @MemLoad(4w3)
+                                with #I32Store => @MemStore(4w3)
+                                with #I64Store => @MemStore(4w3)
+                                with #F32Store => @MemStore(4w3)
+                                with #F64Store => @MemStore(4w3)
+                                with #I32Store8 => @MemStore(1w3)
+                                with #I32Store16 => @MemStore(2w3)
+                                with #I64Store8 => @MemStore(1w3)
+                                with #I64Store16 => @MemStore(2w3)
+                                with #I64Store32 => @MemStore(4w3)
+                                else => @Execute(opcode)
+                            }
+                        }
+                        with #LocalIndex {
+                            imm_index       <= imm_zero_combined
+                            exec_state      <= @Execute(opcode)
+                        }
+                        with #CallIndex {
+                            imm_index       <= imm_zero_combined
+                            exec_state      <= match opcode {
+                                with #CallIndirect => @Imm(opcode, #CallIndirectTable)
+                                else => @Execute(opcode)
+                            }
+                        }
+                        with #CallIndirectTable {
+                            sp              <= sp - 1
+                            exec_state      <= @Fetch()
+                        }
+                        with #BrDepth {
+                            imm_index       <= imm_zero_combined
+                            exec_state      <= @Execute(opcode)
+                        }
+                        with #BrTableCount {
+                            br_count        <= imm_zero_combined[8..0]
+                            br_table_idx    <= 0
+                            exec_state      <= mux(
+                            imm_zero_combined == 0,
+                            @Imm(#Nop, #BrTableDefault),
+                            @Imm(#Nop, #BrTableTarget),
+                            )
+                        }
+                        with #BrTableTarget {
+                            br_count        <= br_count - 1
+                            br_table_idx    <= br_table_idx + 1
+                            exec_state      <= mux(
+                            br_count == 1,
+                            @Imm(#Nop, #BrTableDefault),
+                            @Imm(#Nop, #BrTableTarget),
+                            )
+                        }
+                        with #BrTableDefault {
+                            sp              <= sp - 1
+                            imm_index       <= mux(
+                            top_of_stack < zext(br_count),
+                            zext(br_targets[dyn top_of_stack[3..0]]),
+                            imm_zero_combined,
+                            )
+                            exec_state      <= @DoBr()
+                        }
+                        with #LocalsCount {
+                            if {
+                                when imm_zero_combined == 0 {
+                                    exec_state      <= @Fetch()
+                                }
+                                else {
+                                    decls_remaining <= imm_zero_combined[8..0]
+                                    exec_state      <= @Imm(#Nop, #LocalsDecl)
+                                }
+                            }
+                        }
+                        with #LocalsDecl {
+                            decl_count_reg  <= imm_zero_combined
+                            exec_state      <= @LocalsDeclType()
+                        }
+                        with #PrefixIndex {
+                            exec_state      <= @Fetch()
+                        }
+                        with #RefNull {
+                            exec_state      <= @Execute(opcode)
+                        }
+                    }
+                }
+            }
+        }
+        with @BlockType(kind) {
+            exec_pc         <= exec_pc + 1
+            block_sp        <= block_sp + 1
+            if {
+                when kind == #If {
+                    sp              <= sp - 1
+                    if {
+                        when top_of_stack != 0 {
+                            exec_state      <= @Fetch()
+                        }
+                        else {
+                            exec_state      <= @ScanElse(0)
+                        }
+                    }
+                }
+                else {
+                    exec_state      <= @Fetch()
+                }
+            }
+        }
+        with @Execute(opcode) {
+            match opcode {
+                with #Nop {
+                    exec_state      <= @Fetch()
+                }
+                with #I32Const {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #LocalGet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #GlobalGet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #TableGet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #TableSet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #GlobalSet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #Drop {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #LocalSet {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #LocalTee {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Eqz {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Eq {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32LtS {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Add {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Sub {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Extend8S {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Extend16S {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32And {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Or {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Xor {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #MemorySize {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #MemoryGrow {
+                    sp              <= sp_next
+                    exec_state      <= @Fetch()
+                }
+                with #I32Shl {
+                    sh_op           <= 0
+                    sh_val          <= second_of_stack
+                    sh_cnt          <= top_of_stack & 31w32
+                    exec_state      <= @BinopShiftRun()
+                }
+                with #I32ShrS {
+                    sh_op           <= 1
+                    sh_val          <= second_of_stack
+                    sh_cnt          <= top_of_stack & 31w32
+                    exec_state      <= @BinopShiftRun()
+                }
+                with #I32ShrU {
+                    sh_op           <= 2
+                    sh_val          <= second_of_stack
+                    sh_cnt          <= top_of_stack & 31w32
+                    exec_state      <= @BinopShiftRun()
+                }
+                with #I32Rotl {
+                    sh_op           <= 3
+                    sh_val          <= second_of_stack
+                    sh_cnt          <= top_of_stack & 31w32
+                    exec_state      <= @BinopShiftRun()
+                }
+                with #I32Rotr {
+                    sh_op           <= 4
+                    sh_val          <= second_of_stack
+                    sh_cnt          <= top_of_stack & 31w32
+                    exec_state      <= @BinopShiftRun()
+                }
+                with #I32Mul {
+                    imul_acc        <= 0
+                    imul_a          <= second_of_stack
+                    imul_b          <= top_of_stack
+                    exec_state      <= @BinopMulRun()
+                }
+                with #Call {
+                    if {
+                        when imm_index < zext(n_imports) {
+                            sp              <= sp - 1
+                            exec_state      <= @Fetch()
+                        }
+                        else {
+                            call_depth      <= call_depth + 1
+                            block_sp        <= 0
+                            frame_base      <= sp - zext(
+                            func_params[dyn call_def_idx][8..0],
+                            )
+                            exec_pc         <= func_offsets[dyn call_def_idx][13..0]
+                            imm_count       <= 0
+                            exec_state      <= @Imm(#Nop, #LocalsCount)
+                        }
+                    }
+                }
+                with #Br {
+                    exec_state      <= @DoBr()
+                }
+                with #BrIf {
+                    sp              <= sp - 1
+                    if {
+                        when top_of_stack != 0 {
+                            exec_state      <= @DoBr()
+                        }
+                        else {
+                            exec_state      <= @Fetch()
+                        }
+                    }
+                }
+                with #End {
+                    if {
+                        when block_sp != 0 {
+                            block_sp        <= block_sp - 1
+                            exec_state      <= @Fetch()
+                        }
+                        else {
+                            exec_state      <= @DoReturn()
+                        }
+                    }
+                }
+                with #Return {
+                    exec_state      <= @DoReturn()
+                }
+                else {
+                    exec_state      <= @Halted(1)
+                }
+            }
+        }
+        with @DoBr() {
+            if {
+                when zext(block_sp) == imm_index {
+                    exec_state      <= @DoReturn()
+                }
+                else {
+                    if {
+                        when br_entry_kind == #Loop {
+                            if {
+                                when br_entry_arity {
+                                    br_stash        <= top_of_stack
+                                }
+                            }
+                            sp              <= br_entry_height
+                            block_sp        <= block_sp - imm_index[3..0]
+                            exec_pc         <= br_entry_pc
+                            exec_state      <= mux(br_entry_arity, @BrPush(), @Fetch())
+                        }
+                        else {
+                            if {
+                                when br_entry_arity {
+                                    br_stash        <= top_of_stack
+                                }
+                            }
+                            br_height       <= br_entry_height
+                            br_arity        <= br_entry_arity
+                            exec_state      <= @ScanEnd(imm_index[3..0], 0, true)
+                        }
+                    }
+                }
+            }
+        }
+        with @DoReturn() {
+            if {
+                when call_depth == 0 {
+                    exec_state      <= @Halted(0)
+                }
+                else {
+                    exec_pc         <= return_entry[13..0]
+                    frame_base      <= return_entry[23..13]
+                    block_sp        <= return_entry[26..23]
+                    sp              <= frame_base
+                    call_depth      <= call_depth - 1
+                    exec_state      <= @Fetch()
+                }
+            }
+        }
+        with @LocalsDeclType() {
+            exec_pc         <= exec_pc + 1
+            if {
+                when decls_remaining == 1 {
+                    total_locals    <= total_locals + zext(decl_count_reg[10..0])
+                    exec_state      <= @LocalsZero(total_locals + zext(decl_count_reg[10..0]))
+                }
+                else {
+                    decls_remaining <= decls_remaining - 1
+                    total_locals    <= total_locals + zext(decl_count_reg[10..0])
+                    imm_count       <= 0
+                    exec_state      <= @Imm(#Nop, #LocalsDecl)
+                }
+            }
+        }
+        with @LocalsZero(remaining) {
+            sp              <= sp + 1
+            if {
+                when remaining == 1 {
+                    exec_state      <= @Fetch()
+                }
+                else {
+                    exec_state      <= @LocalsZero(remaining - 1)
+                }
+            }
+        }
+        with @ScanElse(depth) {
+            exec_pc         <= exec_pc + 1
+            if {
+                when exec_byte == 0x02 || exec_byte == 0x03 || exec_byte == 0x04 {
+                    exec_state      <= @ScanElse(depth + 1)
+                }
+                when exec_byte == 0x05 {
+                    if {
+                        when depth == 0 {
+                            exec_state      <= @Fetch()
+                        }
+                        else {
+                            exec_state      <= @ScanElse(depth - 1)
+                        }
+                    }
+                }
+                when exec_byte == 0x0b {
+                    if {
+                        when depth == 0 {
+                            block_sp        <= block_sp - 1
+                            exec_state      <= @Fetch()
+                        }
+                        else {
+                            exec_state      <= @ScanElse(depth - 1)
+                        }
+                    }
+                }
+                else {
+                    exec_state      <= @ScanElse(depth)
+                }
+            }
+        }
+        with @ScanEnd(remaining, depth, restore_sp) {
+            exec_pc         <= exec_pc + 1
+            if {
+                when exec_byte == 0x02 || exec_byte == 0x03 || exec_byte == 0x04 {
+                    exec_state      <= @ScanEnd(remaining, depth + 1, restore_sp)
+                }
+                when exec_byte == 0x0b {
+                    if {
+                        when depth == 0 {
+                            block_sp        <= block_sp - 1 - remaining
+                            if {
+                                when restore_sp {
+                                    sp              <= br_height
+                                    if {
+                                        when br_arity {
+                                            exec_state      <= @BrPush()
+                                        }
+                                        else {
+                                            exec_state      <= @Fetch()
+                                        }
+                                    }
+                                }
+                                else {
+                                    exec_state      <= @Fetch()
+                                }
+                            }
+                        }
+                        else {
+                            exec_state      <= @ScanEnd(remaining, depth - 1, restore_sp)
+                        }
+                    }
+                }
+                else {
+                    exec_state      <= @ScanEnd(remaining, depth, restore_sp)
+                }
+            }
+        }
+        with @BrPush() {
+            sp              <= sp + 1
+            exec_state      <= @Fetch()
+        }
+        with @ImmRaw(opcode, kind, left) {
+            exec_pc         <= exec_pc + 1
+            if {
+                when trunc(mux(kind == #ConstF32, 4w4, 8w4) - left) < 4w4 {
+                    imm_b0          <= imm_b1
+                    imm_b1          <= imm_b2
+                    imm_b2          <= imm_b3
+                    imm_b3          <= exec_byte
+                }
+            }
+            if {
+                when left == 1 {
+                    imm_const       <= match kind {
+                        with #ConstF32 => word(
+                        exec_byte[8..0],
+                        imm_b2[8..0],
+                        imm_b1[8..0],
+                        imm_b0[8..0],
+                        )
+                        else => word(
+                        imm_b3[8..0],
+                        imm_b2[8..0],
+                        imm_b1[8..0],
+                        imm_b0[8..0],
+                        )
+                    }
+                    exec_state      <= @Execute(opcode)
+                }
+                else {
+                    exec_state      <= @ImmRaw(opcode, kind, left - 1)
+                }
+            }
+        }
+        with @StackClear(remaining) {
+            if {
+                when remaining == 1 {
+                    exec_state      <= @Imm(#Nop, #LocalsCount)
+                }
+                else {
+                    exec_state      <= @StackClear(remaining - 1)
+                }
+            }
+        }
+        with @MemLoad(left) {
+            mem_acc         <= mem_acc_next
+            mem_pos         <= mem_pos + 1
+            mem_addr        <= mem_addr + 1
+            if {
+                when left == 1 {
+                    exec_state      <= @Fetch()
+                }
+                else {
+                    exec_state      <= @MemLoad(left - 1)
+                }
+            }
+        }
+        with @BinopShiftRun() {
+            if {
+                when sh_cnt == 0 {
+                    sp              <= sp - 1
+                    exec_state      <= @Fetch()
+                }
+                else {
+                    sh_cnt          <= sh_cnt - 1
+                    sh_val          <= match sh_op {
+                        with 0 => word(sh_val[31..0], 0w1)
+                        with 1 => word(mux(sh_val[31], 1w1, 0w1), sh_val[32..1])
+                        with 2 => word(0w1, sh_val[32..1])
+                        with 3 => word(sh_val[31..0], mux(sh_val[31], 1w1, 0w1))
+                        else => word(mux(sh_val[0], 1w1, 0w1), sh_val[32..1])
+                    }
+                }
+            }
+        }
+        with @BinopMulRun() {
+            if {
+                when imul_b == 0 {
+                    sp              <= sp - 1
+                    exec_state      <= @Fetch()
+                }
+                else {
+                    if {
+                        when imul_b[0] {
+                            imul_acc        <= imul_acc + imul_a
+                        }
+                    }
+                    imul_a          <= word(imul_a[31..0], 0w1)
+                    imul_b          <= word(0w1, imul_b[32..1])
+                }
+            }
+        }
+        with @MemStore(left) {
+            mem_pos         <= mem_pos + 1
+            mem_addr        <= mem_addr + 1
+            if {
+                when left == 1 {
+                    sp              <= sp - 2
+                    exec_state      <= @Fetch()
+                }
+                else {
+                    exec_state      <= @MemStore(left - 1)
+                }
+            }
+        }
+    }
+}

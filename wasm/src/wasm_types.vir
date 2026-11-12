@@ -1,0 +1,222 @@
+//! Shared types for the wasm runtime: the binary-format opcodes the
+//! interpreter understands, and the state machines of the loader and
+//! the interpreter.
+
+//> Wasm opcodes supported by the interpreter.
+//>
+//> Enumerant values are the wasm binary opcode bytes. An opcode
+//> outside this set traps the machine (`Halted(1)`).
+pub enum type Opcode {
+    Unreachable = 0x00w8
+    Nop         = 0x01w8
+    Block       = 0x02w8
+    Loop        = 0x03w8
+    If          = 0x04w8
+    Else        = 0x05w8
+    End         = 0x0bw8
+    Br          = 0x0cw8
+    BrIf        = 0x0dw8
+    BrTable     = 0x0ew8
+    Return      = 0x0fw8
+    Call        = 0x10w8
+    CallIndirect = 0x11w8
+    Drop        = 0x1aw8
+    GlobalGet   = 0x23w8
+    GlobalSet   = 0x24w8
+    TableGet    = 0x25w8
+    TableSet    = 0x26w8
+    LocalGet    = 0x20w8
+    LocalSet    = 0x21w8
+    LocalTee    = 0x22w8
+    I32Load8U   = 0x2dw8
+    I32Store8   = 0x3aw8
+    MemorySize  = 0x3fw8
+    MemoryGrow  = 0x40w8
+    I32Load     = 0x28w8
+    I64Load     = 0x29w8
+    F32Load     = 0x2aw8
+    F64Load     = 0x2bw8
+    I32Load8S   = 0x2cw8
+    I32Load16S  = 0x2ew8
+    I32Load16U  = 0x2fw8
+    I64Load8S   = 0x30w8
+    I64Load8U   = 0x31w8
+    I64Load16S  = 0x32w8
+    I64Load16U  = 0x33w8
+    I64Load32S  = 0x34w8
+    I64Load32U  = 0x35w8
+    I32Store    = 0x36w8
+    I64Store    = 0x37w8
+    F32Store    = 0x38w8
+    F64Store    = 0x39w8
+    I32Store16  = 0x3bw8
+    I64Store8   = 0x3cw8
+    I64Store16  = 0x3dw8
+    I64Store32  = 0x3ew8
+    I32Const    = 0x41w8
+    I32Eqz      = 0x45w8
+    I32Eq       = 0x46w8
+    I32LtS      = 0x48w8
+    I32Add      = 0x6aw8
+    I32Sub      = 0x6bw8
+    I32Mul      = 0x6cw8
+    I32And      = 0x71w8
+    I32Or       = 0x72w8
+    I32Xor      = 0x73w8
+    I32Shl      = 0x74w8
+    I32ShrS     = 0x75w8
+    I32ShrU     = 0x76w8
+    I32Rotl     = 0x77w8
+    I32Rotr     = 0x78w8
+    I32Extend8S  = 0xc0w8
+    I32Extend16S = 0xc1w8
+    Prefix0xFB  = 0xfbw8
+    Prefix0xFC  = 0xfcw8
+    Prefix0xFD  = 0xfdw8
+    Prefix0xFE  = 0xfew8
+}
+
+//> Kind of immediate an instruction carries, when fetching it
+//> byte-by-byte as a LEB128 value.
+pub enum type ImmKind {
+    LocalIndex()
+    Const()
+    MemargAlign()
+    MemargOffset()
+    CallIndex()
+    CallIndirectTable()
+    BrDepth()
+    LocalsCount()
+    LocalsDecl()
+    PrefixIndex()
+    RefNull()
+    ConstF32()
+    ConstF64()
+    BrTableCount()
+    BrTableTarget()
+    BrTableDefault()
+}
+
+//> Kind of a structured control-flow entry on the block stack.
+pub enum type BlockKind {
+    Block = 0w2
+    Loop  = 1w2
+    If    = 2w2
+}
+
+//> What the instruction currently in `Execute` does to the operand
+//> stack. The operand-stack write site and the stack-pointer update
+//> are derived from this, so every simple instruction shares one
+//> memory write port.
+pub enum type StackEffect {
+    None()
+    Push()
+    Pop()
+    ReplaceTop()
+    ReplaceSecond()
+    WriteLocalSet()
+    WriteLocalTee()
+    StoreMem()
+}
+
+//> Which LEB128 immediate the loader is collecting, and therefore
+//> what to do once the value is complete.
+pub enum type LebNext {
+    SectionSize()
+    TypeCount()
+    TypeParams()
+    TypeResults()
+    ImportCount()
+    ImportModuleNameLen()
+    ImportFieldNameLen()
+    ImportTypeIdx()
+    ImportLimitsFlags()
+    ImportLimitsMin()
+    ImportLimitsMax()
+    ImportTagTypeIdx()
+    DataExprConst()
+    DataExprGlobal()
+    FuncCount()
+    FuncTypeIdx()
+    ExportCount()
+    ExportNameLen()
+    ExportIndex()
+    CodeCount()
+    CodeBodySize()
+    DataCount()
+    DataFlags()
+    DataOffset()
+    DataSegLen()
+    DataSkipLen()
+    DataMemIdx()
+}
+
+//> Loader state machine.
+//>
+//> Waits for the module image to arrive from SPI flash, then walks
+//> the image section by section: validates the header, records the
+//> import count and the code offsets of defined functions, finds the
+//> `_start` export, and copies data segments into linear memory.
+//> Unknown and non-resident sections are skipped via their size; the
+//> first custom section (id 0x00) — or an erased-flash byte (0xFF),
+//> so unmodified `.wasm` files terminate correctly — ends the module.
+pub union type LoaderState {
+    WaitFlash()
+    Magic(pos          : Word[2])
+    Version(pos        : Word[2])
+    SectionId()
+    Leb(next           : LebNext)
+    TypeForm()
+    TypeParamSkip()
+    TypeResultSkip()
+    TypeFinish()
+    ImportModuleNameSkip()
+    ImportFieldNameSkip()
+    ImportKind()
+    ImportTableElem()
+    ImportGlobalVal()
+    ImportGlobalMut()
+    ImportTagAttr()
+    ImportEnd()
+    DataExpr()
+    DataExprEnd()
+    DataExprAdd()
+    DataExprSub()
+    DataExprMul()
+    DataExprMulStep()
+    ExportNameByte()
+    ExportKind()
+    DataOffsetOp()
+    DataOffsetEnd()
+    DataCopy(remaining : Word[13])
+    Done()
+    Failed()
+}
+
+//> Interpreter state machine.
+//>
+//> `Idle` waits for the loader to finish. `Fetch`/`Imm`/`BlockType`
+//> consume instruction bytes; `Execute` performs one instruction;
+//> the remaining states are multi-cycle helpers for calls, locals
+//> zero-initialization, structured-control-flow scans and branches.
+pub union type ExecState {
+    Idle()
+    Halted(code          : Word[8])
+    Fetch()
+    Imm(opcode           : Opcode, kind : ImmKind)
+    BlockType(kind       : BlockKind)
+    Execute(opcode       : Opcode)
+    DoBr()
+    DoReturn()
+    LocalsDeclType()
+    LocalsZero(remaining : Word[10])
+    ScanElse(depth       : Word[3])
+    ScanEnd(remaining    : Word[3], depth : Word[3], restore_sp : Bit)
+    BrPush()
+    MemLoad(left         : Word[3])
+    MemStore(left        : Word[3])
+    BinopShiftRun()
+    BinopMulRun()
+    StackClear(remaining : Word[11])
+    ImmRaw(opcode : Opcode, kind : ImmKind, left : Word[4])
+}

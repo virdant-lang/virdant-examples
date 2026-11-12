@@ -1,0 +1,153 @@
+//! Test double for the `virt` board's SPI flash device.
+//!
+//! Lets `vir poke` regression tests exercise the full boot path —
+//! SPI read, module-image fill, loader, interpreter — without the
+//! simulator's flash model (which `vir poke` cannot preload).
+
+//> Minimal SPI flash model: answers a `0x03` read command by
+//> streaming the module image at the requested address, MSB first,
+//> one bit per falling edge of `spi_ck` while chip select is low.
+pub mod FakeFlash {
+    incoming clock    : Clock
+    incoming spi_ck   : Bit
+    incoming spi_cs   : Bit
+    incoming spi_mosi : Bit
+
+    //> Serial data out.
+    outgoing spi_miso : Bit {
+        it := miso_reg
+    }
+
+    @image("assets/flash_image.bin")
+    memory image[8192] : Word[8]
+
+    reg prev_ck : Bit {
+        initial it <= false
+    }
+
+    //> Command/address shift register, filled MSB-first.
+    reg rx_shift : Word[32] {
+        initial it <= 0
+    }
+
+    //> Command/address bits received so far.
+    reg rx_count : Word[6] {
+        initial it <= 0
+    }
+
+    reg command_done : Bit {
+        initial it <= false
+    }
+
+    //> Byte currently being streamed out.
+    reg out_byte : Word[8] {
+        initial it <= 0
+    }
+
+    //> Next bit of `out_byte` to present (0 = MSB).
+    reg out_bit : Word[3] {
+        initial it <= 0
+    }
+
+    //> Flash address of `out_byte`.
+    reg out_byte_addr : Word[13] {
+        initial it <= 0
+    }
+
+    reg miso_reg : Bit {
+        initial it <= false
+    }
+
+    wire rising : Bit {
+        it := spi_ck && !prev_ck
+    }
+
+    wire falling : Bit {
+        it := !spi_ck && prev_ck
+    }
+
+    //> The 24-bit address being received, once all 32 command and
+    //> address bits have been shifted in.
+    wire captured_addr : Word[13] {
+        it := word(rx_shift[31..0], spi_mosi)[13..0]
+    }
+
+    prev_ck <= spi_ck
+
+    if {
+        when !spi_cs {
+            if {
+                when rising {
+                    if {
+                        when rx_count < 32 {
+                            rx_shift      <= word(rx_shift[31..0], spi_mosi)
+                            if {
+                                when rx_count == 31 {
+                                    rx_count      <= 32
+                                    command_done  <= true
+                                    out_byte_addr <= captured_addr
+                                    out_bit       <= 0
+                                    out_byte      <= image[dyn captured_addr]
+                                }
+                                else {
+                                    rx_count      <= rx_count + 1
+                                }
+                            }
+                        }
+                    }
+                }
+                when falling {
+                    if {
+                        when command_done {
+                            miso_reg      <= match out_bit {
+                                with 0 => out_byte[7]
+                                with 1 => out_byte[6]
+                                with 2 => out_byte[5]
+                                with 3 => out_byte[4]
+                                with 4 => out_byte[3]
+                                with 5 => out_byte[2]
+                                with 6 => out_byte[1]
+                                else => out_byte[0]
+                            }
+                            if {
+                                when out_bit == 7 {
+                                    out_bit       <= 0
+                                    out_byte      <= image[dyn (out_byte_addr + 1)[13..0]]
+                                    out_byte_addr <= out_byte_addr + 1
+                                }
+                                else {
+                                    out_bit       <= out_bit + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//> Test top: the execution environment booting from `FakeFlash`.
+pub mod TestTop {
+    incoming clock : Clock
+
+    outgoing debug : Valid[Word[8]]
+    outgoing exit  : Valid[Word[8]]
+
+    mod env of exec_env::ExecutionEnvironment {
+        it.clock        := clock
+        it.window_size  := 8192w14
+    }
+
+    mod flash of test_flash::FakeFlash {
+        it.clock    := clock
+        it.spi_ck   := env.spi_ck
+        it.spi_cs   := env.spi_cs
+        it.spi_mosi := env.spi_mosi
+    }
+
+    env.spi_miso := flash.spi_miso
+
+    debug := env.debug
+    exit  := env.exit
+}

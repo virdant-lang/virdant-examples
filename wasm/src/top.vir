@@ -1,0 +1,37 @@
+//! Board top-level: boots the Rust hello-world wasm module from the
+//! virtual board's SPI flash and runs it, piping its `print` import
+//! to the debug port.
+
+import virt
+import exec_env
+
+//> Wasm hello-world for the virt platform.
+//>
+//> The wasm module image is read out of SPI flash at startup (see
+//> `tools/make_flash.py`), then executed; every character the guest
+//> prints appears on the platform's `debug` port.
+pub mod Top for virt::Virt {
+    incoming clock    : Clock
+    incoming rx       : Bit
+    incoming spi_miso : Bit
+
+    outgoing spi_ck   : Bit
+    outgoing spi_cs   : Bit
+    outgoing spi_mosi : Bit
+    outgoing debug    : Valid[Word[8]]
+    outgoing exit     : Valid[Word[8]]
+
+    unused rx
+
+    mod env of exec_env::ExecutionEnvironment {
+        it.clock        := clock
+        it.spi_miso     := spi_miso
+        it.window_size  := 8192w14
+    }
+
+    spi_ck   := env.spi_ck
+    spi_cs   := env.spi_cs
+    spi_mosi := env.spi_mosi
+    debug    := env.debug
+    exit     := env.exit
+}

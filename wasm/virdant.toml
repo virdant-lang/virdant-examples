@@ -1,0 +1,5 @@
+[project]
+name = "wasm"
+
+[prog]
+top = "top::Top"

@@ -1,0 +1,154 @@
+//! SPI flash master for the `virt` board's 16 MiB flash device.
+//!
+//! Performs standard serial flash reads (command `0x03`): chip select
+//! low, 8-bit command, 24-bit address, then a continuous stream of
+//! data bytes, MSB first, one bit per `spi_ck` pulse. Each `spi_ck`
+//! cycle is split into a low phase (drive `spi_mosi`) and a high
+//! phase (the device samples `spi_mosi`; `spi_miso` is sampled on
+//! read bits).
+
+//> Reader state: idle, or one bit in the low (drive) or high (clock)
+//> phase of the serial transfer.
+pub union type ReaderState {
+    Idle()
+    Low()
+    High()
+}
+
+//> SPI flash read master.
+//>
+//> Pulse `start` to read `byte_count` bytes beginning at
+//> `base_address`; each completed byte pulses out of `data` for one
+//> cycle. `busy` is high while a transfer is in progress.
+pub mod SpiFlashReader {
+    incoming clock : Clock
+
+    //> SPI flash clock. Low while `spi_mosi` is being set, high for
+    //> one cycle per bit.
+    outgoing spi_ck : Bit
+    //> SPI flash chip select, active low.
+    outgoing spi_cs : Bit
+    //> SPI flash controller-out data.
+    outgoing spi_mosi : Bit
+    //> SPI flash controller-in data.
+    incoming spi_miso : Bit
+
+    //> Pulse to begin a read transaction.
+    incoming start : Bit
+    //> First flash address to read.
+    incoming base_address : Word[24]
+    //> Number of bytes to stream out.
+    incoming byte_count : Word[16]
+
+    //> One byte of flash data, valid for one cycle per byte.
+    outgoing data : Valid[Word[8]] dependson spi_miso {
+        it := match state {
+            with @High() if {
+                when (tx_bits_remaining == 0) && (rx_bits == 7) =>
+                    @Valid(word(rx_byte[7..0], spi_miso))
+                else => @Invalid()
+            }
+            else => @Invalid()
+        }
+    }
+
+    //> A transfer is in progress.
+    outgoing busy : Bit {
+        it := match state {
+            with #Idle => false
+            else => true
+        }
+    }
+
+    reg state : ReaderState {
+        initial it <= #Idle
+    }
+
+    //> Command/address shift register: `0x03` followed by the
+    //> 24-bit address, MSB first.
+    reg tx_shift : Word[32] {
+        initial it <= 0
+    }
+
+    //> Command/address bits left to clock out.
+    reg tx_bits_remaining : Word[6] {
+        initial it <= 0
+    }
+
+    //> Data bits accumulated for the byte being read.
+    reg rx_byte : Word[8] {
+        initial it <= 0
+    }
+
+    //> Data bits received within the current byte.
+    reg rx_bits : Word[3] {
+        initial it <= 0
+    }
+
+    //> Bytes left to read.
+    reg bytes_remaining : Word[16] {
+        initial it <= 0
+    }
+
+    spi_ck := match state {
+        with @High() => true
+        else => false
+    }
+
+    spi_cs := match state {
+        with #Idle => true
+        else => false
+    }
+
+    spi_mosi := match state {
+        with @Low() => mux(tx_bits_remaining != 0, tx_shift[31], false)
+        else => false
+    }
+
+    match state {
+        with @Idle() {
+            if {
+                when start {
+                    tx_shift          <= word(0x03w8, base_address)
+                    tx_bits_remaining <= 32
+                    rx_bits           <= 0
+                    bytes_remaining   <= byte_count
+                    state             <= @Low()
+                }
+            }
+        }
+        with @Low() {
+            state             <= @High()
+        }
+        with @High() {
+            if {
+                when tx_bits_remaining != 0 {
+                    tx_shift          <= word(tx_shift[31..0], 0w1)
+                    tx_bits_remaining <= tx_bits_remaining - 1
+                    state             <= @Low()
+                }
+                else {
+                    rx_byte           <= word(rx_byte[7..0], spi_miso)
+                    if {
+                        when rx_bits == 7 {
+                            rx_bits           <= 0
+                            if {
+                                when bytes_remaining == 1 {
+                                    state             <= @Idle()
+                                }
+                                else {
+                                    bytes_remaining   <= bytes_remaining - 1
+                                    state             <= @Low()
+                                }
+                            }
+                        }
+                        else {
+                            rx_bits           <= rx_bits + 1
+                            state             <= @Low()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

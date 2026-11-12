@@ -1,0 +1,9 @@
+#> End-to-end regression: boot the raw wasm module from (fake) SPI
+#> flash and run it to completion.
+tick 140000
+print top.env.machine.load_state
+tick 5000
+print top.env.machine.exec_state
+assert top.env.machine.load_state == #Done
+assert top.env.machine.exec_state == #Halted(0)
+exit
