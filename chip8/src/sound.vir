@@ -1,0 +1,24 @@
+//! Placeholder audio device for the CHIP-8 computer.
+
+import chip8
+
+//> Placeholder for the CHIP-8 sound device.
+//>
+//> The CHIP-8 core raises `audio.beep` while its sound timer is
+//> nonzero.  A real development of this module would drive a speaker
+//> pin or a filtered PWM output; the VirtVga virtual board exposes no
+//> audio pins, so the beep is turned into a gated square wave here
+//> (a toggle flip-flop clocked at a fixed audible rate while beep is
+//> true) and then simply not driven anywhere.  The socket wiring in
+//> `top::Top` stays unchanged when the real device arrives.
+pub mod SoundStub {
+    incoming clock : Clock
+
+    server socket audio of chip8::Audio
+
+    //> Square wave for the speaker pin: toggles while beep is true,
+    //> holds low while idle.
+    reg wave : Bit {
+        it <= mux(audio.beep, !it, false)
+    }
+}

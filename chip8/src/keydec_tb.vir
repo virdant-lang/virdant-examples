@@ -1,0 +1,21 @@
+//! Poke testbench for the UART keypad decoder.
+
+import chip8
+import input
+
+mod KeyDecTb {
+    incoming clock : Clock
+    incoming uart_rx : Bit
+
+    client socket probe of chip8::Keypad
+
+    mod dec of input::KeyDecoder {
+        it.clock := clock
+        it.uart_rx := uart_rx
+    }
+    dec.keypad :=: probe
+
+    outgoing key : Word[16] {
+        it := probe.key
+    }
+}

@@ -1,0 +1,814 @@
+//! CHIP-8 processor core and its I/O socket definitions.
+//!
+//! The core implements the classic CHIP-8 machine: 4 KiB of memory,
+//! sixteen 8-bit data registers, a 12-bit address register, a 16-deep
+//! call stack, 60 Hz delay/sound timers, and a 64x32 one-bit
+//! framebuffer.  The program image is written into memory by an
+//! external loader (see `flash_loader::FlashLoader`) while `load_done`
+//! is low; execution starts at 0x200 once the image is complete.
+
+//> Keypad input interface.
+//>
+//> The CHIP-8 core is the client; an input device implements the
+//> server.  `key` holds one bit per CHIP-8 key, indexed 0x0 through
+//> 0xF, true while the key is pressed.
+pub socket Keypad {
+    soci key : Word[16]
+}
+
+//> Sound output interface.
+//>
+//> The CHIP-8 core is the client; a sound device implements the
+//> server.  `beep` is true while the sound timer is nonzero, i.e.
+//> while the buzzer should sound.
+pub socket Audio {
+    cosi beep : Bit
+}
+
+//> One-hot CPU sequencer states.
+//>
+//> `Fetch` - waiting for the run tick, then latching the instruction.
+//> `Execute` - committing a decoded instruction (one cycle).
+//> `WriteVf` - committing the VF flag of a two-result instruction.
+//> `Draw` - XORing a DXY5 sprite into the framebuffer, one pixel per
+//> cycle.
+//> `MemSeq` - walking memory for FX33/FX55/FX65, one byte per cycle.
+//> `WaitKey` - stalled in FX0A until a key is pressed.
+//> `Clear` - clearing the framebuffer for 00E0, one pixel per cycle.
+enum type CpuState {
+    Fetch
+    Execute
+    WriteVf
+    Draw
+    MemSeq
+    WaitKey
+    Clear
+}
+
+//> The CHIP-8 processor core.
+pub mod Chip8 {
+    incoming clock : Clock
+
+    //> Program-load strobe from the flash loader; while true,
+    //> `load_data` is written to `load_addr` this cycle.
+    incoming load_write : Bit
+    //> Program-load address, 0x000 through 0xFFF.
+    incoming load_addr : Word[12]
+    //> Program-load data byte.
+    incoming load_data : Word[8]
+    //> High once the whole program image has been loaded.
+    incoming load_done : Bit
+
+    //> Keypad input.
+    client socket keypad of Keypad
+
+    //> Beep request to the sound device.
+    client socket audio of Audio {
+        it.beep := sound_timer != 0w8
+    }
+
+    //> CHIP-8 column of the pixel being scanned, 0 through 63.
+    incoming scan_x : Word[6]
+    //> CHIP-8 row of the pixel being scanned, 0 through 31.
+    incoming scan_y : Word[5]
+    //> Framebuffer pixel at (`scan_x`, `scan_y`).
+    outgoing scan_pixel : Bit dependson scan_x, scan_y {
+        it := scan_existing[0]
+    }
+
+    //> Runs one CPU cycle every 100_000 board clocks, i.e. about
+    //> 500 CHIP-8 instructions per second at 50 MHz.
+    reg run_divider : Word[17] {
+        initial it <= 0
+        it <= mux(it == 99_999, 0, it + 1)
+    }
+
+    //> 60 Hz frame tick for the delay and sound timers.
+    reg frame_divider : Word[20] {
+        initial it <= 0
+        it <= mux(it == 833_332, 0, it + 1)
+    }
+
+    //> Pseudo-random source for CXNN: a 16-bit maximal-length LFSR.
+    reg rand_lfsr : Word[16] {
+        initial it <= 0xace1
+        it <= word(it[15..0], it[15] ^^ it[13] ^^ it[12] ^^ it[10])
+    }
+
+    //> Current program counter.
+    reg pc : Word[12] {
+        initial it <= 0x200
+        if {
+            when cpu_state == #Execute {
+                it <= execute_next_pc
+            }
+        }
+    }
+
+    //> Current address register.
+    reg addr_i : Word[12] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0xa {
+                it <= addr_nnn
+            }
+            when cpu_state == #Execute && opcode == 0xf && inst_lo == 0x1e {
+                it <= it + zext(reg_x_value)
+            }
+            when cpu_state == #Execute && opcode == 0xf && inst_lo == 0x29 {
+                it <= zext(font_byte_offset)
+            }
+        }
+    }
+
+    //> Call stack pointer; the stack grows upward from empty.
+    reg stack_pointer : Word[4] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0x2 {
+                it <= it + 1
+            }
+            when cpu_state == #Execute && opcode == 0x0 && inst_lo == 0x00ee {
+                it <= it - 1
+            }
+        }
+    }
+
+    //> 60 Hz delay timer.
+    reg delay_timer : Word[8] {
+        initial it <= 0
+        if {
+            when frame_tick && it != 0 {
+                it <= it - 1
+            }
+            when cpu_state == #Execute && opcode == 0xf && inst_lo == 0x15 {
+                it <= reg_x_value
+            }
+        }
+    }
+
+    //> 60 Hz sound timer; nonzero makes `audio.beep` true.
+    reg sound_timer : Word[8] {
+        initial it <= 0
+        if {
+            when frame_tick && it != 0 {
+                it <= it - 1
+            }
+            when cpu_state == #Execute && opcode == 0xf && inst_lo == 0x18 {
+                it <= reg_x_value
+            }
+        }
+    }
+
+    //> VF flag under construction: the carry/borrow/collision result
+    //> of the instruction currently being committed.
+    reg flag_bit : Bit {
+        initial it <= false
+        if {
+            when cpu_state == #Execute && alu_sets_flag {
+                it <= alu_flag_value
+            }
+            when cpu_state == #Execute && opcode == 0xd {
+                it <= false
+            }
+            when cpu_state == #Draw {
+                it <= it || draw_collision
+            }
+        }
+    }
+
+    //> Sequencer state.
+    reg cpu_state : CpuState {
+        initial it <= #Fetch
+        it <= next_cpu_state
+    }
+
+    //> High byte of the latched instruction.
+    reg inst_hi : Word[8] {
+        initial it <= 0
+        if {
+            when cpu_state == #Fetch && run_pulse {
+                it <= main_memory[dyn pc]
+            }
+        }
+    }
+
+    //> Low byte of the latched instruction.
+    reg inst_lo : Word[8] {
+        initial it <= 0
+        if {
+            when cpu_state == #Fetch && run_pulse {
+                it <= main_memory[dyn (pc + 1)]
+            }
+        }
+    }
+
+    //> Sprite row counter for DXY5.
+    reg draw_row : Word[4] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0xd {
+                it <= 0
+            }
+            when cpu_state == #Draw && draw_column == 7 {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Sprite column counter for DXY5.
+    reg draw_column : Word[3] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0xd {
+                it <= 0
+            }
+            when cpu_state == #Draw {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Pixel walk counter for 00E0.
+    reg clear_counter : Word[11] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0x0 && inst_lo == 0x00e0 {
+                it <= 0
+            }
+            when cpu_state == #Clear {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Register index walked by FX55/FX65.
+    reg seq_index : Word[4] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0xf
+                    && (inst_lo == 0x55 || inst_lo == 0x65) {
+                it <= 0
+            }
+            when cpu_state == #MemSeq && inst_lo != 0x33 && it != reg_x {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Byte phase walked by FX33.
+    reg seq_step : Word[2] {
+        initial it <= 0
+        if {
+            when cpu_state == #Execute && opcode == 0xf && inst_lo == 0x33 {
+                it <= 0
+            }
+            when cpu_state == #MemSeq && inst_lo == 0x33 && it != 2 {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> FX0A: true once a key has been seen pressed during this wait.
+    reg waitkey_seen : Bit {
+        initial it <= false
+        if {
+            when cpu_state == #WaitKey {
+                it <= any_key_pressed
+            }
+            else {
+                it <= false
+            }
+        }
+    }
+
+    //> FX0A: key index most recently seen pressed during this wait.
+    reg waitkey_key : Word[4] {
+        initial it <= 0
+        if {
+            when cpu_state == #WaitKey && any_key_pressed {
+                it <= pressed_key_number
+            }
+        }
+    }
+
+    //> The 4 KiB main memory.  During boot the flash loader fills it;
+    //> afterwards only FX55 (store) and FX33 (BCD) write it, through
+    //> the `MemSeq` state.
+    //>
+    //> The FX33 write is explicitly guarded by `inst_lo == 0x33`: it used
+    //> to be the `else` of the FX55 test, so FX65 (also `MemSeq`)
+    //> overwrote `[I + seq_step]` with a BCD digit while loading
+    //> (`roms/test_mem.flash`: F365 read back V2 wrong).  The write
+    //> site once had to route register reads through wires because the
+    //> simulator sampled write sites post-edge (virdant bug3, see
+    //> virdant/bug3/REPORT.md, and `call_stack`); the two-phase commit
+    //> fix (upstream b6d3dde) samples write sites against pre-edge
+    //> values, so direct register reads are exact.  The `bcd_write_*`
+    //> wires stay as plain readable helpers.
+    memory main_memory[4096] : Word[8] {
+        if {
+            when load_write {
+                it[dyn load_addr] <= load_data
+            }
+            else if {
+                when cpu_state == #MemSeq && inst_lo == 0x55 {
+                    it[dyn (addr_i + zext(seq_index))] <= data_registers[dyn seq_index]
+                }
+                else if {
+                    when bcd_write_enable {
+                        it[dyn bcd_write_addr] <= bcd_digit
+                    }
+                }
+            }
+        }
+    }
+
+    //> FX33 write: enable and address of the BCD digit (see
+    //> `main_memory`).
+    wire bcd_write_enable : Bit {
+        it := cpu_state == #MemSeq && inst_lo == 0x33
+    }
+    wire bcd_write_addr : Word[12] {
+        it := addr_i + zext(seq_step)
+    }
+
+    //> The sixteen 8-bit data registers V0 through VF.
+    //>
+    //> Zero-initialized via @image_inline: real-world games assume
+    //> power-on RAM is zeroed (they do not 00E0-clear registers), and
+    //> the simulator starts uninitialized words at random garbage.
+    //> FX0A commits Vx := key at the WaitKey→Fetch exit edge; the
+    //> simulator's two-phase commit samples this write site against
+    //> pre-edge values, so the direct write is exact (an earlier skid
+    //> buffer was needed against the old one-at-a-time commit and has
+    //> been removed).
+    @image_inline("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    memory data_registers[16] : Word[8] {
+        if {
+            when cpu_state == #Execute && execute_writes_v {
+                it[dyn reg_x] <= v_write_data
+            }
+            else if {
+                when cpu_state == #WriteVf {
+                    it[15] <= mux(flag_bit, 1, 0)
+                }
+                else if {
+                    when cpu_state == #WaitKey && waitkey_done {
+                        it[dyn reg_x] <= zext(waitkey_key)
+                    }
+                    else if {
+                        when cpu_state == #MemSeq && inst_lo == 0x65 {
+                            it[dyn seq_index] <= main_memory[dyn (addr_i + zext(seq_index))]
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //> The 16-deep call stack.
+    //>
+    //> The 16-deep call stack: 2NNN pushes the return address.
+    //>
+    //> The write site reads `cpu_state`, `stack_pointer` and `pc`
+    //> directly.  It once had to route those register reads through
+    //> wires because the simulator sampled write sites post-edge
+    //> (virdant bug3, virdant/bug3/REPORT.md); the two-phase commit fix
+    //> (upstream b6d3dde) samples write sites against pre-edge values,
+    //> so the direct reads are exact — verified by the success-path
+    //> 2NNN/00EE roundtrip in `roms/test_mem.flash`.
+    //>
+    //> Zero-initialized via @image_inline (see `data_registers`).
+    @image_inline("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    memory call_stack[16] : Word[16] {
+        if {
+            when cpu_state == #Execute && opcode == 0x2 {
+                it[dyn stack_pointer] <= zext(pc + 2)
+            }
+        }
+    }
+
+    //> The 64x32 one-bit framebuffer, 2048 pixels addressed as
+    //> `y * 64 + x`.  During boot the flash loader fills it; afterwards
+    //> 00E0 clears it, DXYN XORs sprites into it one pixel per cycle.
+    //>
+    //> The Draw-cycle write is a read-modify-write of this very memory:
+    //> `draw_new_pixel` reads `draw_existing` back.  The simulator's
+    //> two-phase commit samples the write site once per edge against
+    //> pre-edge values, so this is exact (an earlier skid buffer was
+    //> needed against the old re-firing write driver and has been
+    //> removed).
+    //>
+    //> Zero-initialized via @image (one byte per Word[1] element, see
+    //> images/frame_buffer_zero.image): real-world games do not 00E0
+    //> at boot and assume a powered-on blank screen; the simulator
+    //> starts uninitialized words at random garbage, which painted
+    //> the whole screen with noise.
+    @image("images/frame_buffer_zero.image")
+    memory frame_buffer[2048] : Word[1] {
+        if {
+            when cpu_state == #Clear {
+                it[dyn clear_counter] <= 0w1
+            }
+            else if {
+                when cpu_state == #Draw {
+                    it[dyn draw_pixel_addr] <= draw_new_pixel
+                }
+            }
+        }
+    }
+
+    wire run_pulse : Bit {
+        it := run_divider == 99_999 && load_done
+    }
+
+    wire frame_tick : Bit {
+        it := frame_divider == 833_332
+    }
+
+    wire pixel_scan_addr : Word[11] {
+        it := word(scan_y, scan_x)
+    }
+
+    wire scan_existing : Word[1] {
+        it := frame_buffer[dyn pixel_scan_addr]
+    }
+
+    //> Next sequencer state.
+    wire next_cpu_state : CpuState {
+        it := if {
+            when cpu_state == #Fetch if {
+                when run_pulse => #Execute
+                else => #Fetch
+            }
+            when cpu_state == #Execute => execute_next_state
+            when cpu_state == #WriteVf => #Fetch
+            when cpu_state == #Draw if {
+                when draw_finished => #WriteVf
+                else => #Draw
+            }
+            when cpu_state == #MemSeq if {
+                when mem_seq_finished => #Fetch
+                else => #MemSeq
+            }
+            when cpu_state == #WaitKey if {
+                when waitkey_done => #Fetch
+                else => #WaitKey
+            }
+            when cpu_state == #Clear if {
+                when clear_counter == 2047 => #Fetch
+                else => #Clear
+            }
+            else => #Fetch
+        }
+    }
+
+    //> State to enter after committing the latched instruction.
+    wire execute_next_state : CpuState {
+        it := if {
+            when opcode == 0x0 if {
+                when inst_lo == 0x00e0 => #Clear
+                else => #Fetch
+            }
+            when opcode == 0x8 => match low_nibble {
+                with 0x4 => #WriteVf
+                with 0x5 => #WriteVf
+                with 0x6 => #WriteVf
+                with 0x7 => #WriteVf
+                with 0xe => #WriteVf
+                else => #Fetch
+            }
+            when opcode == 0xd => #Draw
+            when opcode == 0xf => match inst_lo {
+                with 0x33 => #MemSeq
+                with 0x55 => #MemSeq
+                with 0x65 => #MemSeq
+                with 0x0a => #WaitKey
+                else => #Fetch
+            }
+            else => #Fetch
+        }
+    }
+
+    //> Opcode nibble (bits 7..4 of the instruction's high byte).
+    wire opcode : Word[4] {
+        it := inst_hi[8..4]
+    }
+
+    //> X register index (low nibble of the high byte).
+    wire reg_x : Word[4] {
+        it := inst_hi[4..0]
+    }
+
+    //> Y register index (bits 7..4 of the low byte).
+    wire reg_y : Word[4] {
+        it := inst_lo[8..4]
+    }
+
+    //> Instruction low nibble.
+    wire low_nibble : Word[4] {
+        it := inst_lo[4..0]
+    }
+
+    //> Immediate byte.
+    wire byte_kk : Word[8] {
+        it := inst_lo
+    }
+
+    //> 12-bit address immediate.
+    wire addr_nnn : Word[12] {
+        it := word(inst_hi[4..0], inst_lo)
+    }
+
+    wire reg_x_value : Word[8] {
+        it := data_registers[dyn reg_x]
+    }
+
+    wire reg_y_value : Word[8] {
+        it := data_registers[dyn reg_y]
+    }
+
+    wire v0_value : Word[8] {
+        it := data_registers[0]
+    }
+
+    //> `reg_x_value + reg_y_value` with carry-out, for 8XY4.
+    wire sum_xy : Word[9] {
+        it := reg_x_value +. reg_y_value
+    }
+
+    //> True when low_nibble selects an ALU operation.
+    wire alu_valid : Bit {
+        it := low_nibble <= 0x7 || low_nibble == 0xe
+    }
+
+    //> VX result of the 8XY* ALU operations.
+    wire alu_result : Word[8] {
+        it := match low_nibble {
+            with 0x0 => reg_y_value
+            with 0x1 => reg_x_value | reg_y_value
+            with 0x2 => reg_x_value & reg_y_value
+            with 0x3 => reg_x_value ^ reg_y_value
+            with 0x4 => sum_xy[8..0]
+            with 0x5 => reg_x_value - reg_y_value
+            with 0x6 => word(0w1, reg_x_value[8..1])
+            with 0x7 => reg_y_value - reg_x_value
+            with 0xe => word(reg_x_value[7..0], 0w1)
+            else => dontcare
+        }
+    }
+
+    //> True when an 8XY* operation also produces a VF result.
+    wire alu_sets_flag : Bit {
+        it := opcode == 0x8
+            && (low_nibble == 0x4 || low_nibble == 0x5 || low_nibble == 0x6
+                || low_nibble == 0x7 || low_nibble == 0xe)
+    }
+
+    //> VF result of the current 8XY* operation.
+    wire alu_flag_value : Bit {
+        it := match low_nibble {
+            with 0x4 => sum_xy[8]
+            with 0x5 => reg_x_value >= reg_y_value
+            with 0x6 => reg_x_value[0]
+            with 0x7 => reg_y_value >= reg_x_value
+            with 0xe => reg_x_value[7]
+            else => false
+        }
+    }
+
+    //> True when the Execute state commits a data-register write.
+    wire execute_writes_v : Bit {
+        it := opcode == 0x6
+            || opcode == 0x7
+            || (opcode == 0x8 && alu_valid)
+            || opcode == 0xc
+            || (opcode == 0xf && inst_lo == 0x07)
+    }
+
+    //> Value committed to `reg_x` by the Execute state.
+    wire v_write_data : Word[8] {
+        it := if {
+            when opcode == 0x6 => byte_kk
+            when opcode == 0xc => rand_lfsr[8..0] & byte_kk
+            when opcode == 0x7 => reg_x_value + byte_kk
+            when opcode == 0x8 => alu_result
+            when opcode == 0xf => delay_timer
+            else => dontcare
+        }
+    }
+
+    //> Program counter value committed by the Execute state.
+    wire execute_next_pc : Word[12] {
+        it := if {
+            when opcode == 0x1 || opcode == 0x2 => addr_nnn
+            when opcode == 0xb => addr_nnn + zext(v0_value)
+            when opcode == 0x3 if {
+                when reg_x_value == byte_kk => pc + 4
+                else => pc + 2
+            }
+            when opcode == 0x4 if {
+                when reg_x_value != byte_kk => pc + 4
+                else => pc + 2
+            }
+            when opcode == 0x5 if {
+                when low_nibble == 0x0 && reg_x_value == reg_y_value => pc + 4
+                else => pc + 2
+            }
+            when opcode == 0x9 if {
+                when low_nibble == 0x0 && reg_x_value != reg_y_value => pc + 4
+                else => pc + 2
+            }
+            when opcode == 0x0 && inst_lo == 0x00ee => trunc(call_stack[dyn (stack_pointer - 1)])
+            when opcode == 0xe if {
+                when inst_lo == 0x009e if {
+                    when key_x_pressed => pc + 4
+                    else => pc + 2
+                }
+                when inst_lo == 0x00a1 if {
+                    when !key_x_pressed => pc + 4
+                    else => pc + 2
+                }
+                else => pc + 2
+            }
+            else => pc + 2
+        }
+    }
+
+    //> `5 * reg_x`: the byte offset of the font glyph for `reg_x`,
+    //> used by FX29.
+    wire font_index : Word[4] {
+        it := reg_x_value[4..0]
+    }
+
+    wire font_times4 : Word[7] {
+        it := zext(word(font_index, 0w2))
+    }
+
+    wire font_index_wide : Word[7] {
+        it := zext(font_index)
+    }
+
+    wire font_byte_offset : Word[7] {
+        it := font_times4 + font_index_wide
+    }
+
+    //> CHIP-8 key indexed by `reg_x_value`, for EX9E/EXA1.
+    wire key_x_pressed : Bit {
+        it := keypad.key[dyn reg_x_value[4..0]]
+    }
+
+    wire any_key_pressed : Bit {
+        it := any(keypad.key)
+    }
+
+    //> FX0A is satisfied once a key has been pressed and then released
+    //> again (classic press-and-release semantics).
+    wire waitkey_done : Bit {
+        it := waitkey_seen && !any_key_pressed
+    }
+
+    //> Lowest-index key currently pressed, for FX0A.
+    wire pressed_key_number : Word[4] {
+        it := if {
+            when keypad.key[0]  => 0
+            when keypad.key[1]  => 1
+            when keypad.key[2]  => 2
+            when keypad.key[3]  => 3
+            when keypad.key[4]  => 4
+            when keypad.key[5]  => 5
+            when keypad.key[6]  => 6
+            when keypad.key[7]  => 7
+            when keypad.key[8]  => 8
+            when keypad.key[9]  => 9
+            when keypad.key[10] => 10
+            when keypad.key[11] => 11
+            when keypad.key[12] => 12
+            when keypad.key[13] => 13
+            when keypad.key[14] => 14
+            when keypad.key[15] => 15
+            else => 0
+        }
+    }
+
+    //> Number of sprite rows drawn by the current DXY5, where a zero
+    //> nibble means sixteen.
+    wire sprite_rows : Word[4] {
+        it := mux(low_nibble == 0, 15, low_nibble - 1)
+    }
+
+    wire draw_finished : Bit {
+        it := draw_column == 7 && draw_row == sprite_rows
+    }
+
+    //> Row of the framebuffer pixel currently being drawn, wrapping
+    //> modulo 32.
+    wire draw_y : Word[5] {
+        it := reg_y_value[5..0] + zext(draw_row)
+    }
+
+    //> Column of the framebuffer pixel currently being drawn,
+    //> wrapping modulo 64.
+    wire draw_x : Word[6] {
+        it := reg_x_value[6..0] + zext(draw_column)
+    }
+
+    wire draw_pixel_addr : Word[11] {
+        it := word(draw_y, draw_x)
+    }
+
+    wire draw_sprite_addr : Word[12] {
+        it := addr_i + zext(draw_row)
+    }
+
+    wire draw_sprite_byte : Word[8] {
+        it := main_memory[dyn draw_sprite_addr]
+    }
+
+    wire draw_sprite_pixel : Bit {
+        it := draw_sprite_byte[dyn draw_column]
+    }
+
+    wire draw_existing : Word[1] {
+        it := frame_buffer[dyn draw_pixel_addr]
+    }
+
+    wire draw_new_pixel : Word[1] {
+        it := word(draw_existing[0] ^^ draw_sprite_pixel)
+    }
+
+    wire draw_collision : Bit {
+        it := draw_existing[0] && draw_sprite_pixel
+    }
+
+    wire mem_seq_finished : Bit {
+        it := if {
+            when inst_lo == 0x33 => seq_step == 2
+            else => seq_index == reg_x
+        }
+    }
+
+    //> BCD conversion for FX33.
+    wire bcd_value : Word[8] {
+        it := reg_x_value
+    }
+
+    wire bcd_hundreds : Word[8] {
+        it := if {
+            when bcd_value >= 200 => 2
+            when bcd_value >= 100 => 1
+            else => 0
+        }
+    }
+
+    wire bcd_after_hundreds : Word[8] {
+        it := if {
+            when bcd_value >= 200 => bcd_value - 200
+            when bcd_value >= 100 => bcd_value - 100
+            else => bcd_value
+        }
+    }
+
+    wire bcd_tens : Word[8] {
+        it := if {
+            when bcd_after_hundreds >= 90 => 9
+            when bcd_after_hundreds >= 80 => 8
+            when bcd_after_hundreds >= 70 => 7
+            when bcd_after_hundreds >= 60 => 6
+            when bcd_after_hundreds >= 50 => 5
+            when bcd_after_hundreds >= 40 => 4
+            when bcd_after_hundreds >= 30 => 3
+            when bcd_after_hundreds >= 20 => 2
+            when bcd_after_hundreds >= 10 => 1
+            else => 0
+        }
+    }
+
+    wire bcd_after_tens : Word[8] {
+        it := if {
+            when bcd_after_hundreds >= 90 => bcd_after_hundreds - 90
+            when bcd_after_hundreds >= 80 => bcd_after_hundreds - 80
+            when bcd_after_hundreds >= 70 => bcd_after_hundreds - 70
+            when bcd_after_hundreds >= 60 => bcd_after_hundreds - 60
+            when bcd_after_hundreds >= 50 => bcd_after_hundreds - 50
+            when bcd_after_hundreds >= 40 => bcd_after_hundreds - 40
+            when bcd_after_hundreds >= 30 => bcd_after_hundreds - 30
+            when bcd_after_hundreds >= 20 => bcd_after_hundreds - 20
+            when bcd_after_hundreds >= 10 => bcd_after_hundreds - 10
+            else => bcd_after_hundreds
+        }
+    }
+
+    wire bcd_ones : Word[8] {
+        it := bcd_after_tens
+    }
+
+    wire bcd_digit : Word[8] {
+        it := match seq_step {
+            with 0 => bcd_hundreds
+            with 1 => bcd_tens
+            else => bcd_ones
+        }
+    }
+}

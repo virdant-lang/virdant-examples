@@ -1,0 +1,256 @@
+//! UART keypad decoder for the CHIP-8 computer.
+
+import chip8
+
+//> UART keypad decoder.
+//>
+//> Decodes keystrokes arriving on `uart_rx` (the virtual board's
+//> stdin under `vir run`) into the sixteen CHIP-8 keys 0x0 through
+//> 0xF.
+//>
+//> Framing: 115200 8N1, LSB first.  At the 50 MHz board clock one
+//> bit period is 434.03 cycles; the sampler uses a 434-cycle period,
+//> which accumulates less than a quarter cycle of error over the 8
+//> data bits.
+//>
+//> Keystrokes arrive as ASCII bytes; they are decoded through the
+//> classic CHIP-8 keyboard layout (both cases accepted):
+//>
+//>     1 2 3 4      1 2 3 C
+//>     Q W E R  ->  4 5 6 D
+//>     A S D F      7 8 9 E
+//>     Z X C V      A 0 B F
+//>
+//> Key semantics (UART cannot signal key releases, so this decoder
+//> makes them explicit): receiving a key's character *presses* that
+//> key; receiving the *same* key's character again *releases* it;
+//> receiving a *different* key's character moves the press.  At most
+//> one key is held at a time, which is enough for FX0A's
+//> press-and-release flow and for EX9E/EXA1 skips.  Any other byte
+//> is ignored.
+pub mod KeyDecoder {
+    incoming clock : Clock
+
+    incoming uart_rx : Bit
+
+    server socket keypad of chip8::Keypad {
+        it.key := key_reg
+    }
+
+    //> Previous `uart_rx` value, for falling-edge (start bit) detect.
+    reg rx_prev : Bit {
+        initial it <= true
+        it <= uart_rx
+    }
+
+    //> Consecutive cycles `uart_rx` has been idle-high.  A start bit
+    //> is only trusted after the line has idled for 100 cycles: the
+    //> simulator (and a real line) can glitch low before the design
+    //> settles, and trusting such a glitch would desynchronize the
+    //> framer.  100 cycles is well under a stop bit (434), so
+    //> back-to-back keystrokes still decode.
+    reg idle_counter : Word[9] {
+        initial it <= 0
+        if {
+            when uart_rx if {
+                when it != 511 {
+                    it <= it + 1
+                }
+            }
+            else {
+                it <= 0
+            }
+        }
+    }
+
+    //> True while a frame is being received.
+    reg receiving : Bit {
+        initial it <= false
+        if {
+            when start_detected {
+                it <= true
+            }
+            when byte_done {
+                it <= false
+            }
+        }
+    }
+
+    //> Cycles until the next data-bit sample.  On the start-bit edge
+    //> it loads 650 (the center of data bit 1: 434 + 217), then
+    //> reloads 433 so each sample lands one bit period (434 cycles)
+    //> after the previous one.
+    reg sample_timer : Word[12] {
+        initial it <= 0
+        if {
+            when start_detected {
+                it <= 650
+            }
+            else if {
+                when receiving if {
+                    when it == 0 {
+                        it <= 433
+                    }
+                    else {
+                        it <= it - 1
+                    }
+                }
+            }
+        }
+    }
+
+    //> Number of data bits sampled so far, 0 through 7.
+    reg bit_index : Word[3] {
+        initial it <= 0
+        if {
+            when start_detected {
+                it <= 0
+            }
+            when sample_now && !byte_done {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Data bits shifted in so far, LSB first (new bit enters the
+    //> MSB, so after 8 samples the first bit has reached bit 0).
+    reg shift_reg : Word[8] {
+        initial it <= 0
+        if {
+            when start_detected {
+                it <= 0
+            }
+            when sample_now {
+                it <= word(uart_rx, it[8..1])
+            }
+        }
+    }
+
+    //> One bit per CHIP-8 key; exactly one bit set while a key is
+    //> held, all zero when none is.
+    reg key_reg : Word[16] {
+        initial it <= 0
+        if {
+            when byte_done && byte_is_key if {
+                when it == key_onehot {
+                    it <= 0w16
+                }
+                else {
+                    it <= key_onehot
+                }
+            }
+        }
+    }
+
+    //> Start bit: falling edge on a line that has idled high.
+    wire start_detected : Bit {
+        it := rx_prev && !uart_rx && !receiving && idle_counter >= 100
+    }
+
+    //> Mid-bit sample point for the current data bit.
+    wire sample_now : Bit {
+        it := receiving && sample_timer == 0
+    }
+
+    //> Eighth data bit sampled: the byte is complete.
+    wire byte_done : Bit {
+        it := sample_now && bit_index == 7
+    }
+
+    //> The completed byte, including the bit being sampled this
+    //> cycle.
+    wire rx_byte : Word[8] {
+        it := word(uart_rx, shift_reg[8..1])
+    }
+
+    //> True when the completed byte names a CHIP-8 key.
+    wire byte_is_key : Bit {
+        it := match rx_byte {
+            with 0x31 => true
+            with 0x32 => true
+            with 0x33 => true
+            with 0x34 => true
+            with 0x51 => true
+            with 0x57 => true
+            with 0x77 => true
+            with 0x45 => true
+            with 0x65 => true
+            with 0x52 => true
+            with 0x72 => true
+            with 0x41 => true
+            with 0x61 => true
+            with 0x53 => true
+            with 0x73 => true
+            with 0x44 => true
+            with 0x64 => true
+            with 0x46 => true
+            with 0x66 => true
+            with 0x5a => true
+            with 0x7a => true
+            with 0x58 => true
+            with 0x78 => true
+            with 0x43 => true
+            with 0x63 => true
+            with 0x56 => true
+            with 0x76 => true
+            else => false
+        }
+    }
+
+    //> The completed byte's key index, 0 through 15 (classic CHIP-8
+    //> keyboard layout, both cases).
+    wire key_index : Word[4] {
+        it := match rx_byte {
+            with 0x31 => 0x1
+            with 0x32 => 0x2
+            with 0x33 => 0x3
+            with 0x34 => 0xc
+            with 0x51 => 0x4
+            with 0x57 => 0x5
+            with 0x77 => 0x5
+            with 0x45 => 0x6
+            with 0x65 => 0x6
+            with 0x52 => 0xd
+            with 0x72 => 0xd
+            with 0x41 => 0x7
+            with 0x61 => 0x7
+            with 0x53 => 0x8
+            with 0x73 => 0x8
+            with 0x44 => 0x9
+            with 0x64 => 0x9
+            with 0x46 => 0xe
+            with 0x66 => 0xe
+            with 0x5a => 0xa
+            with 0x7a => 0xa
+            with 0x58 => 0x0
+            with 0x78 => 0x0
+            with 0x43 => 0xb
+            with 0x63 => 0xb
+            with 0x56 => 0xf
+            with 0x76 => 0xf
+            else => 0w4
+        }
+    }
+
+    //> One-hot decode of `key_index` into the 16-bit key vector.
+    wire key_onehot : Word[16] {
+        it := word(
+            key_index == 0xf,
+            key_index == 0xe,
+            key_index == 0xd,
+            key_index == 0xc,
+            key_index == 0xb,
+            key_index == 0xa,
+            key_index == 0x9,
+            key_index == 0x8,
+            key_index == 0x7,
+            key_index == 0x6,
+            key_index == 0x5,
+            key_index == 0x4,
+            key_index == 0x3,
+            key_index == 0x2,
+            key_index == 0x1,
+            key_index == 0x0,
+        )
+    }
+}

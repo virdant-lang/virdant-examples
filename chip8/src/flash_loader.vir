@@ -1,0 +1,179 @@
+//! SPI flash program loader for the CHIP-8 computer.
+
+//> Loader state machine.
+//>
+//> `CmdAddr` - clocking out the 0x03 READ command and the 24-bit
+//> start address.
+//> `ReadData` - clocking program bytes out of the flash, one write
+//> strobe per byte.
+//> `Done` - the whole image is loaded; the flash is deselected.
+enum type LoaderState {
+    CmdAddr
+    ReadData
+    Done
+}
+
+//> Reads the program image out of the SPI flash and streams it into
+//> the CHIP-8's memory.
+//>
+//> Issues a standard 0x03 READ command at address 0x000000 and clocks
+//> out 4096 bytes, one `write_enable` strobe per byte, then raises
+//> `loaded`.  SPI mode 0: the flash samples `flash_mosi` on each
+//> rising `flash_ck` edge and drives `flash_miso` after each falling
+//> edge, so mosi is held through the low phase and miso is sampled at
+//> the end of the low phase.  One bit takes two board clocks, so the
+//> 4 KiB image loads in about 1.3 ms at 50 MHz.
+pub mod FlashLoader {
+    incoming clock : Clock
+
+    //> SPI flash clock.
+    outgoing flash_ck : Bit {
+        it := ck_reg
+    }
+    //> SPI flash chip select (active low).
+    outgoing flash_cs : Bit {
+        it := cs_reg
+    }
+    //> SPI flash controller-out data.
+    outgoing flash_mosi : Bit {
+        it := cmd_shift[31]
+    }
+    //> SPI flash controller-in data.
+    incoming flash_miso : Bit
+
+    //> RAM write strobe: while true, `write_data` is written to
+    //> `write_addr` this cycle.
+    outgoing write_enable : Bit {
+        it := write_pulse
+    }
+    //> RAM address of the byte being loaded.
+    //>
+    //> `write_pulse` is registered, so it asserts one cycle after
+    //> `byte_count` has already advanced past the byte latched in
+    //> `write_data_reg`; the address therefore trails the count by
+    //> one.
+    outgoing write_addr : Word[12] {
+        it := byte_count - 1
+    }
+    //> RAM data of the byte being loaded.
+    outgoing write_data : Word[8] {
+        it := write_data_reg
+    }
+
+    //> High once the whole program image has been loaded.
+    outgoing loaded : Bit {
+        it := loader_state == #Done
+    }
+
+    //> Command and address shift register: 0x03 followed by the
+    //> 24-bit start address 0x000000.
+    //>
+    //> The shift is skipped while `cmd_bits == 0`: `cs_reg` falls at
+    //> the same board edge as the first rising `flash_ck`, and the
+    //> flash model only samples rising edges where CS was already
+    //> low, so the first sampled edge is the *second* rising edge.
+    //> Skipping the first shift keeps bit31 of `cmd_shift` on
+    //> `flash_mosi` through that edge, so the flash samples the
+    //> command MSB-first from bit31.
+    reg cmd_shift : Word[32] {
+        initial it <= word(0x03w8, 0w24)
+        if {
+            when ck_reg && loader_state == #CmdAddr && cmd_bits != 0 {
+                it <= word(it[31..0], 0w1)
+            }
+        }
+    }
+
+    //> Command/address bits clocked out so far.
+    reg cmd_bits : Word[6] {
+        initial it <= 0
+        if {
+            when ck_reg && loader_state == #CmdAddr {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Byte being shifted in from the flash.
+    reg rx_shift : Word[8] {
+        initial it <= 0
+        if {
+            when !ck_reg && loader_state == #ReadData {
+                it <= word(it[7..0], flash_miso)
+            }
+        }
+    }
+
+    //> Bits shifted into the current byte, 0 through 7.
+    reg rx_bits : Word[3] {
+        initial it <= 0
+        if {
+            when !ck_reg && loader_state == #ReadData {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Bytes written into memory so far.
+    reg byte_count : Word[12] {
+        initial it <= 0
+        if {
+            when !ck_reg && loader_state == #ReadData && rx_bits == 7 {
+                it <= it + 1
+            }
+        }
+    }
+
+    //> Completed byte waiting to be written.
+    reg write_data_reg : Word[8] {
+        initial it <= 0
+        if {
+            when !ck_reg && loader_state == #ReadData && rx_bits == 7 {
+                it <= word(rx_shift[7..0], flash_miso)
+            }
+        }
+    }
+
+    //> One-cycle RAM write strobe.
+    reg write_pulse : Bit {
+        initial it <= false
+        it <= !ck_reg && loader_state == #ReadData && rx_bits == 7
+    }
+
+    reg ck_reg : Bit {
+        initial it <= false
+        if {
+            when loader_state == #Done {
+                it <= false
+            }
+            else {
+                it <= !it
+            }
+        }
+    }
+
+    reg cs_reg : Bit {
+        initial it <= true
+        if {
+            when loader_state == #Done {
+                it <= true
+            }
+            else {
+                it <= false
+            }
+        }
+    }
+
+    reg loader_state : LoaderState {
+        initial it <= #CmdAddr
+        if {
+            when it == #CmdAddr && ck_reg && cmd_bits == 32 {
+                it <= #ReadData
+            }
+            when it == #ReadData && !ck_reg && rx_bits == 7
+                    && byte_count == 4095 {
+                it <= #Done
+            }
+        }
+    }
+}

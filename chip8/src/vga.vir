@@ -1,0 +1,65 @@
+//! VGA sync generator and scan-position decoder for the CHIP-8
+//! computer.
+
+//> Generates standard 640x480@60 VGA timing from the 50 MHz board
+//> clock (a /2 divider gives the 25 MHz pixel rate) and translates
+//> the scan position into CHIP-8 framebuffer coordinates.
+//>
+//> The 64x32 CHIP-8 display is rendered as an 8x8-scaled 512x256
+//> block, centered on the screen (64 pixels of margin left and right,
+//> 112 top and bottom).
+pub mod VgaTiming {
+    incoming clock : Clock
+
+    //> Horizontal sync (active high).
+    outgoing hs : Bit {
+        it := horizontal_position >= 656 && horizontal_position < 752
+    }
+
+    //> Vertical sync (active high).
+    outgoing vs : Bit {
+        it := vertical_position >= 490 && vertical_position < 492
+    }
+
+    //> True while the scan position is inside the CHIP-8 display area.
+    outgoing display_area : Bit {
+        it := horizontal_position >= 64 && horizontal_position < 576
+            && vertical_position >= 112 && vertical_position < 368
+    }
+
+    //> CHIP-8 column under the scan position, 0 through 63.
+    outgoing chip_x : Word[6] {
+        it := (horizontal_position - 64)[9..3]
+    }
+
+    //> CHIP-8 row under the scan position, 0 through 31.
+    outgoing chip_y : Word[5] {
+        it := (vertical_position - 112)[8..3]
+    }
+
+    // Divides the 50 MHz board clock down to a 25 MHz pixel rate.
+    reg pixel_enable : Bit {
+        initial it <= false
+        it <= !it
+    }
+
+    // Column of the current pixel, 0 through 799 (640 visible).
+    reg horizontal_position : Word[10] {
+        initial it <= 0
+        if {
+            when pixel_enable {
+                it <= mux(it == 799, 0, it + 1)
+            }
+        }
+    }
+
+    // Row of the current pixel, 0 through 524 (480 visible).
+    reg vertical_position : Word[10] {
+        initial it <= 0
+        if {
+            when pixel_enable && horizontal_position == 799 {
+                it <= mux(it == 524, 0, it + 1)
+            }
+        }
+    }
+}

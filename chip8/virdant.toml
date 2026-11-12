@@ -1,0 +1,5 @@
+[project]
+name = "chip8"
+
+[prog]
+top = "top::Top"

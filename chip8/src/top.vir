@@ -1,0 +1,98 @@
+//! CHIP-8 computer for the `VirtVga` virtual board.
+//!
+//! Loads a program from the SPI flash into the CHIP-8's 4 KiB memory
+//! (`flash_loader::FlashLoader`), executes it
+//! (`chip8::Chip8`), and renders the 64x32 framebuffer on the VGA
+//! output (`vga::VgaTiming`), each CHIP-8 pixel drawn as an 8x8
+//! block, centered on the screen.  Sound is stubbed behind the
+//! `chip8::Audio` socket (`sound::SoundStub`, the VirtVga board has
+//! no audio pins); keypad input decodes UART keystrokes via
+//! `input::KeyDecoder`.
+
+import virt
+import chip8
+import flash_loader
+import vga
+import sound
+import input
+
+//> CHIP-8 computer top level.
+pub mod Top for virt::VirtVga {
+    incoming clock : Clock
+
+    //> UART receive line; forwarded to the keypad stub.
+    incoming rx : Bit
+
+    //> SPI flash controller-in data.
+    incoming spi_miso : Bit
+
+    //> SPI flash clock.
+    outgoing spi_ck : Bit {
+        it := program_loader.flash_ck
+    }
+    //> SPI flash chip select (active low).
+    outgoing spi_cs : Bit {
+        it := program_loader.flash_cs
+    }
+    //> SPI flash controller-out data.
+    outgoing spi_mosi : Bit {
+        it := program_loader.flash_mosi
+    }
+
+    //> VGA red channel.
+    outgoing vga_r : Word[4] {
+        it := mux(video_timing.display_area, pixel_color, 0x1)
+    }
+    //> VGA green channel.
+    outgoing vga_g : Word[4] {
+        it := mux(video_timing.display_area, pixel_color, 0x1)
+    }
+    //> VGA blue channel.
+    outgoing vga_b : Word[4] {
+        it := mux(video_timing.display_area, pixel_color, 0x1)
+    }
+    //> Horizontal sync (active high).
+    outgoing vga_hs : Bit {
+        it := video_timing.hs
+    }
+    //> Vertical sync (active high).
+    outgoing vga_vs : Bit {
+        it := video_timing.vs
+    }
+
+    mod program_loader of flash_loader::FlashLoader {
+        it.clock := clock
+        it.flash_miso := spi_miso
+    }
+
+    mod core of chip8::Chip8 {
+        it.clock := clock
+        it.load_write := program_loader.write_enable
+        it.load_addr := program_loader.write_addr
+        it.load_data := program_loader.write_data
+        it.load_done := program_loader.loaded
+        it.scan_x := video_timing.chip_x
+        it.scan_y := video_timing.chip_y
+    }
+
+    mod video_timing of vga::VgaTiming {
+        it.clock := clock
+    }
+
+    mod sound_device of sound::SoundStub {
+        it.clock := clock
+    }
+
+    mod keypad_device of input::KeyDecoder {
+        it.clock := clock
+        it.uart_rx := rx
+    }
+
+    sound_device.audio :=: core.audio
+    core.keypad :=: keypad_device.keypad
+
+    // Framebuffer pixel, white when set, black when clear.
+    wire pixel_color : Word[4] {
+        it := mux(core.scan_pixel, 0xf, 0x0)
+    }
+}
