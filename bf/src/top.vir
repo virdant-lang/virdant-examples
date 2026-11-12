@@ -1,0 +1,279 @@
+//! A Brainf*ck machine whose program comes from a file, not a literal.
+//! Plus a `Virt`-platform top that runs it and prints the tape.
+
+//> A Brainf*ck machine over a 4096-cell tape, its program loaded at
+//> build time from `program.bin` via `@image` -- the bytes of the
+//> file *are* the machine code. Edit the file, rerun, and the same
+//> FSM runs a different program with zero logic changes. Interprets
+//> a Brainf*ck subset: > < + - [ . ]. Pulse `start`; `done` pulses for
+//> one cycle when the program walks off its end (NUL). The `.` opcode
+//> raises `print` with the current cell for one cycle -- the caller's
+//> window onto the tape, one character at a time.
+enum type State {
+    Idle      // waiting for a start pulse
+    Clear     // sweeping the tape clean, one cell per cycle
+    Run       // fetch, decode, execute : one instruction per cycle
+    ScanFwd   // walking right through the program, hunting for `]`
+    ScanBack  // walking left through the program, hunting for `[`
+}
+
+pub mod BfMachine {
+    incoming clock      : Clock
+    incoming start      : Bit
+    incoming peek_addr  : Word[12]
+
+    outgoing busy     : Bit
+    outgoing reg done : Bit {
+        initial it <= false
+        // A pulse, not a level: one cycle, then quiet again.
+        it <= state == #Run && opcode == 0
+    }
+    outgoing pointer   : Word[12] {
+        it := ptr
+    }
+    outgoing cell      : Word[8] {
+        it := current
+    }
+    outgoing peek_data : Word[8] dependson peek_addr {
+        // A second, read-only window onto the tape, for the curious.
+        it := tape[dyn peek_addr]
+    }
+    outgoing print : Valid[Word[8]] {
+        // The `.` opcode: offer the cell under the cursor for exactly
+        // the one cycle the machine spends executing it.
+        it := if {
+            when state == #Run && opcode == 0x2E => @Valid(current)
+            else => @Invalid()
+        }
+    }
+
+    // The program ROM. `@image` loads raw binary, one byte per cell
+    // for Word[8]; the path resolves relative to the project root, so
+    // this is the `program.bin` sitting next to `virdant.toml`. The
+    // file should hold the ASCII Brainf*ck source, NUL-padded to
+    // halt; anything past the program is unspecified, which is fine
+    // because a well-formed program halts before walking that far.
+    // Four kilobytes: room for generator-style programs -- a hello
+    // world that loops itself into existence, or a self-printing
+    // quine several times this ROM's smallest ancestor.
+    @image("program.bf")
+    memory prog_rom[4096] : Word[8]
+
+    // The tape: 4096 byte cells -- the machine's memory, roomy
+    // enough for programs that walk the cursor hundreds of cells
+    // out. Fresh silicon holds no promises, so every run begins by
+    // sweeping all 4096 cells to zero.
+    memory tape[4096] : Word[8] {
+        match state {
+            with #Clear {
+                it[dyn ptr] <= 0
+            }
+            with #Run match opcode {
+                // `+`/`-` read the old cell and commit the new one on
+                // the clock edge; other states write nothing at all.
+                with 0x2B { it[dyn ptr] <= current + 1 }
+                with 0x2D { it[dyn ptr] <= current - 1 }
+            }
+        }
+    }
+
+    reg state : State {
+        initial it <= #Idle
+        match it {
+            with #Idle if {
+                when start { it    <= #Clear }
+            }
+            with #Clear if {
+                when ptr == 4095 { it <= #Run }
+            }
+            with #Run match opcode {
+                // `[` over a zero cell: the loop is skipped. Go find
+                // the matching `]` and land just past it.
+                with 0x5B if {
+                    when current == 0 { it <= #ScanFwd }
+                }
+                // `]` over a nonzero cell: run it again. Walk back
+                // to the matching `[` and land just after it -- the
+                // loop body begins there.
+                with 0x5D if {
+                    when current != 0 { it <= #ScanBack }
+                }
+                // The NUL padding past the last instruction.
+                with 0 { it              <= #Idle }
+            }
+            with #ScanFwd if {
+                when opcode == 0x5D && scan_depth == 0 { it <= #Run }
+            }
+            with #ScanBack if {
+                when opcode == 0x5B && scan_depth == 0 { it <= #Run }
+            }
+        }
+    }
+
+    // Twelve bits: one address bit per ROM size bit, 2^12 == 4096.
+    reg ip : Word[12] {
+        initial it <= 0
+        if {
+            when start && state == #Idle {
+                it <= 0
+            }
+            when state == #Run if {
+                when opcode == 0x5D && current != 0 {
+                    // A taken `]` steps back before it scans.
+                    it <= it - 1
+                }
+                else {
+                    // Everything else steps forward.
+                    it <= it + 1
+                }
+            }
+            when state == #ScanFwd if {
+                // Step past every byte, including a nested `]` whose
+                // pop just emptied the counter -- only the *matching*
+                // `]` (depth zero, nothing left to pop) is the landing
+                // spot, and that one freezes `ip` so `Run` re-executes
+                // it as a harmless no-op.
+                when opcode != 0x5D || scan_depth != 0 {
+                    it <= it + 1
+                }
+            }
+            when state == #ScanBack if {
+                when opcode == 0x5B && scan_depth == 0 {
+                    // Found the *matching* `[` -- depth zero. Land
+                    // just *after* it: the loop re-enters there.
+                    it <= it + 1
+                }
+                else {
+                    it <= it - 1
+                }
+            }
+        }
+    }
+
+    // Nesting counter for bracket scans. Programs nest loops, so a
+    // scan cannot stop at the first bracket it meets: walking left
+    // from a taken `]`, every inner `]` pushes a level and every `[`
+    // pops one; the match is the `[` that pops the *last* level.
+    // Mirror image for a forward scan skipping a `[`.
+    reg scan_depth : Word[7] {
+        initial it <= 0
+        if {
+            // Entering a scan: start counting from zero.
+            when state == #Run && opcode == 0x5B && current == 0 {
+                it <= 0
+            }
+            when state == #Run && opcode == 0x5D && current != 0 {
+                it <= 0
+            }
+            when state == #ScanFwd match opcode {
+                with 0x5B { it <= it + 1 }
+                with 0x5D if {
+                    when it != 0 { it <= it - 1 }
+                }
+            }
+            when state == #ScanBack match opcode {
+                with 0x5B if {
+                    when it != 0 { it <= it - 1 }
+                }
+                with 0x5D { it <= it + 1 }
+            }
+        }
+    }
+
+    reg ptr : Word[12] {
+        initial it <= 0
+        if {
+            when start && state == #Idle {
+                it             <= 0
+            }
+            when state == #Clear if {
+                when it == 4095 {
+                    it             <= 0
+                }
+                else {
+                    it             <= it + 1
+                }
+            }
+            when state == #Run match opcode {
+                with 0x3E { it <= it + 1 }
+                with 0x3C { it <= it - 1 }
+            }
+        }
+    }
+
+    // ASCII is the opcode: see `Opcode` above; 0x00 halts. One ROM,
+    // no mux, just fetch from `prog_rom` at the instruction pointer.
+    wire opcode : Word[8] {
+        it := prog_rom[dyn ip]
+    }
+
+    // The machine's own eyes: the tape cell under the cursor.
+    wire current : Word[8] {
+        it := tape[dyn ptr]
+    }
+
+    busy := state != #Idle
+}
+
+//> States of the `Virt` top: wait for the machine, then ask the
+//> simulator to exit.
+enum type TopState {
+    Wait    // machine is running (or the tape is still being swept)
+    Done    // program halted; `exit` raised
+}
+
+//> The `Virt` wrapper: boots the machine, forwards the machine's
+//> `print` stream (the `.` opcode) to the platform's `debug` port
+//> byte by byte as the program runs, and raises `exit` with code 0
+//> once the program walks off its end.
+pub mod Top for virt::Virt {
+    incoming clock    : Clock
+    incoming rx       : Bit
+    incoming spi_miso : Bit
+
+    outgoing debug : Valid[Word[8]]
+    outgoing exit  : Valid[Word[8]]
+
+    mod machine of BfMachine
+
+    machine.clock := clock
+
+    // Boot pulse: `start` is true for exactly the first cycle after
+    // power-up, then never again.
+    reg boot : Word[4] {
+        initial it <= 0
+        it <= it + 1
+    }
+    machine.start := boot == 0
+
+    reg state : TopState {
+        initial it <= #Wait
+        match it {
+            with #Wait if {
+                when machine.done { it <= #Done }
+            }
+            with #Done {
+            }
+        }
+    }
+
+    // Whatever the program prints, the host sees: `debug` is just a
+    // wire from the machine's `.` opcode to the platform.
+    debug := machine.print
+
+    exit := match state {
+        with #Done => @Valid(0)
+        else => @Invalid()
+    }
+
+    unused rx
+    unused spi_miso
+    unused machine.pointer
+    unused machine.cell
+    unused machine.busy
+    unused machine.peek_data
+
+    // The peek window is for poke-session debugging; the Virt top
+    // has no use for it, so it idles at address zero.
+    machine.peek_addr := 0
+}

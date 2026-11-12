@@ -1,0 +1,68 @@
+top top::BfMachine
+vcd trace.vcd
+
+# Pin every incoming port before the first tick: an undriven
+# port wanders, and a wandering input makes for a confusing garden.
+poke top.start false
+poke top.peek_addr 0
+
+# --- Quiet at first: the machine is neither busy nor done. ---
+assert top.busy == false
+assert top.done == false
+
+# === The program image: program.bin, currently the classic
+# generator-style hello world -- nested multiply loops build the
+# letters, then `.` prints each one as it runs. The Virt top forwards
+# those `.` prints to the platform's `debug` port. Edit program.bin,
+# rerun, and the same logic computes something else -- that is the
+# point of loading the program from a file.
+
+poke top.start true
+tick
+poke top.start false
+tick 100
+# Mid-run, inside the generator loops.
+advance
+assert top.busy == true
+assert top.done == false
+
+# Budget: 1 start edge + 4096 tape-sweep cycles (one per cell of the
+# 4096-cell tape) + ~1700 execute cycles (nested generator loops with
+# runtime bracket scans, thirteen `.`s, and the NUL halt); 8000 gives
+# comfortable slack.
+tick 8000
+advance
+assert top.busy == false
+# The machine rests wherever the program left the cursor: the last
+# `.` prints cell 6 (the newline counter). Only a fresh `start`
+# rewinds it.
+assert top.pointer == 6
+
+# The tape after "Hello World!\n": letters on cells 2-5, the newline
+# on cell 6, counters back at zero.
+poke top.peek_addr 0
+advance
+assert top.peek_data == 0
+poke top.peek_addr 1
+advance
+assert top.peek_data == 0
+poke top.peek_addr 2
+advance
+assert top.peek_data == 72
+poke top.peek_addr 3
+advance
+assert top.peek_data == 100
+poke top.peek_addr 4
+advance
+assert top.peek_data == 87
+poke top.peek_addr 5
+advance
+assert top.peek_data == 33
+poke top.peek_addr 6
+advance
+assert top.peek_data == 10
+poke top.peek_addr 7
+advance
+assert top.peek_data == 0
+
+exit
