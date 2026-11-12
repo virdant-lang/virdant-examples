@@ -25,6 +25,26 @@ REC_EXP_NAN = 0b111_000_000   # 448
 # Exception flag names, indexed by bit (HardFloat's fixed order).
 FLAG_NAMES = ["invalid", "divide_by_zero", "overflow", "underflow", "inexact"]
 
+# HardFloat rounding-mode order (the RTL enum order; differs from the
+# RISC-V frm encoding, where 2/3 are swapped).
+ROUND_MODE_NAMES = ["rne", "rz", "rup", "rdn", "rmm"]
+
+
+def parse_round_mode(text):
+    """Parse a rounding mode given as a name (rne/rz/rup/rdn/rmm) or a
+    number 0..4 in HardFloat order. Exits with a usage error otherwise."""
+    t = text.strip().lower()
+    if t in ROUND_MODE_NAMES:
+        return ROUND_MODE_NAMES.index(t)
+    try:
+        value = int(t, 0)
+    except ValueError:
+        sys.exit("{}: not a rounding mode (use rne/rz/rup/rdn/rmm or 0..4)"
+                 .format(text))
+    if 0 <= value <= 4:
+        return value
+    sys.exit("{}: rounding mode out of range 0..4".format(text))
+
 
 def to_binary32(value):
     """Round a Python float to an IEEE binary32 bit pattern."""

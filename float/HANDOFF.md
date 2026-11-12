@@ -41,9 +41,16 @@ the correctly-rounded glibc oracle pattern (`fmaf`, `fesetround` +
                           `python3 divmodel.py model` = datapath-model
                           cross-check
     add_mult, compare,
-    select                CLI drivers; every run self-checks against a
-                          Python reference and exits nonzero on
-                          mismatch
+    select, divide, sqrt,
+    fntorec, rectofn,
+    itof, ftoi, classify  CLI drivers, one per operation; every run
+                          self-checks against a Python reference and
+                          exits nonzero on mismatch. divide/sqrt take
+                          an optional rounding mode (rne/rz/rup/rdn/rmm
+                          or 0..4); itof/ftoi take an optional
+                          signed|unsigned before the mode. rectofn
+                          models the documented sNaN->IEEE-infinity
+                          boundary quirk in its self-check.
     add_mult.img          Generated testbench input image (gitignored
                           artifacts: do not edit by hand)
     src/*.vir             One package per module family (see inventory)
@@ -332,8 +339,9 @@ detail):
    compare/select/recfntofn (they predate it and keep local copies);
    decide EncodeRecFnBinary32's home (currently pub inside
    muladdrecfn; a shared `rawencode` package was the plan's option
-   (b)); CLI drivers for div/sqrt following the add_mult pattern;
-   divmodel.py could reuse fuzz.py's corner-battery scaffolding.
+   (b)). CLI drivers are DONE — one per operation (see Layout);
+   divmodel.py could still reuse fuzz.py's corner-battery
+   scaffolding.
 
 ## How to verify a change
 

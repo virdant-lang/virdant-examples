@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Run a 33-bit recoded value through RecFnToFnBinary32.
+
+Usage: ./rectofn <recoded>
+
+The argument is a 33-bit recoded value in hex (as printed by
+./fntorec, e.g. 7f2aaaab). The hardware converts it back to IEEE
+binary32; the 8-hex-digit IEEE bit pattern and the decimal value are
+printed on stdout. Every run self-checks the conversion, exiting
+nonzero on any mismatch. Boundary quirk (documented): a signaling
+NaN recoding (quiet bit clear) converts to IEEE infinity, sign
+preserved; quiet NaNs and all other classes convert exactly.
+"""
+
+import math
+import struct
+import sys
+
+from fputils import decode, run_packet
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: {} <recoded>".format(sys.argv[0]))
+    try:
+        rec = int(sys.argv[1], 16)
+    except ValueError:
+        sys.exit("operand must be a hex recoded value")
+    if not 0 <= rec < (1 << 33):
+        sys.exit("recoded value must fit in 33 bits")
+
+    # Selector word 3 = 3: recoded -> IEEE. The 33-bit recoded operand
+    # occupies image word 0.
+    packet = run_packet([rec, 0, 0, 3, 0])
+
+    ieee = (packet >> 32) & 0xFFFFFFFF   # bits [63..32], 32 bits
+    value = struct.unpack("<f", struct.pack("<I", ieee))[0]
+
+    sign = (rec >> 32) & 1
+    rec_exp = (rec >> 23) & 0x1FF
+    quiet = rec & 0x40_0000
+    if rec_exp >= 448 and not quiet:
+        # Signaling NaN recoding: the hardware delivers IEEE infinity
+        # with the sign preserved (the quiet-bit-less NaN payload has
+        # no IEEE NaN encoding to map onto).
+        expected_ieee = 0x7F800000 | (sign << 31)
+        if ieee != expected_ieee:
+            sys.stderr.write("SELF-CHECK FAIL: sNaN recoded {:#09x} "
+                             "expected {:#010x}, got {:#010x}\n"
+                             .format(rec, expected_ieee, ieee))
+            sys.exit(1)
+        print("{:08x} {} (sNaN -> inf)".format(ieee, value))
+        return
+
+    expected = decode(rec)
+    ok = (math.isnan(expected) and math.isnan(value)) or \
+        (expected == value and
+         math.copysign(1.0, expected) == math.copysign(1.0, value))
+    if not ok:
+        sys.stderr.write("SELF-CHECK FAIL: recoded {:#09x} decoded to {}, "
+                         "hardware returned {:#010x} ({})\n"
+                         .format(rec, expected, ieee, value))
+        sys.exit(1)
+
+    print("{:08x} {}".format(ieee, value))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Run two floats through the DivSqrtRecFnBinary32 hardware divider.
+
+Usage: ./divide <a> <b> [mode]
+
+Both arguments are rounded to IEEE binary32 and recoded into
+HardFloat's 33-bit format. The quotient is decoded and printed on
+stdout; the exception flags are reported on stderr. Every run
+self-checks the hardware result (value, exception flags, measured
+latency) against the Fraction-exact reference in divmodel.py,
+exiting nonzero on any mismatch.
+
+Mode is a rounding-mode name (rne, rz, rup, rdn, rmm) or a number
+0..4 in HardFloat order; the default is rne.
+"""
+
+import sys
+
+from fputils import decode, parse_round_mode, to_binary32
+import divmodel
+
+
+def main():
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: {} <a> <b> [mode]".format(sys.argv[0]))
+    try:
+        a, b = (float(arg) for arg in sys.argv[1:3])
+    except ValueError:
+        sys.exit("operands must be numbers")
+    mode = parse_round_mode(sys.argv[3]) if len(sys.argv) == 4 else 0
+
+    a_bits = to_binary32(a)
+    b_bits = to_binary32(b)
+
+    out, flags, latency = divmodel.rtl_div(a_bits, b_bits, mode)
+    ref_result, ref_flags = divmodel.ref_div(a_bits, b_bits, mode)
+    problems = divmodel._compare(ref_result, ref_flags, out, flags, "div")
+    expected = 1 if divmodel.div_is_special(a_bits, b_bits) else 28
+    if latency != expected:
+        problems.append("latency: expected {} cycles, got {}"
+                        .format(expected, latency))
+    if problems:
+        for p in problems:
+            sys.stderr.write("SELF-CHECK FAIL: {}\n".format(p))
+        sys.exit(1)
+
+    print(decode(out))
+    if flags:
+        sys.stderr.write("exception_flags: {}\n"
+                         .format(", ".join(sorted(flags))))
+
+
+if __name__ == "__main__":
+    main()

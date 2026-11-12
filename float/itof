@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Run an integer through the IntToRecFnBinary32 hardware converter.
+
+Usage: ./itof <int> [signed|unsigned] [mode]
+
+The argument is converted to recoded binary32 by the hardware
+(FCVT.S.W for signed, FCVT.S.WU for unsigned). The float value is
+printed on stdout; the exception flags are reported on stderr. Every
+run self-checks the hardware result (value and flags) against the
+Fraction-exact rounding reference in fuzz.py, exiting nonzero on any
+mismatch.
+
+The integer may be given in decimal or 0x-hex. For unsigned inputs
+0..0xFFFFFFFF is accepted; for signed, -2^31..2^31-1. Mode is a
+rounding-mode name (rne, rz, rup, rdn, rmm) or 0..4 in HardFloat
+order; the default is rne.
+"""
+
+import sys
+from fractions import Fraction as F
+
+from fputils import (FLAG_NAMES, decode, parse_round_mode, recode,
+                     run_packet)
+import fuzz
+
+REC_EXP_INF = 384
+
+
+def ref_itof(v_bits, signed, mode):
+    """Exact reference: round the integer value at the binary32 grid."""
+    value = v_bits - (1 << 32) if signed and (v_bits >> 31) else v_bits
+    if value == 0:
+        return 0, set()
+    sign = 1 if value < 0 else 0
+    mag = F(-value if value < 0 else value)
+    p, inexact, overflow = fuzz.round_scaled(mag, sign, mode)
+    flags = set()
+    if inexact:
+        flags.add("inexact")
+    if overflow:
+        flags.add("overflow")
+        return (sign << 32) | (REC_EXP_INF << 23), flags
+    # An integer magnitude is at least 1, so the rounded result is
+    # never zero; no underflow can occur.
+    return recode(fuzz.u32_from_scaled(p) | (sign << 31)), flags
+
+
+def main():
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit("usage: {} <int> [signed|unsigned] [mode]"
+                 .format(sys.argv[0]))
+    try:
+        value = int(sys.argv[1], 0)
+    except ValueError:
+        sys.exit("operand must be an integer")
+    signed = True
+    mode = 0
+    args = sys.argv[2:]
+    if args:
+        word = args[0].lower()
+        if word in ("signed", "s"):
+            args = args[1:]
+        elif word in ("unsigned", "u"):
+            signed = False
+            args = args[1:]
+    if args:
+        mode = parse_round_mode(args[0])
+    if signed and not -0x80000000 <= value <= 0x7FFFFFFF:
+        sys.exit("signed integer out of 32-bit range")
+    if not signed and not 0 <= value <= 0xFFFFFFFF:
+        sys.exit("unsigned integer out of 32-bit range")
+
+    v_bits = value & 0xFFFFFFFF
+
+    # Selector word 3 = 5: int -> recoded. Integer in word 1, control
+    # in word 2: bit 0 = signed, bits 4..2 = rounding mode.
+    packet = run_packet([0, v_bits, (mode << 2) | int(signed), 5, 0])
+
+    out = packet >> 31                # bits [63..31], 33 bits
+    flag_bits = (packet >> 26) & 0x1F
+    rtl_flags = {name for i, name in enumerate(FLAG_NAMES)
+                 if flag_bits & (1 << i)}
+
+    expected, ref_flags = ref_itof(v_bits, signed, mode)
+    problems = []
+    if out != expected:
+        problems.append("expected recoded {:#09x}, got {:#09x}"
+                        .format(expected, out))
+    if rtl_flags != ref_flags:
+        problems.append("flags: expected {} got {}"
+                        .format(sorted(ref_flags), sorted(rtl_flags)))
+    if problems:
+        for p in problems:
+            sys.stderr.write("SELF-CHECK FAIL: {}\n".format(p))
+        sys.exit(1)
+
+    print(decode(out))
+    if rtl_flags:
+        sys.stderr.write("exception_flags: {}\n"
+                         .format(", ".join(sorted(rtl_flags))))
+
+
+if __name__ == "__main__":
+    main()

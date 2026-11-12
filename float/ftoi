@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Run a float through the RecFnToIntBinary32 hardware converter.
+
+Usage: ./ftoi <a> [signed|unsigned] [mode]
+
+The argument is rounded to IEEE binary32 and converted to a 32-bit
+integer by the hardware (FCVT.W.S for signed, FCVT.WU.S for
+unsigned). The integer is printed on stdout (decimal, two's
+complement for signed); the int exception flags (invalid, overflow,
+inexact) are reported on stderr. Every run self-checks the hardware
+result against an exact Python reference implementing the RISC-V
+semantics (NaN/inf -> invalid with saturation; out-of-range ->
+invalid + overflow with saturation; inexact otherwise), exiting
+nonzero on any mismatch.
+
+Mode is a rounding-mode name (rne, rz, rup, rdn, rmm) or 0..4 in
+HardFloat order; the default is rne.
+"""
+
+import sys
+from fractions import Fraction as F
+
+from fputils import parse_round_mode, recode, run_packet, to_binary32
+
+HALF = F(1, 2)
+
+
+def ref_ftoi(rec, signed, mode):
+    """Exact reference for recoded -> 32-bit integer conversion.
+
+    Returns (u32 bit pattern, flag-name set), matching the module's
+    documented semantics: invalid is raised only for NaN or infinity
+    input (with saturation); a finite out-of-range result raises
+    overflow only (also saturating); the range check applies to the
+    ROUNDED value, so e.g. -0.5 unsigned delivers 0 with inexact;
+    inexact is suppressed whenever a saturating flag is raised.
+    """
+    sign = (rec >> 32) & 1
+    rec_exp = (rec >> 23) & 0x1FF
+    fract = rec & 0x7FFFFF
+
+    if rec_exp >= 448:
+        return (0x7FFFFFFF if signed else 0xFFFFFFFF), {"invalid"}
+    if rec_exp >= 384:
+        if not signed:
+            return (0 if sign else 0xFFFFFFFF), {"invalid"}
+        return (0x80000000 if sign else 0x7FFFFFFF), {"invalid"}
+    if rec_exp < 64:
+        return 0, set()
+
+    value = F(1 << 23) * F(2) ** (rec_exp - 279) + \
+        F(fract) * F(2) ** (rec_exp - 279)
+    if sign:
+        value = -value
+    neg = value < 0
+    mag = -value if neg else value
+
+    # Round the magnitude at the integer grid, sign-aware for the
+    # directed modes (toward +inf pulls a negative magnitude down,
+    # toward -inf pushes it up).
+    fl = mag.numerator // mag.denominator
+    frac_part = mag - fl
+    if frac_part == 0:
+        rounded = fl
+        inexact = False
+    else:
+        inexact = True
+        if mode == 1:                      # TowardZero
+            up = False
+        elif mode == 2:                    # TowardPositive
+            up = not neg
+        elif mode == 3:                    # TowardNegative
+            up = neg
+        elif mode == 4:                    # MaxMagnitude (away from 0)
+            up = frac_part >= HALF
+        else:                              # NearestEven
+            up = frac_part > HALF or \
+                (frac_part == HALF and fl % 2 == 1)
+        rounded = fl + 1 if up else fl
+    if neg:
+        rounded = -rounded
+
+    # Range check on the rounded value; overflow saturates and
+    # suppresses inexact.
+    if signed:
+        if rounded > 0x7FFFFFFF:
+            return 0x7FFFFFFF, {"overflow"}
+        if rounded < -0x80000000:
+            return 0x80000000, {"overflow"}
+    elif rounded > 0xFFFFFFFF:
+        return 0xFFFFFFFF, {"overflow"}
+    elif rounded < 0:
+        return 0, {"overflow"}
+    return rounded & 0xFFFFFFFF, ({"inexact"} if inexact else set())
+
+
+def main():
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit("usage: {} <a> [signed|unsigned] [mode]"
+                 .format(sys.argv[0]))
+    try:
+        a = float(sys.argv[1])
+    except ValueError:
+        sys.exit("operand must be a number")
+    signed = True
+    mode = 0
+    args = sys.argv[2:]
+    if args:
+        word = args[0].lower()
+        if word in ("signed", "s"):
+            args = args[1:]
+        elif word in ("unsigned", "u"):
+            signed = False
+            args = args[1:]
+    if args:
+        mode = parse_round_mode(args[0])
+
+    rec = recode(to_binary32(a))
+
+    # Selector word 3 = 6: recoded -> int. Control in word 2: bit 0 =
+    # signed, bits 4..2 = rounding mode.
+    packet = run_packet([rec, 0, (mode << 2) | int(signed), 6, 0])
+
+    out = (packet >> 32) & 0xFFFFFFFF  # bits [63..32], 32 bits
+    flag_bits = (packet >> 29) & 0x7   # bits [31..29]
+    rtl_flags = set()
+    if flag_bits & 0b100:
+        rtl_flags.add("invalid")
+    if flag_bits & 0b010:
+        rtl_flags.add("overflow")
+    if flag_bits & 0b001:
+        rtl_flags.add("inexact")
+
+    expected, ref_flags = ref_ftoi(rec, signed, mode)
+    problems = []
+    if out != expected:
+        problems.append("expected {:#010x}, got {:#010x}"
+                        .format(expected, out))
+    if rtl_flags != ref_flags:
+        problems.append("flags: expected {} got {}"
+                        .format(sorted(ref_flags), sorted(rtl_flags)))
+    if problems:
+        for p in problems:
+            sys.stderr.write("SELF-CHECK FAIL: {}\n".format(p))
+        sys.exit(1)
+
+    print(out - (1 << 32) if signed and (out >> 31) else out)
+    if rtl_flags:
+        sys.stderr.write("int_exception_flags: {}\n"
+                         .format(", ".join(sorted(rtl_flags))))
+
+
+if __name__ == "__main__":
+    main()

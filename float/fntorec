@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Run a float through the FnToRecFnBinary32 hardware converter.
+
+Usage: ./fntorec <a>
+
+The argument is rounded to IEEE binary32 and converted into
+HardFloat's 33-bit recoded format by the hardware. The recoded
+encoding is printed as a 9-hex-digit (33-bit) number on stdout.
+Every run self-checks the hardware result against fputils.recode,
+exiting nonzero on any mismatch.
+"""
+
+import sys
+
+from fputils import recode, run_packet, to_binary32
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: {} <a>".format(sys.argv[0]))
+    try:
+        a = float(sys.argv[1])
+    except ValueError:
+        sys.exit("operand must be a number")
+
+    a_bits = to_binary32(a)
+
+    # Selector word 3 = 2: IEEE -> recoded. The operand lives in the
+    # LOW 32 bits of image word 0 (the converter reads [32..0]).
+    packet = run_packet([a_bits, 0, 0, 2, 0])
+
+    out = packet >> 31                # bits [63..31], 33 bits
+    expected = recode(a_bits)
+    if out != expected:
+        sys.stderr.write("SELF-CHECK FAIL: expected recoded {:#09x}, "
+                         "got {:#09x}\n".format(expected, out))
+        sys.exit(1)
+
+    print("{:09x}".format(out))
+
+
+if __name__ == "__main__":
+    main()

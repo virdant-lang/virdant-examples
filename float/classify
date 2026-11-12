@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Run a float through the ClassifyRecFnBinary32 hardware classifier.
+
+Usage: ./classify <a>
+
+The argument is rounded to IEEE binary32 and recoded into HardFloat's
+33-bit format; FCLASS.S's ten one-hot category bits are decoded and
+the class name is printed on stdout. Every run self-checks the
+hardware one-hot word against an independent Python reference,
+exiting nonzero on any mismatch.
+
+Bit order (RISC-V fclass.S): bit 0 = -inf, 1 = negative normal,
+2 = negative subnormal, 3 = -zero, 4 = +zero, 5 = positive
+subnormal, 6 = positive normal, 7 = +inf, 8 = signaling NaN,
+9 = quiet NaN.
+"""
+
+import sys
+
+from fputils import run_packet, to_binary32, recode
+
+CLASS_NAMES = [
+    "negative_inf",       # bit 0
+    "negative_normal",    # bit 1
+    "negative_subnormal", # bit 2
+    "negative_zero",      # bit 3
+    "positive_zero",      # bit 4
+    "positive_subnormal", # bit 5
+    "positive_normal",    # bit 6
+    "positive_inf",       # bit 7
+    "signaling_nan",      # bit 8
+    "quiet_nan",          # bit 9
+]
+
+
+def ref_class_bits(rec):
+    """Independent one-hot classification of a recoded value."""
+    sign = (rec >> 32) & 1
+    rec_exp = (rec >> 23) & 0x1FF
+    fract = rec & 0x7FFFFF
+    if rec_exp >= 448:
+        # The quiet bit (fraction bit 22) splits qNaN from sNaN.
+        return 1 << (9 if fract & 0x40_0000 else 8)
+    if rec_exp >= 384:
+        return 1 << (7 if sign == 0 else 0)
+    if rec_exp < 64:
+        return 1 << (4 if sign == 0 else 3)
+    subnormal = rec_exp < 130
+    if sign == 0:
+        return 1 << (5 if subnormal else 6)
+    return 1 << (2 if subnormal else 1)
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: {} <a>".format(sys.argv[0]))
+    try:
+        a = float(sys.argv[1])
+    except ValueError:
+        sys.exit("operand must be a number")
+
+    rec = recode(to_binary32(a))
+
+    # Selector word 3 = 7: classify.
+    packet = run_packet([rec, 0, 0, 7, 0])
+
+    bits = (packet >> 54) & 0x3FF      # bits [63..54], 10 bits
+    expected = ref_class_bits(rec)
+    if bits != expected:
+        sys.stderr.write("SELF-CHECK FAIL: expected one-hot {:#06x}, "
+                         "got {:#06x}\n".format(expected, bits))
+        sys.exit(1)
+
+    print(CLASS_NAMES[bits.bit_length() - 1])
+
+
+if __name__ == "__main__":
+    main()

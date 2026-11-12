@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Run a float through the DivSqrtRecFnBinary32 hardware square root.
+
+Usage: ./sqrt <a> [mode]
+
+The argument is rounded to IEEE binary32 and recoded into HardFloat's
+33-bit format. The square root is decoded and printed on stdout; the
+exception flags are reported on stderr. Every run self-checks the
+hardware result (value, exception flags, measured latency) against
+the Fraction-exact reference in divmodel.py, exiting nonzero on any
+mismatch.
+
+Mode is a rounding-mode name (rne, rz, rup, rdn, rmm) or a number
+0..4 in HardFloat order; the default is rne.
+"""
+
+import sys
+
+from fputils import decode, parse_round_mode, to_binary32
+import divmodel
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        sys.exit("usage: {} <a> [mode]".format(sys.argv[0]))
+    try:
+        a = float(sys.argv[1])
+    except ValueError:
+        sys.exit("operand must be a number")
+    mode = parse_round_mode(sys.argv[2]) if len(sys.argv) == 3 else 0
+
+    a_bits = to_binary32(a)
+
+    out, flags, latency = divmodel.rtl_sqrt(a_bits, mode)
+    ref_result, ref_flags = divmodel.ref_sqrt(a_bits, mode)
+    problems = divmodel._compare(ref_result, ref_flags, out, flags, "sqrt")
+    expected = 1 if divmodel.sqrt_is_special(a_bits) else 28
+    if latency != expected:
+        problems.append("latency: expected {} cycles, got {}"
+                        .format(expected, latency))
+    if problems:
+        for p in problems:
+            sys.stderr.write("SELF-CHECK FAIL: {}\n".format(p))
+        sys.exit(1)
+
+    print(decode(out))
+    if flags:
+        sys.stderr.write("exception_flags: {}\n"
+                         .format(", ".join(sorted(flags))))
+
+
+if __name__ == "__main__":
+    main()
