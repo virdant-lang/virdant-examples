@@ -12,42 +12,51 @@
 //> that are not zero-class are invalid and classify as subnormal,
 //> matching the reference implementation.
 pub mod RecFnClassBinary32 {
+    //> The recoded operand under classification.
     incoming in : Word[33]
 
+    //> Zero class: recExp 0..63.
     outgoing is_zero : Bit dependson in {
         it := is_zero_class
     }
 
+    //> NaN class: recExp 448..511.
     outgoing is_nan : Bit dependson in {
         it := is_special && rec_exp[6]
     }
 
+    //> Infinity class: recExp 384..447.
     outgoing is_inf : Bit dependson in {
         it := is_special && !rec_exp[6]
     }
 
+    //> Subnormal class: recExp 107..129 (plus invalid encodings below
+    //> 107 outside the zero class).
     outgoing is_subnormal : Bit dependson in {
         it := finite_nonzero && rec_exp < 130w9
     }
 
+    //> Normal class: recExp 130..383.
     outgoing is_normal : Bit dependson in {
         it := finite_nonzero && rec_exp >= 130w9
     }
 
+    //> Recoded exponent field: in[32..23].
     wire rec_exp : Word[9] {
         it := in[32..23]
     }
 
-    // Special class: recExp top two bits are 0b11 (infinity or NaN).
+    //> Special class: recExp top two bits are 0b11 (infinity or NaN).
     wire is_special : Bit {
         it := rec_exp[9..7] == 0b11w2
     }
 
+    //> Finite and nonzero: neither the zero class nor a special.
     wire finite_nonzero : Bit {
         it := !is_zero_class && !is_special
     }
 
-    // Zero class: recExp top three bits all zero.
+    //> Zero class: recExp top three bits all zero.
     wire is_zero_class : Bit {
         it := rec_exp[9..6] == 0w3
     }

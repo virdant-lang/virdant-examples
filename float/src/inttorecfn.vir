@@ -8,8 +8,10 @@ import hardfloat
 
 //> Leading-zero count of an 8-bit byte, 0..8 (8 when x is zero).
 mod CountLeadingZeros8 {
+    //> The byte to count leading zeros of.
     incoming x : Word[8]
 
+    //> Number of leading zeros, 0..8 (8 when x is zero).
     outgoing lz : Word[4] dependson x {
         it := if {
             when x[7] => 0w4
@@ -31,8 +33,10 @@ mod CountLeadingZeros8 {
 //> byte fixes the high bits of the count and its own counter fixes
 //> the low three bits.
 mod CountLeadingZeros32 {
+    //> The 32-bit value to count leading zeros of.
     incoming x : Word[32]
 
+    //> Number of leading zeros, 0..32 (32 when x is zero).
     outgoing lz : Word[6] dependson x {
         it := if {
             when any(x[32..24]) => zext(clz_byte3.lz)
@@ -43,15 +47,19 @@ mod CountLeadingZeros32 {
         }
     }
 
+    //> Leading-zero counter for byte 3 (bits 32..24).
     mod clz_byte3 of CountLeadingZeros8 {
         it.x := x[32..24]
     }
+    //> Leading-zero counter for byte 2 (bits 24..16).
     mod clz_byte2 of CountLeadingZeros8 {
         it.x := x[24..16]
     }
+    //> Leading-zero counter for byte 1 (bits 16..8).
     mod clz_byte1 of CountLeadingZeros8 {
         it.x := x[16..8]
     }
+    //> Leading-zero counter for byte 0 (bits 8..0).
     mod clz_byte0 of CountLeadingZeros8 {
         it.x := x[8..0]
     }
@@ -62,15 +70,26 @@ mod CountLeadingZeros32 {
 //> `signed_in` high treats `in` as two's complement; low treats it as
 //> unsigned. The result is always a normal or zero recoded value.
 pub mod IntToRecFnBinary32 {
+    //> High when `in` is a signed two's-complement integer.
     incoming signed_in       : Bit
+
+    //> The integer to convert.
     incoming in              : Word[32]
+
+    //> Rounding mode; only affects inexact magnitudes.
     incoming rounding_mode   : hardfloat::RoundMode
+
+    //> Tininess policy; no behavior here (the result is never
+    //> subnormal), so this is deliberately unused.
     incoming detect_tininess : hardfloat::Tininess
 
+    //> The recoded binary32 result, normal or zero.
     outgoing out : Word[33] dependson signed_in, in, rounding_mode {
         it := mux(is_zero_magnitude, signed_zero, word(sign, rec_exp, fract))
     }
 
+    //> {invalid, overflow, underflow, divide-by-zero, inexact}; only
+    //> inexact (bit 4) can ever be raised.
     outgoing exception_flags : Word[5] dependson signed_in, in {
         // Only inexact (bit 4) can ever be raised: a 32-bit integer
         // cannot overflow or underflow binary32.
@@ -81,64 +100,77 @@ pub mod IntToRecFnBinary32 {
     // policy input selects no behavior here.
     unused detect_tininess
 
-    // Leading-one position: k = 31 - lz, valid when nonzero.
+    //> Leading-one position: k = 31 - lz, valid when nonzero.
+    //> Leading-zero counter over the magnitude.
     mod leading_ones of CountLeadingZeros32 {
         it.x := magnitude
     }
 
+    //> Result sign: only a signed negative integer is negative.
     wire sign : Bit {
         it := signed_in && in[31]
     }
 
-    // Magnitude; for the most-negative integer the wrapping negation
-    // lands on 0x80000000, which is the correct unsigned magnitude.
+    //> Magnitude; for the most-negative integer the wrapping negation
+    //> lands on 0x80000000, which is the correct unsigned magnitude.
     wire magnitude : Word[32] {
         it := mux(sign, -in, in)
     }
 
+    //> True when the integer is zero, the only exact-to-zero case.
     wire is_zero_magnitude : Bit {
         it := magnitude == 0w32
     }
 
+    //> Recoded zero with the result's sign.
     wire signed_zero : Word[33] {
         it := word(sign, 0w9, 0w23)
     }
 
-    // Normalize: shift the magnitude up so the leading one sits at
-    // bit 31, then take the top 24 bits as the significand with one
-    // guard bit and a sticky below.
+    //> Normalize: shift the magnitude up so the leading one sits at
+    //> bit 31, then take the top 24 bits as the significand with one
+    //> guard bit and a sticky below.
+    //> Barrel stage 1: conditional left shift by 16.
     wire shifted_16 : Word[32] {
         it := mux(leading_ones.lz[4], word(magnitude[16..0], 0w16), magnitude)
     }
+    //> Barrel stage 2: conditional left shift by 8.
     wire shifted_8  : Word[32] {
         it := mux(leading_ones.lz[3], word(shifted_16[24..0], 0w8), shifted_16)
     }
+    //> Barrel stage 3: conditional left shift by 4.
     wire shifted_4  : Word[32] {
         it := mux(leading_ones.lz[2], word(shifted_8[28..0], 0w4), shifted_8)
     }
+    //> Barrel stage 4: conditional left shift by 2.
     wire shifted_2  : Word[32] {
         it := mux(leading_ones.lz[1], word(shifted_4[30..0], 0w2), shifted_4)
     }
+    //> Barrel stage 5: conditional left shift by 1.
     wire shifted_1  : Word[32] {
         it := mux(leading_ones.lz[0], word(shifted_2[31..0], 0w1), shifted_2)
     }
 
+    //> 24-bit significand with the leading one explicit.
     wire sig     : Word[24] {
         it := shifted_1[32..8]
     }
+    //> First bit below the significand, for rounding.
     wire guard   : Bit {
         it := shifted_1[7]
     }
+    //> OR of every bit below the guard.
     wire sticky  : Bit {
         it := any(shifted_1[7..0])
     }
+    //> True when the conversion loses information.
     wire inexact : Bit {
         it := guard || sticky
     }
 
-    // Round the magnitude up or leave it, per mode. Rounding toward
-    // +inf means truncating a negative magnitude (toward zero), and
-    // rounding toward -inf means growing it; sign-aware like Rounder.
+    //> Round the magnitude up or leave it, per mode. Rounding toward
+    //> +inf means truncating a negative magnitude (toward zero), and
+    //> rounding toward -inf means growing it; sign-aware like Rounder.
     wire round_up : Bit {
         it := match rounding_mode {
             with #NearestEven    => guard && (sig[0] || sticky)
@@ -149,22 +181,27 @@ pub mod IntToRecFnBinary32 {
         }
     }
 
+    //> Significand after the rounding increment, one bit wider for
+    //> the carry.
     wire rounded : Word[25] {
         it := sig +. mux(round_up, 1w24, 0w24)
     }
 
-    // Carry out of the significand rolls the exponent up one; the
-    // significand becomes exactly 1.0.
+    //> Carry out of the significand rolls the exponent up one; the
+    //> significand becomes exactly 1.0.
     wire carry : Bit {
         it := rounded[24]
     }
+    //> Fraction after rounding (and after any carry normalizes it).
     wire fract : Word[23] {
         it := rounded[23..0]
     }
 
+    //> Recoded exponent of the leading one, before the carry bump.
     wire leading_position : Word[9] {
         it := zext(31w6 - leading_ones.lz)
     }
+    //> Final recoded exponent, bumped on a rounding carry.
     wire rec_exp          : Word[9] {
         it := mux(carry, leading_position + 257w9, leading_position + 256w9)
     }

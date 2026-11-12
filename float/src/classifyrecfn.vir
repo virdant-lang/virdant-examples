@@ -14,8 +14,10 @@ import recfnclass
 //> infinity. The quiet/signaling split reads the NaN payload's top
 //> bit (fraction bit 22), preserved by the format converters.
 pub mod ClassifyRecFnBinary32 {
+    //> The recoded operand under classification.
     incoming in : Word[33]
 
+    //> One-hot FCLASS.S category word, most significant bit first.
     outgoing out : Word[10] dependson in {
         it := word(is_quiet_nan,
         is_sig_nan,
@@ -29,15 +31,17 @@ pub mod ClassifyRecFnBinary32 {
         cls.is_inf && in[32])
     }
 
+    //> Decode-equivalence classification of the operand.
     mod cls of recfnclass::RecFnClassBinary32 {
         it.in := in
     }
 
-    // NaN quiet/signaling split: fraction bit 22.
+    //> NaN quiet/signaling split: fraction bit 22.
     wire is_sig_nan : Bit {
         it := cls.is_nan && !in[22]
     }
 
+    //> NaN quiet/signaling split: fraction bit 22.
     wire is_quiet_nan : Bit {
         it := cls.is_nan && in[22]
     }

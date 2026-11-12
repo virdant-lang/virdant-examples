@@ -11,84 +11,104 @@
 //> Recoded input: [32] sign, [31..23] recExp, [22..0] fract.
 //> IEEE output: [31] sign, [30..23] biased exponent, [22..0] fraction.
 pub mod RecFnToFnBinary32 {
+    //> The 33-bit recoded value to convert.
     incoming in : Word[33]
 
+    //> The IEEE binary32 encoding of the same value.
     outgoing out : Word[32] dependson in {
         it := word(sign, exp_out, fract_out)
     }
 
+    //> Sign bit, passed through unchanged.
     wire sign    : Bit {
         it := in[32]
     }
+    //> Recoded exponent field, in[32..23].
     wire rec_exp : Word[9] {
         it := in[32..23]
     }
+    //> Recoded fraction field, in[23..0].
     wire fract   : Word[23] {
         it := in[23..0]
     }
 
-    // Decode-equivalence classes.
+    //> Decode-equivalence classes.
     wire is_special   : Bit {
         it := rec_exp[9..7] == 0b11w2
     }
+    //> NaN class: special with the quiet bit set.
     wire is_nan       : Bit {
         it := is_special && rec_exp[6]
     }
+    //> Infinity class: special with the quiet bit clear.
     wire is_inf       : Bit {
         it := is_special && !rec_exp[6]
     }
+    //> Zero class: recExp top three bits all zero.
     wire is_zero      : Bit {
         it := rec_exp[9..6] == 0w3
     }
+    //> Subnormal range: recExp below 130.
     wire is_subnormal : Bit {
         it := rec_exp < 130w9
     }
 
-    // Denormalization: sig24 re-merges the explicit leading bit into
-    // the fraction; shifting right by (130 - recExp) lands it back in
-    // the IEEE fraction field.
-    //
-    // Worked examples:
-    //   rec 107, fract 0: shift 23, 2^23 >> 23 = 1 (smallest subnormal).
-    //   rec 129, fract 0: shift 1, 2^23 >> 1 (max subnormal, 2^-127).
+    //> Denormalization: sig24 re-merges the explicit leading bit into
+    //> the fraction; shifting right by (130 - recExp) lands it back in
+    //> the IEEE fraction field.
+    //>
+    //> Worked examples:
+    //>   rec 107, fract 0: shift 23, 2^23 >> 23 = 1 (smallest subnormal).
+    //>   rec 129, fract 0: shift 1, 2^23 >> 1 (max subnormal, 2^-127).
     wire sig24     : Word[24] {
         it := word(1w1, fract)
     }
+    //> Denormalization distance, unclamped: 130 - recExp.
     wire shift_raw : Word[9] {
         it := 130w9 - rec_exp
     }
 
-    // Shifts of 24 or more lose every bit; clamp so the 5-stage
-    // barrel (which only covers 0..31) cannot resurrect them. Only
-    // invalid encodings below recExp 107 ever reach this.
+    //> Shifts of 24 or more lose every bit; clamp so the 5-stage
+    //> barrel (which only covers 0..31) cannot resurrect them. Only
+    //> invalid encodings below recExp 107 ever reach this.
+    //> Denormalization distance clamped to the barrel's range.
     wire shift_clamped : Word[9] {
         it := mux(shift_raw >= 24w9, 31w9, shift_raw)
     }
+    //> Denormalization distance narrowed to the barrel width.
     wire shift_amount  : Word[5] {
         it := shift_clamped[5..0]
     }
 
-    // Right barrel over Word[24]: stages 16, 8, 4, 2, 1.
+    //> Right barrel over Word[24]: stages 16, 8, 4, 2, 1.
+    //> Barrel stage 1: conditional right shift by 16.
     wire shifted_16 : Word[24] {
         it := mux(shift_amount[4], word(0w16, sig24[24..16]), sig24)
     }
+    //> Barrel stage 2: conditional right shift by 8.
     wire shifted_8  : Word[24] {
         it := mux(shift_amount[3], word(0w8, shifted_16[24..8]), shifted_16)
     }
+    //> Barrel stage 3: conditional right shift by 4.
     wire shifted_4  : Word[24] {
         it := mux(shift_amount[2], word(0w4, shifted_8[24..4]), shifted_8)
     }
+    //> Barrel stage 4: conditional right shift by 2.
     wire shifted_2  : Word[24] {
         it := mux(shift_amount[1], word(0w2, shifted_4[24..2]), shifted_4)
     }
+    //> Barrel stage 5: conditional right shift by 1.
     wire shifted_1  : Word[24] {
         it := mux(shift_amount[0], word(0w1, shifted_2[24..1]), shifted_2)
     }
 
+    //> Denormalized fraction, the barrel output's low 23 bits.
     wire denorm_fract : Word[23] {
         it := shifted_1[23..0]
     }
 
+    //> IEEE biased exponent: specials encode 0xFF, zero and subnormal
+    //> encode 0, and recExp 130..383 maps to 1..254.
     wire exp_out : Word[8] {
         it := if {
             when is_nan => 0xFFw8
@@ -100,6 +120,8 @@ pub mod RecFnToFnBinary32 {
         }
     }
 
+    //> IEEE fraction: NaN payload preserved; inf, zero and subnormal
+    //> handled per class; normals pass through.
     wire fract_out : Word[23] {
         it := if {
             // NaN payload preserved; inf forces fraction zero even

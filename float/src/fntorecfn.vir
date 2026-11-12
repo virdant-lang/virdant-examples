@@ -9,8 +9,10 @@
 //> style: obviously correct beats clever. Boundaries: x with bit 22
 //> set -> 0; x = 1 -> 22; x = 0 -> 23.
 mod CountLeadingZeros23 {
+    //> The 23-bit value to count leading zeros of.
     incoming x : Word[23]
 
+    //> Number of leading zeros, 0..23 (23 when x is zero).
     outgoing lz : Word[5] dependson x {
         it := if {
             when x[22] => 0w5
@@ -46,74 +48,91 @@ mod CountLeadingZeros23 {
 //> IEEE input: [31] sign, [30..23] biased exponent, [22..0] fraction.
 //> Recoded output: [32] sign, [31..23] recExp, [22..0] fract.
 pub mod FnToRecFnBinary32 {
+    //> The IEEE binary32 word to convert.
     incoming in : Word[32]
 
+    //> The 33-bit recoded encoding of the same value.
     outgoing out : Word[33] dependson in {
         it := word(sign, rec_exp, rec_fract)
     }
 
-    // Subnormal normalization distance (0..22 for a nonzero fraction).
+    //> Subnormal normalization distance (0..22 for a nonzero fraction).
+    //> Leading-zero counter for subnormal normalization.
     mod normalizer of CountLeadingZeros23 {
         it.x := fract
     }
 
+    //> Sign bit, passed through unchanged.
     wire sign   : Bit {
         it := in[31]
     }
+    //> IEEE biased exponent field, in[31..23].
     wire exp_in : Word[8] {
         it := in[31..23]
     }
+    //> IEEE fraction field, in[23..0].
     wire fract  : Word[23] {
         it := in[23..0]
     }
 
+    //> Zero exponent: zero or subnormal input.
     wire is_zero_exp   : Bit {
         it := exp_in == 0w8
     }
+    //> Max exponent: infinity or NaN input.
     wire is_max_exp    : Bit {
         it := exp_in == 0xFFw8
     }
+    //> Zero fraction.
     wire is_zero_fract : Bit {
         it := fract == 0w23
     }
 
+    //> Normalization distance from the leading-zero counter.
     wire norm_dist      : Word[5] {
         it := normalizer.lz
     }
+    //> Normalization distance widened to recExp width.
     wire norm_dist_wide : Word[9] {
         it := zext(norm_dist)
     }
 
-    // Left barrel over Word[45]: stages 16, 8, 4, 2, 1 on the
-    // norm_dist bits (norm_dist <= 22, but includes values needing
-    // the 8 stage, e.g. 11 = 8 + 2 + 1).
+    //> Left barrel over Word[45]: stages 16, 8, 4, 2, 1 on the
+    //> norm_dist bits (norm_dist <= 22, but includes values needing
+    //> the 8 stage, e.g. 11 = 8 + 2 + 1).
+    //> Fraction widened for the barrel.
     wire fract_wide : Word[45] {
         it := zext(fract)
     }
+    //> Barrel stage 1: conditional left shift by 16.
     wire shifted_16 : Word[45] {
         it := mux(norm_dist[4], word(fract_wide[29..0], 0w16), fract_wide)
     }
+    //> Barrel stage 2: conditional left shift by 8.
     wire shifted_8  : Word[45] {
         it := mux(norm_dist[3], word(shifted_16[37..0], 0w8), shifted_16)
     }
+    //> Barrel stage 3: conditional left shift by 4.
     wire shifted_4  : Word[45] {
         it := mux(norm_dist[2], word(shifted_8[41..0], 0w4), shifted_8)
     }
+    //> Barrel stage 4: conditional left shift by 2.
     wire shifted_2  : Word[45] {
         it := mux(norm_dist[1], word(shifted_4[43..0], 0w2), shifted_4)
     }
+    //> Barrel stage 5: conditional left shift by 1.
     wire shifted_1  : Word[45] {
         it := mux(norm_dist[0], word(shifted_2[44..0], 0w1), shifted_2)
     }
 
-    // The 22 bits below the dropped leading one, shifted up by one;
-    // bit 0 is zero. Worked example: fract = 1 -> norm_dist 22 ->
-    // rec_exp 107, rec_fract 0 (the smallest subnormal, 2^-149).
+    //> The 22 bits below the dropped leading one, shifted up by one;
+    //> bit 0 is zero. Worked example: fract = 1 -> norm_dist 22 ->
+    //> rec_exp 107, rec_fract 0 (the smallest subnormal, 2^-149).
     wire subnormal_fract : Word[23] {
         it := word(shifted_1[22..0], 0w1)
     }
 
-    // Worked example: 1.0 (exp_in 127) -> rec_exp 256.
+    //> Worked example: 1.0 (exp_in 127) -> rec_exp 256.
     wire rec_exp : Word[9] {
         it := if {
             when is_zero_exp && is_zero_fract => 0w9
@@ -124,6 +143,8 @@ pub mod FnToRecFnBinary32 {
         }
     }
 
+    //> Recoded fraction: subnormal normalization, infinity/NaN and
+    //> zero pass the fraction through or zero it.
     wire rec_fract : Word[23] {
         it := if {
             when is_zero_exp => mux(is_zero_fract, 0w23, subnormal_fract)

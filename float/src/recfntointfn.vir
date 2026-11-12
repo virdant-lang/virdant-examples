@@ -2,7 +2,7 @@
 //!
 //! Matches the reference RecFNToIN contract: `signed_out` selects the
 //! target signedness; `int_exception_flags` is {invalid, overflow,
-    //! inexact} from the top; out-of-range and NaN/infinity results
+//! inexact} from the top; out-of-range and NaN/infinity results
 //! saturate per the reference table.
 
 import hardfloat
@@ -23,18 +23,26 @@ import recfnclass
 //> the subnormal class: only the exponent sign (value above or below
 //> one) matters.
 pub mod RecFnToIntBinary32 {
+    //> The recoded value to convert.
     incoming in            : Word[33]
+
+    //> Rounding mode for inexact results.
     incoming rounding_mode : hardfloat::RoundMode
+
+    //> High: target a signed two's-complement integer; low: unsigned.
     incoming signed_out    : Bit
 
+    //> The saturated, rounded integer result.
     outgoing out : Word[32] dependson in, rounding_mode, signed_out {
         it := mux(use_exceptional, exceptional_out, rounded_out)
     }
 
+    //> {invalid, overflow, inexact}, most significant first.
     outgoing int_exception_flags : Word[3] dependson in, rounding_mode, signed_out {
         it := word(invalid_exc, overflow_exc, inexact_exc)
     }
 
+    //> Decode-equivalence classification of the operand.
     mod cls of recfnclass::RecFnClassBinary32 {
         it.in := in
     }
@@ -43,112 +51,137 @@ pub mod RecFnToIntBinary32 {
     unused cls.is_subnormal
     unused cls.is_normal
 
+    //> Result sign bit, passed through unchanged.
     wire sign    : Bit {
         it := in[32]
     }
+    //> Recoded exponent field, in[32..23].
     wire rec_exp : Word[9] {
         it := in[32..23]
     }
+    //> Recoded fraction field, in[23..0].
     wire fract   : Word[23] {
         it := in[23..0]
     }
 
-    // Explicit leading one; the zero class already reads as zero
-    // through the tiny-value path (its sticky collapses to zero).
+    //> Explicit leading one; the zero class already reads as zero
+    //> through the tiny-value path (its sticky collapses to zero).
     wire sig24 : Word[24] {
         it := word(1w1, fract)
     }
 
-    // Exponent relative to the integer boundary: e = recExp - 279.
-    // Negative e means the value is below 2^23-scaled... values under
-    // one may still have e >= 0 only for recExp >= 279, where the
-    // significand is already an integer.
+    //> Exponent relative to the integer boundary: e = recExp - 279.
+    //> Negative e means the value is below 2^23-scaled... values under
+    //> one may still have e >= 0 only for recExp >= 279, where the
+    //> significand is already an integer.
     wire e_full : Word[10] {
         it := rec_exp -. 279w9
     }
+    //> Negative exponent flag: value below one.
     wire e_neg  : Bit {
         it := e_full[10..9] == 1w1
     }
 
-    // Path for e >= 0: the value is already an exact integer; shift
-    // it into a 33-bit window. Shifts of 9 or more are clamped to 9:
-    // any value that large is out of every target range, and the
-    // clamped window keeps bit 32 set to flag it.
+    //> Path for e >= 0: the value is already an exact integer; shift
+    //> it into a 33-bit window. Shifts of 9 or more are clamped to 9:
+    //> any value that large is out of every target range, and the
+    //> clamped window keeps bit 32 set to flag it.
+    //> Shift amount for the integer path, clamped to the window.
     wire int_shift     : Word[4] {
         it := mux(e_full > 9w10, 9w4, trunc(e_full))
     }
+    //> Significand widened to the integer window.
     wire sig33         : Word[33] {
         it := zext(sig24)
     }
+    //> Integer-path barrel stage 1: conditional right shift by 8.
     wire shifted_int_8 : Word[33] {
         it := mux(int_shift[3], word(sig33[25..0], 0w8), sig33)
     }
+    //> Integer-path barrel stage 2: conditional right shift by 4.
     wire shifted_int_4 : Word[33] {
         it := mux(int_shift[2], word(shifted_int_8[29..0], 0w4), shifted_int_8)
     }
+    //> Integer-path barrel stage 3: conditional right shift by 2.
     wire shifted_int_2 : Word[33] {
         it := mux(int_shift[1], word(shifted_int_4[31..0], 0w2), shifted_int_4)
     }
+    //> Integer-path barrel stage 4: conditional right shift by 1.
     wire shifted_int_1 : Word[33] {
         it := mux(int_shift[0], word(shifted_int_2[32..0], 0w1), shifted_int_2)
     }
 
-    // Path for e < 0: scale the significand into a 48-bit fixed-point
-    // word V with value = V * 2^-24: shift amount 24 + e, i.e.
-    // recExp - 255, in [0, 23] for values down to a half. Below a
-    // half (recExp < 255) the integer part is zero, the guard bit
-    // disappears, and only the sticky survives.
+    //> Path for e < 0: scale the significand into a 48-bit fixed-point
+    //> word V with value = V * 2^-24: shift amount 24 + e, i.e.
+    //> recExp - 255, in [0, 23] for values down to a half. Below a
+    //> half (recExp < 255) the integer part is zero, the guard bit
+    //> disappears, and only the sticky survives.
+    //> Deep-underflow flag: value below a half, integer part zero.
     wire is_deep     : Bit {
         it := rec_exp < 255w9
     }
+    //> Fractional shift amount, 24 + e.
     wire frac_shift  : Word[5] {
         it := trunc(rec_exp - 255w9)
     }
+    //> Fractional-path barrel stage 1: conditional left shift by 16.
     wire scaled_16   : Word[48] {
         it := mux(frac_shift[4], word(scaled_wide[32..0], 0w16), scaled_wide)
     }
+    //> Fractional-path barrel stage 2: conditional left shift by 8.
     wire scaled_8    : Word[48] {
         it := mux(frac_shift[3], word(scaled_16[40..0], 0w8), scaled_16)
     }
+    //> Fractional-path barrel stage 3: conditional left shift by 4.
     wire scaled_4    : Word[48] {
         it := mux(frac_shift[2], word(scaled_8[44..0], 0w4), scaled_8)
     }
+    //> Fractional-path barrel stage 4: conditional left shift by 2.
     wire scaled_2    : Word[48] {
         it := mux(frac_shift[1], word(scaled_4[46..0], 0w2), scaled_4)
     }
+    //> Fractional-path barrel stage 5: conditional left shift by 1.
     wire scaled_1    : Word[48] {
         it := mux(frac_shift[0], word(scaled_2[47..0], 0w1), scaled_2)
     }
+    //> Significand placed at the bottom of the 48-bit window.
     wire scaled_wide : Word[48] {
         it := word(0w24, sig24)
     }
+    //> Barrel output, zeroed on deep underflow.
     wire scaled      : Word[48] {
         it := mux(is_deep, 0w48, scaled_1)
     }
 
-    // Integer part and rounding bits of the fixed-point window.
+    //> Integer part of the fixed-point window.
     wire int_part    : Word[24] {
         it := scaled[48..24]
     }
+    //> Least significant integer bit, for round-to-nearest-even.
     wire int_lsb     : Bit {
         it := scaled[24]
     }
+    //> Guard bit just below the integer part.
     wire guard       : Bit {
         it := scaled[23]
     }
+    //> OR of every fractional bit below the guard.
     wire frac_sticky : Bit {
         it := any(scaled[23..0])
     }
 
-    // Below a half, everything folds into the sticky bit: any nonzero
-    // value is inexact, and nearest modes round to zero.
+    //> Below a half, everything folds into the sticky bit: any nonzero
+    //> value is inexact, and nearest modes round to zero.
     wire sticky       : Bit {
         it := mux(is_deep, !cls.is_zero, frac_sticky)
     }
+    //> Inexactness of the fractional path.
     wire inexact_frac : Bit {
         it := guard || sticky
     }
 
+    //> Rounding increment decision, per mode; sign-aware like a
+    //> magnitude rounder.
     wire round_up : Bit {
         it := match rounding_mode {
             with #NearestEven    => guard && (int_lsb || sticky)
@@ -159,64 +192,83 @@ pub mod RecFnToIntBinary32 {
         }
     }
 
+    //> Integer part plus the rounding increment, one bit wider for
+    //> the carry.
     wire rounded_small : Word[25] {
         it := int_part +. mux(round_up, 1w24, 0w24)
     }
+    //> Rounded small-path result widened to the result width.
     wire small_result  : Word[33] {
         it := zext(rounded_small)
     }
 
-    // The rounded magnitude, and its inexactness.
+    //> The rounded magnitude, and its inexactness.
     wire rounded_magnitude : Word[33] {
         it := mux(e_neg, small_result, shifted_int_1)
     }
+    //> Inexactness of the result: only the fractional path can be
+    //> inexact.
     wire inexact           : Bit {
         it := e_neg && inexact_frac
     }
 
-    // Range checks against the target signedness. The only valid
-    // magnitude of 2^31 is the signed minimum, via a negative sign.
+    //> Range checks against the target signedness. The only valid
+    //> magnitude of 2^31 is the signed minimum, via a negative sign.
+    //> Out of signed range; 2^31 is valid only as the signed minimum.
     wire signed_overflow   : Bit {
         it := (rounded_magnitude > 0x8000_0000w33)
         || ((rounded_magnitude == 0x8000_0000w33) && !sign)
     }
+    //> Out of unsigned range: any negative value, or a magnitude with
+    //> bit 32 set.
     wire unsigned_overflow : Bit {
         it := rounded_magnitude[32] || (sign && (rounded_magnitude != 0w33))
     }
 
+    //> Invalid: NaN or infinity input.
     wire invalid_exc     : Bit {
         it := cls.is_nan || cls.is_inf
     }
+    //> Overflow: finite but out of the target range.
     wire overflow_exc    : Bit {
         it := !invalid_exc
         && mux(signed_out, signed_overflow, unsigned_overflow)
     }
+    //> Inexact: rounding dropped fraction bits.
     wire inexact_exc     : Bit {
         it := !invalid_exc && !overflow_exc && inexact
     }
+    //> Selects the saturation path over the rounded result.
     wire use_exceptional : Bit {
         it := invalid_exc || overflow_exc
     }
 
-    // Saturation table, matching the reference: NaN saturates as
-    // positive; infinities and overflows saturate by sign.
+    //> Saturation table, matching the reference: NaN saturates as
+    //> positive; infinities and overflows saturate by sign.
+    //> Sign of the saturating value: NaN saturates as positive,
+    //> everything else by its sign.
     wire exc_sign        : Bit {
         it := !cls.is_nan && sign
     }
+    //> High half of the saturation word: signed minimum or zero.
     wire exc_high        : Word[32] {
         it := mux(signed_out == exc_sign, 0x8000_0000w32, 0w32)
     }
+    //> Low half of the saturation word: unsigned zero or signed max.
     wire exc_low         : Word[32] {
         it := mux(!exc_sign, 0x7FFF_FFFFw32, 0w32)
     }
+    //> Saturated result, high and low halves ORed.
     wire exceptional_out : Word[32] {
         it := exc_high | exc_low
     }
 
-    // Two's complement of the rounded magnitude; -0 reads as zero.
+    //> Two's complement of the rounded magnitude; -0 reads as zero.
+    //> Magnitude truncated to the result width.
     wire magnitude_bits : Word[32] {
         it := rounded_magnitude[32..0]
     }
+    //> Final result: negated for negative sign, else the magnitude.
     wire rounded_out    : Word[32] {
         it := mux(sign, -magnitude_bits, magnitude_bits)
     }

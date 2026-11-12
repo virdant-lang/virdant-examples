@@ -13,61 +13,70 @@ import hardfloat
 //> Layout: [32] sign, [31..23] recExp (9 bits), [22..0] fract.
 //> Value formula: value = sig * 2^(s_exp - 2048), i.e. s_exp = recExp + 1769.
 mod DecodeRecFnBinary32 {
+    //> The recoded operand to decode.
     incoming in : Word[33]
 
+    //> Sign bit, passed through unchanged.
     outgoing sign : Bit dependson in {
         it := in[32]
     }
 
+    //> Scaled exponent, s_exp = recExp + 1769, so that
+    //> value = sig * 2^(s_exp - 2048).
     outgoing s_exp : Word[13] dependson in {
         it := zext(rec_exp) + 1769w13
     }
 
+    //> Significand: 2^23 + fract for every nonzero class, 0 for zero.
     outgoing sig : Word[24] dependson in {
         // Leading 1 prepended for every non-zero class; zero forces sig to 0.
         // Inf and NaN keep the leading 1 — the top level bypasses specials.
         it := mux(is_zero_class, 0w24, word(1w1, fract))
     }
 
+    //> Zero class flag.
     outgoing is_zero : Bit dependson in {
         it := is_zero_class
     }
 
+    //> Infinity class: special with the quiet bit clear.
     outgoing is_inf : Bit dependson in {
         it := is_special && !rec_exp[6]
     }
 
+    //> NaN class: special with the quiet bit set.
     outgoing is_nan : Bit dependson in {
         it := is_special && rec_exp[6]
     }
 
-    // Mirrored from the is_nan output: outgoing ports must not be read
-    // inside their own module.
+    //> Mirrored from the is_nan output: outgoing ports must not be read
+    //> inside their own module.
     wire is_nan_wire : Bit {
         it := is_special && rec_exp[6]
     }
 
+    //> Signaling NaN: NaN class with the quiet bit (fract bit 22) clear.
     outgoing is_snan : Bit dependson in {
         // NaN class with the quiet bit (fract bit 22) clear.
         it := is_nan_wire && !fract[22]
     }
 
-    // recExp field: in[31..23], 9 recoded exponent bits.
+    //> recExp field: in[31..23], 9 recoded exponent bits.
     wire rec_exp : Word[9] {
         it := in[32..23]
     }
 
-    // Fraction field: in[22..0].
+    //> Fraction field: in[22..0].
     wire fract : Word[23] {
         it := in[23..0]
     }
 
-    // Special class: recExp top two bits are 0b11 (inf or NaN).
+    //> Special class: recExp top two bits are 0b11 (inf or NaN).
     wire is_special : Bit {
         it := rec_exp[9..7] == 0b11w2
     }
 
-    // Zero class: recExp top three bits are all zero.
+    //> Zero class: recExp top three bits are all zero.
     wire is_zero_class : Bit {
         it := rec_exp[9..6] == 0w3
     }
@@ -76,9 +85,13 @@ mod DecodeRecFnBinary32 {
 //> Exact 24x24 unsigned significand multiplier.
 //> The product of two 24-bit values always fits in 48 bits.
 mod MulSig24 {
+    //> Multiplicand significand.
     incoming a_sig : Word[24]
+
+    //> Multiplier significand.
     incoming b_sig : Word[24]
 
+    //> Exact 48-bit product of the two significands.
     outgoing prod : Word[48] dependson a_sig, b_sig {
         // Bit-serial shift-add: there is no `*` operator in Virdant and no
         // loops, so the ladder is spelled out as one `let` list; each
@@ -118,16 +131,27 @@ mod MulSig24 {
 //> the bigger operand, right-shifting by the exponent difference and
 //> capturing lost bits as sticky.
 mod AlignAddend {
-    incoming big_sig   : Word[48]      // value = big_sig * 2^(big_exp - 2048)
-    incoming big_exp   : Word[13]      // caller guarantees big_exp >= small_exp
+    //> The larger significand, value = big_sig * 2^(big_exp - 2048).
+    incoming big_sig   : Word[48]
+
+    //> Exponent of the larger operand; caller guarantees
+    //> big_exp >= small_exp.
+    incoming big_exp   : Word[13]
+
+    //> The smaller significand, value = small_sig * 2^(small_exp - 2048).
     incoming small_sig : Word[48]
+
+    //> Exponent of the smaller operand.
     incoming small_exp : Word[13]
 
+    //> The larger operand placed at window bits [79..32].
     outgoing big_in_window : Word[80] dependson big_sig {
         // big_sig placed at bits [79..32]
         it := word(big_sig, 0w32)
     }
 
+    //> The smaller operand right-shifted into place under the larger;
+    //> all zero when every bit fell below the window.
     outgoing small_in_window : Word[80] dependson big_exp, small_exp, small_sig {
         // small_sig entered at bits [79..32] and shifted right by diff,
         // so its bits land at [79-diff .. 32-diff]: the low 32 window
@@ -135,6 +159,8 @@ mod AlignAddend {
         it := mux(lost_all_bits, 0w80, small_shifted_1)
     }
 
+    //> OR of the addend bits shifted out of the window (always strictly
+    //> below one window ulp; the full OR when everything fell out).
     outgoing sticky : Bit dependson big_exp, small_exp, small_sig {
         // OR of small_sig bits shifted out; with the addend entering one
         // window ulp above the floor, only shifts beyond 32 drop bits,
@@ -142,90 +168,110 @@ mod AlignAddend {
         it := mux(lost_all_bits, any(small_sig), sticky_shifted)
     }
 
-    // Exponent difference, widened so the borrow is visible.
-    // The caller guarantees big_exp >= small_exp, so a borrow is
-    // impossible; the borrow arm still degrades to diff = 0.
+    //> Exponent difference, widened so the borrow is visible.
+    //> The caller guarantees big_exp >= small_exp, so a borrow is
+    //> impossible; the borrow arm still degrades to diff = 0.
     wire exponent_diff_raw : Word[14]
     exponent_diff_raw := big_exp -. small_exp
 
+    //> Exponent difference, borrow arm clamped to zero.
     wire exponent_diff : Word[14]
     exponent_diff := mux(exponent_diff_raw[13], 0w14, exponent_diff_raw)
 
-    // A shift of 128 or more pushes every small_sig bit below the
-    // window: nothing survives and sticky is the OR of all of it.
+    //> A shift of 128 or more pushes every small_sig bit below the
+    //> window: nothing survives and sticky is the OR of all of it.
     wire lost_all_bits : Bit
     lost_all_bits := any(exponent_diff[14..7])
 
-    // The addend enters the barrel one window ulp above the window
-    // floor (bits [79..32]), so a right shift by diff places bit j of
-    // small_sig at window bit 32 + j - diff -- the exact aligned
-    // position -- and nothing is dropped while diff <= 32.
+    //> The addend enters the barrel one window ulp above the window
+    //> floor (bits [79..32]), so a right shift by diff places bit j of
+    //> small_sig at window bit 32 + j - diff -- the exact aligned
+    //> position -- and nothing is dropped while diff <= 32.
     wire small_wide : Word[80]
     small_wide := word(small_sig, 0w32)
 
-    // Stage 0: conditional right shift by 64 when exponent_diff[6] is set.
+    //> Stage 0: conditional right shift by 64 when exponent_diff[6] is set.
     wire small_shifted_64 : Word[80]
     small_shifted_64 := mux(exponent_diff[6], word(0w64, small_wide[80..64]), small_wide)
 
+    //> Bits dropped at stage 0.
     wire small_dropped_64 : Bit
     small_dropped_64 := exponent_diff[6] && any(small_wide[64..0])
 
-    // Stage 1: conditional right shift by 32 when exponent_diff[5] is set.
+    //> Stage 1: conditional right shift by 32 when exponent_diff[5] is set.
     wire small_shifted_32 : Word[80]
     small_shifted_32 := mux(exponent_diff[5], word(0w32, small_shifted_64[80..32]), small_shifted_64)
 
+    //> Bits dropped at stage 1.
     wire small_dropped_32 : Bit
     small_dropped_32 := exponent_diff[5] && any(small_shifted_64[32..0])
 
-    // Stage 2: conditional right shift by 16 when exponent_diff[4] is set.
+    //> Stage 2: conditional right shift by 16 when exponent_diff[4] is set.
     wire small_shifted_16 : Word[80]
     small_shifted_16 := mux(exponent_diff[4], word(0w16, small_shifted_32[80..16]), small_shifted_32)
 
+    //> Bits dropped at stage 2.
     wire small_dropped_16 : Bit
     small_dropped_16 := exponent_diff[4] && any(small_shifted_32[16..0])
 
-    // Stage 3: conditional right shift by 8 when exponent_diff[3] is set.
+    //> Stage 3: conditional right shift by 8 when exponent_diff[3] is set.
     wire small_shifted_8 : Word[80]
     small_shifted_8 := mux(exponent_diff[3], word(0w8, small_shifted_16[80..8]), small_shifted_16)
 
+    //> Bits dropped at stage 3.
     wire small_dropped_8 : Bit
     small_dropped_8 := exponent_diff[3] && any(small_shifted_16[8..0])
 
-    // Stage 4: conditional right shift by 4 when exponent_diff[2] is set.
+    //> Stage 4: conditional right shift by 4 when exponent_diff[2] is set.
     wire small_shifted_4 : Word[80]
     small_shifted_4 := mux(exponent_diff[2], word(0w4, small_shifted_8[80..4]), small_shifted_8)
 
+    //> Bits dropped at stage 4.
     wire small_dropped_4 : Bit
     small_dropped_4 := exponent_diff[2] && any(small_shifted_8[4..0])
 
-    // Stage 5: conditional right shift by 2 when exponent_diff[1] is set.
+    //> Stage 5: conditional right shift by 2 when exponent_diff[1] is set.
     wire small_shifted_2 : Word[80]
     small_shifted_2 := mux(exponent_diff[1], word(0w2, small_shifted_4[80..2]), small_shifted_4)
 
+    //> Bits dropped at stage 5.
     wire small_dropped_2 : Bit
     small_dropped_2 := exponent_diff[1] && any(small_shifted_4[2..0])
 
-    // Stage 6: conditional right shift by 1 when exponent_diff[0] is set.
+    //> Stage 6: conditional right shift by 1 when exponent_diff[0] is set.
     wire small_shifted_1 : Word[80]
     small_shifted_1 := mux(exponent_diff[0], word(0w1, small_shifted_2[80..1]), small_shifted_2)
 
+    //> Bits dropped at stage 6.
     wire small_dropped_1 : Bit
     small_dropped_1 := exponent_diff[0] && any(small_shifted_2[1..0])
 
-    // Sticky accumulated over the barrel stages: bits dropped at each
-    // firing stage OR together.
+    //> Sticky accumulated over the barrel stages: bits dropped at each
+    //> firing stage OR together.
     wire sticky_shifted : Bit
     sticky_shifted := small_dropped_64 || small_dropped_32 || small_dropped_16 || small_dropped_8 || small_dropped_4 || small_dropped_2 || small_dropped_1
 }
 
 //> Sign-magnitude add/subtract with sticky folding.
 mod SignMagAdd {
+    //> Magnitude of the A operand, in window units.
     incoming a_magnitude : Word[80]
+
+    //> Sign of the A operand.
     incoming a_sign      : Bit
+
+    //> Magnitude of the B operand, in window units.
     incoming b_magnitude : Word[80]
+
+    //> Sign of the B operand.
     incoming b_sign      : Bit
+
+    //> Sticky fraction belonging to the B operand, strictly below one
+    //> window ulp.
     incoming sticky_in   : Bit
 
+    //> Sum magnitude: same-sign add, or the effective subtraction of
+    //> the smaller from the larger (equal magnitudes cancel to zero).
     outgoing sum_magnitude : Word[81] dependson a_magnitude, a_sign, b_magnitude, b_sign, sticky_in {
         it := if {
             when same_sign => a_magnitude +. b_magnitude
@@ -236,6 +282,8 @@ mod SignMagAdd {
         }
     }
 
+    //> Sign of the sum: the bigger operand's sign, or the small (b)
+    //> operand's sign for the sticky-only cancellation arm.
     outgoing sum_sign : Bit dependson a_magnitude, a_sign, b_magnitude, b_sign {
         it := if {
             when same_sign => a_sign
@@ -251,6 +299,10 @@ mod SignMagAdd {
         }
     }
 
+    //> The incoming sticky always survives: it represents a nonzero
+    //> remainder strictly below one window ulp that belongs to the
+    //> small (b) operand, and no arm of the add can absorb it into
+    //> the window magnitudes.
     outgoing sticky_out : Bit dependson sticky_in {
         // The incoming sticky always survives: it represents a nonzero
         // remainder strictly below one window ulp that belongs to the
@@ -259,49 +311,53 @@ mod SignMagAdd {
         it := sticky_in
     }
 
+    //> Both operands carry the same sign: plain addition.
     wire same_sign : Bit
     same_sign := !(a_sign ^^ b_sign)
 
-    // Effective-subtraction arms. The incoming sticky represents a
-    // remainder strictly between 0 and 1 window ulp attached to the b
-    // (smaller-exponent) operand, so with the exact window magnitudes:
-    //
-    //   a > b: true magnitude = (a - b) - sticky = (a - b - 1) + (1 - sticky)
-    //          with 1 - sticky in (0, 1): fold one ulp off the integer
-    //          part and keep sticky_out set.
-    //   b > a: true magnitude = (b - a) + sticky with sticky in (0, 1):
-    //          the integer part is exactly b - a and the remainder is
-    //          the sticky itself -- no fold, sticky_out set.
-    //   a == b: true magnitude = sticky in (0, 1): the window holds 0
-    //          and the sticky carries the whole magnitude.
-    //
-    // In every arm the pair (sum_magnitude, sticky_out) is therefore the
-    // exact floor-plus-sticky image of the true result.
+    //> Effective-subtraction arms. The incoming sticky represents a
+    //> remainder strictly between 0 and 1 window ulp attached to the b
+    //> (smaller-exponent) operand, so with the exact window magnitudes:
+    //>
+    //>   a > b: true magnitude = (a - b) - sticky = (a - b - 1) + (1 - sticky)
+    //>          with 1 - sticky in (0, 1): fold one ulp off the integer
+    //>          part and keep sticky_out set.
+    //>   b > a: true magnitude = (b - a) + sticky with sticky in (0, 1):
+    //>          the integer part is exactly b - a and the remainder is
+    //>          the sticky itself -- no fold, sticky_out set.
+    //>   a == b: true magnitude = sticky in (0, 1): the window holds 0
+    //>          and the sticky carries the whole magnitude.
+    //>
+    //> In every arm the pair (sum_magnitude, sticky_out) is therefore the
+    //> exact floor-plus-sticky image of the true result.
     wire a_minus_b_wide : Word[81]
     a_minus_b_wide := a_magnitude -. b_magnitude
 
+    //> Reverse subtraction arm: exact, no sticky fold.
     wire b_minus_a : Word[81]
     b_minus_a := b_magnitude -. a_magnitude
 
-    // One window ulp, widened to match the borrow chain.
+    //> One window ulp, widened to match the borrow chain.
     wire sticky_ulp : Word[81]
     sticky_ulp := zext(word(sticky_in))
 
+    //> a - b with one ulp folded off for the sticky remainder.
     wire a_minus_b_full : Word[82]
     a_minus_b_full := a_minus_b_wide -. sticky_ulp
 
-    // Truncation back to Word[81] is safe: a_magnitude > b_magnitude in
-    // this arm, so a_minus_b_wide >= 1 and the fold never borrows.
+    //> Truncation back to Word[81] is safe: a_magnitude > b_magnitude in
+    //> this arm, so a_minus_b_wide >= 1 and the fold never borrows.
     wire a_minus_b : Word[81]
     a_minus_b := trunc(a_minus_b_full)
 }
 
 //> Leading-zero count of an 8-bit byte, 0..8 (8 when x is zero).
 mod CountLeadingZeros8 {
+    //> The byte to count leading zeros of.
     incoming x : Word[8]
 
-    // Priority from the MSB down; the first set bit wins, and an
-    // all-zero byte falls through to 8.
+    //> Priority from the MSB down; the first set bit wins, and an
+    //> all-zero byte falls through to 8.
     outgoing lz : Word[4] dependson x {
         it := if {
             when x[7] => 0w4
@@ -319,12 +375,13 @@ mod CountLeadingZeros8 {
 
 //> Leading-zero count over 81 bits, 0..81 (81 when x is zero).
 mod CountLeadingZeros81 {
+    //> The 81-bit value to count leading zeros of.
     incoming x : Word[81]
 
-    // A highest set bit at position p gives lz = 80 - p.  Byte i covers
-    // bits 8i+7 .. 8i, so when it is the highest nonzero byte its clz c
-    // means p = 8i + 7 - c and the arm value is (73 - 8i) + c.  Bit 80
-    // is handled first, and an all-zero input falls through to 81.
+    //> A highest set bit at position p gives lz = 80 - p.  Byte i covers
+    //> bits 8i+7 .. 8i, so when it is the highest nonzero byte its clz c
+    //> means p = 8i + 7 - c and the arm value is (73 - 8i) + c.  Bit 80
+    //> is handled first, and an all-zero input falls through to 81.
     outgoing lz : Word[7] dependson x {
         it := if {
             when x[80] => 0w7
@@ -342,35 +399,45 @@ mod CountLeadingZeros81 {
         }
     }
 
-    // Ten byte counters, byte 9 at the top (bits 79..72) down to
-    // byte 0 at the bottom (bits 7..0).
+    //> Byte counters, byte 9 at the top (bits 79..72) down to
+    //> byte 0 at the bottom (bits 7..0).
+    //> Byte 9 counter: bits 80..72.
     mod clz_byte9 of CountLeadingZeros8
     clz_byte9.x := x[80..72]
 
+    //> Byte 8 counter: bits 72..64.
     mod clz_byte8 of CountLeadingZeros8
     clz_byte8.x := x[72..64]
 
+    //> Byte 7 counter: bits 64..56.
     mod clz_byte7 of CountLeadingZeros8
     clz_byte7.x := x[64..56]
 
+    //> Byte 6 counter: bits 56..48.
     mod clz_byte6 of CountLeadingZeros8
     clz_byte6.x := x[56..48]
 
+    //> Byte 5 counter: bits 48..40.
     mod clz_byte5 of CountLeadingZeros8
     clz_byte5.x := x[48..40]
 
+    //> Byte 4 counter: bits 40..32.
     mod clz_byte4 of CountLeadingZeros8
     clz_byte4.x := x[40..32]
 
+    //> Byte 3 counter: bits 32..24.
     mod clz_byte3 of CountLeadingZeros8
     clz_byte3.x := x[32..24]
 
+    //> Byte 2 counter: bits 24..16.
     mod clz_byte2 of CountLeadingZeros8
     clz_byte2.x := x[24..16]
 
+    //> Byte 1 counter: bits 16..8.
     mod clz_byte1 of CountLeadingZeros8
     clz_byte1.x := x[16..8]
 
+    //> Byte 0 counter: bits 8..0.
     mod clz_byte0 of CountLeadingZeros8
     clz_byte0.x := x[8..0]
 }
@@ -378,65 +445,79 @@ mod CountLeadingZeros81 {
 //> Normalizes an 81-bit sign-magnitude sum: one leading-zero count
 //> plus one barrel shift, per the recoded-format guarantee.
 mod Normalize {
-    incoming sum   : Word[81]     // value = sum * 2^(s_exp - 2048)
+    //> The window sum to normalize, value = sum * 2^(s_exp - 2048).
+    incoming sum   : Word[81]
+
+    //> Scaled exponent of the sum, on the same s_exp - 2048 convention.
     incoming s_exp : Word[13]
 
-    // After the shift the leading 1 of a nonzero sum sits at bit 80:
-    // sig takes bits 80..57, guard takes bit 56, sticky ORs bits 55..0.
+    //> After the shift the leading 1 of a nonzero sum sits at bit 80:
+    //> sig takes bits 80..57, guard takes bit 56, sticky ORs bits 55..0.
     outgoing sig : Word[24] dependson sum {
         it := shifted_by_1[81..57]
     }
 
+    //> Round bit just below the normalized significand.
     outgoing guard : Bit dependson sum {
         it := shifted_by_1[56]
     }
 
+    //> OR of every bit below the guard.
     outgoing sticky : Bit dependson sum {
         it := any(shifted_by_1[56..0])
     }
 
-    // (s_exp + 57) - lz; wrapping-safe since s_exp >= 1704 and lz <= 81.
+    //> (s_exp + 57) - lz; wrapping-safe since s_exp >= 1704 and lz <= 81.
     outgoing exp : Word[13] dependson sum, s_exp {
         it := (s_exp + 57w13) - lz_extended
     }
 
+    //> True when the sum is exactly zero.
     outgoing is_zero_result : Bit dependson sum {
         it := sum == 0w81
     }
 
+    //> Leading-zero counter over the sum.
     mod lz_counter of CountLeadingZeros81
     lz_counter.x := sum
 
+    //> Leading-zero count widened to exponent width.
     wire lz_extended : Word[13] {
         it := zext(lz_counter.lz)
     }
 
-    // 7-stage left barrel over Word[81]: stage s shifts by s when that
-    // lz bit is set, dropping the top s bits and appending s zeros.
+    //> 7-stage left barrel over Word[81]: stage s shifts by s when that
+    //> lz bit is set, dropping the top s bits and appending s zeros.
     wire shifted_by_64 : Word[81] {
         it := mux(lz_counter.lz[6], word(sum[17..0], 0w64), sum)
     }
 
+    //> Barrel stage: conditional left shift by 32.
     wire shifted_by_32 : Word[81] {
         it := mux(lz_counter.lz[5], word(shifted_by_64[49..0], 0w32), shifted_by_64)
     }
 
+    //> Barrel stage: conditional left shift by 16.
     wire shifted_by_16 : Word[81] {
         it := mux(lz_counter.lz[4], word(shifted_by_32[65..0], 0w16), shifted_by_32)
     }
 
+    //> Barrel stage: conditional left shift by 8.
     wire shifted_by_8 : Word[81] {
         it := mux(lz_counter.lz[3], word(shifted_by_16[73..0], 0w8), shifted_by_16)
     }
 
+    //> Barrel stage: conditional left shift by 4.
     wire shifted_by_4 : Word[81] {
         it := mux(lz_counter.lz[2], word(shifted_by_8[77..0], 0w4), shifted_by_8)
     }
 
+    //> Barrel stage: conditional left shift by 2.
     wire shifted_by_2 : Word[81] {
         it := mux(lz_counter.lz[1], word(shifted_by_4[79..0], 0w2), shifted_by_4)
     }
 
+    //> Barrel stage: conditional left shift by 1.
     wire shifted_by_1 : Word[81] {
         it := mux(lz_counter.lz[0], word(shifted_by_2[80..0], 0w1), shifted_by_2)
     }
@@ -451,20 +532,48 @@ mod Normalize {
 //> no double rounding at the subnormal seam.
 //> exp convention: value = sig * 2^(exp - 2048), pre-carry.
 pub mod EncodeRecFnBinary32 {
+    //> Result sign.
     incoming sign            : Bit
+
+    //> Scaled exponent, value = sig * 2^(exp - 2048), pre-carry.
     incoming exp             : Word[13]
+
+    //> Significand with the leading one explicit.
     incoming sig             : Word[24]
+
+    //> Guard bit just below the significand.
     incoming guard           : Bit
+
+    //> OR of every bit below the guard.
     incoming sticky          : Bit
+
+    //> Sign an exact zero takes under the IEEE zero-sum rule.
     incoming zero_sign       : Bit
+
+    //> Invalid-operation flag from the caller.
     incoming invalid_exc     : Bit
+
+    //> Divide-by-zero flag from the caller.
     incoming divide_by_zero  : Bit // raise flag bit 1 alongside is_inf
+
+    //> Top-level special: emit NaN unconditionally.
     incoming is_nan          : Bit // top-level special: emit NaN
+
+    //> Top-level special: emit infinity, no rounding flags.
     incoming is_inf          : Bit // top-level special: emit infinity, no flags
+
+    //> Rounding mode for the single rounding decision.
     incoming round_mode      : hardfloat::RoundMode
+
+    //> Tininess policy; underflow is computed after rounding directly,
+    //> so this is deliberately unused.
     incoming detect_tininess : hardfloat::Tininess
 
+    //> The recoded binary32 result.
     outgoing out             : Word[33] dependson sign, exp, sig, guard, sticky, zero_sign, is_nan, is_inf, round_mode
+
+    //> IEEE exception flags {inexact, underflow, overflow,
+    //> divide-by-zero, invalid}, least significant first.
     outgoing exception_flags : Word[5] dependson sign, exp, sig, guard, sticky, invalid_exc, divide_by_zero, is_nan, is_inf, round_mode
 
     // Tininess is detected after rounding (RISC-V semantics); the flag
@@ -477,14 +586,17 @@ pub mod EncodeRecFnBinary32 {
         it := 0b110_000_000w9
     }
 
+    //> Recoded-exponent class constants.
     wire rec_exp_nan : Word[9] {
         it := 0b111_000_000w9
     }
 
+    //> Recoded-exponent class constants.
     wire rec_exp_max_finite : Word[9] {
         it := 0b101_111_111w9
     }
 
+    //> Fraction of the max finite value (all ones).
     wire max_finite_fract : Word[23] {
         it := 0x7F_FFFFw23
     }
@@ -494,6 +606,7 @@ pub mod EncodeRecFnBinary32 {
         it := word(sign, rec_exp_inf, 0w23)
     }
 
+    //> Overflow candidates; both carry the result sign.
     wire out_max_finite : Word[33] {
         it := word(sign, rec_exp_max_finite, max_finite_fract)
     }
@@ -505,10 +618,12 @@ pub mod EncodeRecFnBinary32 {
         it := exp -. 1769w13
     }
 
+    //> Borrow flag of exp - 1769: value far below the subnormal range.
     wire exp_borrow : Bit {
         it := exp_diff[14..13] == 1w1
     }
 
+    //> Pre-carry recoded exponent, low 9 bits of exp - 1769.
     wire s_exp : Word[9] {
         it := exp_diff[9..0]
     }
@@ -520,10 +635,12 @@ pub mod EncodeRecFnBinary32 {
         it := !exp_borrow && exp_diff >= 130w14
     }
 
+    //> Subnormal-range class of the unrounded value (s_exp 107..129).
     wire class_subnormal_pre : Bit {
         it := !exp_borrow && exp_diff >= 107w14 && exp_diff <= 129w14
     }
 
+    //> Deep-underflow boundary class (s_exp exactly 106).
     wire class_deep_106 : Bit {
         it := !exp_borrow && exp_diff == 106w14
     }
@@ -562,14 +679,17 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
+    //> Kept-part LSB of the subnormal round bits.
     wire subnormal_lsb : Bit {
         it := subnormal_round_bits[3..2] == 1w1
     }
 
+    //> Guard bit of the subnormal round bits.
     wire subnormal_guard : Bit {
         it := subnormal_round_bits[2..1] == 1w1
     }
 
+    //> Sticky of the subnormal round bits.
     wire subnormal_sticky : Bit {
         it := subnormal_round_bits[1..0] == 1w1
     }
@@ -582,6 +702,8 @@ pub mod EncodeRecFnBinary32 {
     //> whole significand lies below the subnormal grid, whose only
     //> in-range point is the smallest subnormal itself; at s_exp = 106
     //> the leading one plays the role of the guard bit.
+    //> Effective round-position bits, selected by class: kept LSB,
+    //> guard, and sticky at the effective ulp.
     wire round_lsb : Bit {
         it := if {
             when class_normal_pre => sig[0]
@@ -590,6 +712,7 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
+    //> Effective guard bit, selected by class.
     wire round_guard : Bit {
         it := if {
             when class_normal_pre => guard
@@ -599,6 +722,7 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
+    //> Effective sticky, selected by class.
     wire round_sticky_low : Bit {
         it := if {
             when class_normal_pre => false
@@ -608,6 +732,8 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
+    //> Effective sticky: pipeline sticky, subnormal sticky, and the
+    //> pipeline guard when it sits below the round position.
     wire sticky_e : Bit {
         // In the normal class the pipeline guard IS the round-position
         // bit (guard_e), so only the pipeline sticky folds in here; in
@@ -616,10 +742,12 @@ pub mod EncodeRecFnBinary32 {
         it := round_sticky_low || sticky || (guard && !class_normal_pre)
     }
 
+    //> Effective guard bit.
     wire guard_e : Bit {
         it := round_guard
     }
 
+    //> Effective kept-part LSB.
     wire lsb_e : Bit {
         it := round_lsb
     }
@@ -712,6 +840,8 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
+    //> Round-up increment at the effective ulp: one bit for normals,
+    //> one subnormal ulp for subnormals, none for deep underflow.
     wire increment : Word[24] {
         it := if {
             when class_normal_pre => 1w24
@@ -720,11 +850,12 @@ pub mod EncodeRecFnBinary32 {
         }
     }
 
-    //> Significand plus rounding increment; bit 24 is the carry out.
+    //> Significand after the rounding increment, widened for the carry.
     wire rounded_sum : Word[25] {
         it := zeroed +. mux(round_up, increment, 0w24)
     }
 
+    //> Rounded significand.
     wire rounded : Word[24] {
         it := rounded_sum[24..0]
     }
@@ -736,14 +867,18 @@ pub mod EncodeRecFnBinary32 {
         it := !class_normal_pre && !class_subnormal_pre && round_up
     }
 
+    //> Rounding carry out of the significand (or the deep-underflow
+    //> round-up flag).
     wire carry : Bit {
         it := rounded_sum[25..24] == 1w1 || deep_up
     }
 
+    //> The rounding was inexact.
     wire inexact_e : Bit {
         it := guard_e || sticky_e
     }
 
+    //> The result is an exact zero.
     wire is_zero_out : Bit {
         it := !carry && rounded == 0w24
     }
@@ -775,6 +910,7 @@ pub mod EncodeRecFnBinary32 {
         it := (exp + mux(carry, 1w13, 0w13)) -. 1769w13
     }
 
+    //> Overflow: post-carry recoded exponent above the normal range.
     wire overflow : Bit {
         it := !is_zero_out && post_diff[14..13] == 0w1 && post_diff > 383w14
     }
@@ -831,27 +967,40 @@ pub mod EncodeRecFnBinary32 {
 //> This is a fully combinational first draft; the real HardFloat unit is
 //> a 4-stage pipeline, to be retrofitted at the module boundaries here.
 pub mod MulAddRecFnBinary32 {
+    //> Multiplicand.
     incoming a               : Word[33]
+
+    //> Multiplier.
     incoming b               : Word[33]
+
+    //> Addend.
     incoming c               : Word[33]
+
+    //> Rounding mode for the single rounding.
     incoming rounding_mode   : hardfloat::RoundMode
+
+    //> Tininess policy, passed through to the encoder.
     incoming detect_tininess : hardfloat::Tininess
 
+    //> The recoded binary32 result of a * b + c.
     outgoing out : Word[33] dependson a, b, c, rounding_mode {
         it := encoder.out
     }
 
+    //> IEEE exception flags from the encoder.
     outgoing exception_flags : Word[5] dependson a, b, c, rounding_mode {
         it := encoder.exception_flags
     }
 
-    // Operand decodes.
+    //> Operand decodes.
     mod decode_a of DecodeRecFnBinary32 {
         it.in := a
     }
+    //> Operand decodes.
     mod decode_b of DecodeRecFnBinary32 {
         it.in := b
     }
+    //> Operand decodes.
     mod decode_c of DecodeRecFnBinary32 {
         it.in := c
     }
@@ -859,38 +1008,44 @@ pub mod MulAddRecFnBinary32 {
     // zero addend, so its class output is deliberately unused.
     unused decode_c.is_zero
 
-    // Exact 24x24 significand product.
+    //> Exact 24x24 significand product.
     mod multiplier of MulSig24 {
         it.a_sig := decode_a.sig
         it.b_sig := decode_b.sig
     }
 
-    // Product sign and recoded exponent:
-    // value = prod * 2^(product_exp - 2048).
+    //> Product sign and recoded exponent:
+    //> value = prod * 2^(product_exp - 2048).
     wire product_sign : Bit {
         it := decode_a.sign ^^ decode_b.sign
     }
+    //> Scaled exponent of the product.
     wire product_exp  : Word[13] {
         it := decode_a.s_exp + decode_b.s_exp - 2048w13
     }
 
-    // Special operands, resolved before the datapath result is read.
+    //> Special operands, resolved before the datapath result is read.
     wire any_nan          : Bit {
         it := decode_a.is_nan || decode_b.is_nan || decode_c.is_nan
     }
+    //> Signaling-NaN operand present.
     wire any_snan         : Bit {
         it := decode_a.is_snan || decode_b.is_snan || decode_c.is_snan
     }
+    //> The product itself is infinite (either factor is).
     wire product_inf      : Bit {
         it := decode_a.is_inf || decode_b.is_inf
     }
+    //> Zero-times-infinity invalid operation.
     wire zero_times_inf   : Bit {
         it := (decode_a.is_inf && decode_b.is_zero)
         || (decode_b.is_inf && decode_a.is_zero)
     }
+    //> Adding an infinity of opposite sign to an infinite product.
     wire inf_inf_conflict : Bit {
         it := product_inf && decode_c.is_inf && (product_sign ^^ decode_c.sign)
     }
+    //> The result is a NaN.
     wire result_is_nan    : Bit {
         it := any_nan || zero_times_inf || inf_inf_conflict
     }
@@ -901,42 +1056,54 @@ pub mod MulAddRecFnBinary32 {
     wire invalid_exc     : Bit {
         it := any_snan || (!any_nan && (zero_times_inf || inf_inf_conflict))
     }
+    //> Result is an infinite product or an infinite addend.
     wire result_is_inf   : Bit {
         it := !result_is_nan && (product_inf || decode_c.is_inf)
     }
+    //> Sign of an infinite result.
     wire result_inf_sign : Bit {
         it := mux(product_inf, product_sign, decode_c.sign)
     }
+    //> Sign handed to the encoder: infinite-result sign, else the
+    //> adder's sum sign.
     wire encode_sign     : Bit {
         it := mux(result_is_inf, result_inf_sign, adder.sum_sign)
     }
 
-    // Align the smaller of product and `c` under the bigger.
+    //> Align the smaller of product and `c` under the bigger.
     wire c_sig_wide : Word[48] {
         it := zext(decode_c.sig)
     }
+    //> True when `c` carries the bigger exponent.
     wire c_is_big   : Bit {
         it := decode_c.s_exp > product_exp
     }
+    //> Bigger operand: significand.
     wire big_sig    : Word[48] {
         it := mux(c_is_big, c_sig_wide, multiplier.prod)
     }
+    //> Bigger operand: scaled exponent.
     wire big_exp    : Word[13] {
         it := mux(c_is_big, decode_c.s_exp, product_exp)
     }
+    //> Bigger operand: sign.
     wire big_sign   : Bit {
         it := mux(c_is_big, decode_c.sign, product_sign)
     }
+    //> Smaller operand: significand.
     wire small_sig  : Word[48] {
         it := mux(c_is_big, multiplier.prod, c_sig_wide)
     }
+    //> Smaller operand: scaled exponent.
     wire small_exp  : Word[13] {
         it := mux(c_is_big, product_exp, decode_c.s_exp)
     }
+    //> Smaller operand: sign.
     wire small_sign : Bit {
         it := mux(c_is_big, product_sign, decode_c.sign)
     }
 
+    //> Windowed alignment of the smaller operand under the bigger.
     mod aligner of AlignAddend {
         it.big_sig   := big_sig
         it.big_exp   := big_exp
@@ -944,6 +1111,7 @@ pub mod MulAddRecFnBinary32 {
         it.small_exp := small_exp
     }
 
+    //> Sign-magnitude addition of the two windowed operands.
     mod adder of SignMagAdd {
         it.a_magnitude := aligner.big_in_window
         it.a_sign      := big_sign
@@ -952,12 +1120,13 @@ pub mod MulAddRecFnBinary32 {
         it.sticky_in   := aligner.sticky
     }
 
-    // Window bit 32 is the significand binary point of the bigger operand,
-    // so the sum's recoded exponent is big_exp - 32.
+    //> Window bit 32 is the significand binary point of the bigger operand,
+    //> so the sum's recoded exponent is big_exp - 32.
     wire sum_exp : Word[13] {
         it := big_exp - 32w13
     }
 
+    //> Normalization of the window sum into (sig, guard, sticky).
     mod normalizer of Normalize {
         it.sum   := adder.sum_magnitude
         it.s_exp := sum_exp
@@ -976,6 +1145,7 @@ pub mod MulAddRecFnBinary32 {
         }
     }
 
+    //> Single rounding and recoded encoding of the result.
     mod encoder of EncodeRecFnBinary32 {
         it.sign            := encode_sign
         it.exp             := normalizer.exp
