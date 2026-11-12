@@ -1,0 +1,566 @@
+//! Berkeley HardFloat-style floating-point interfaces for binary32.
+//!
+//! All float operands use the recoded format, which adds one bit over
+//! the IEEE 754 encoding, so a recoded binary32 is 8 + 24 + 1 = 33 bits.
+
+//! HardFloat's rounding-mode encoding.
+//!
+//! Note that this differs from the RISC-V encoding order:
+//! nearest-even = 0, toward-zero = 1, toward-positive = 2,
+//! toward-negative = 3, max-magnitude (nearest, ties away) = 4.
+pub enum type RoundMode {
+    NearestEven    = 0w3
+    TowardZero     = 1w3
+    TowardPositive = 2w3
+    TowardNegative = 3w3
+    MaxMagnitude   = 4w3
+}
+
+//> Subnormal (tininess) detection policy.
+//>
+//> In HardFloat this is a single input bit selecting whether tininess
+//> is detected before or after rounding.
+pub enum type Tininess {
+    AfterRounding  = 0w1
+    BeforeRounding = 1w1
+}
+
+//> Request payload for `DivSqrtRecFnBinary32`.
+//>
+//> When `sqrt_op` is low, the result is `a / b`.
+//> When `sqrt_op` is high, the result is sqrt(a).
+pub struct type DivSqrtRequest {
+    sqrt_op         : Bit
+    a               : Word[33]
+    b               : Word[33]
+    rounding_mode   : RoundMode
+    detect_tininess : Tininess
+}
+
+//> Response payload for `DivSqrtRecFnBinary32`.
+//>
+//> `exception_flags` is in HardFloat's fixed bit order:
+//> [0] invalid, [1] infinite, [2] overflow, [3] underflow, [4] inexact.
+pub struct type DivSqrtResponse {
+    out             : Word[33]
+    exception_flags : Word[5]
+}
+
+//> Recoded-operand decode for divide and square root.
+//>
+//> Zero-class operands decode to sig = 0; every other class carries
+//> the uniform (recExp, sig24) pair with sig24 = 2^23 + fract.
+mod DivSqrtDecode {
+    incoming in : Word[33]
+
+    outgoing sign : Bit dependson in {
+        it := in[32]
+    }
+
+    // recExp field: in[32..23] is bits 31..23, the 9 recoded exponent
+    // bits. Fraction field: in[23..0] is bits 22..0.
+    wire rec_exp_w : Word[9] {
+        it := in[32..23]
+    }
+
+    outgoing rec_exp : Word[9] dependson in {
+        it := rec_exp_w
+    }
+
+    wire is_zero_w : Bit {
+        it := rec_exp_w[9..6] == 0w3
+    }
+
+    outgoing sig : Word[24] dependson in {
+        it := mux(is_zero_w, 0w24, word(1w1, in[23..0]))
+    }
+
+    outgoing is_zero : Bit dependson in {
+        it := is_zero_w
+    }
+
+    // Special class: recExp top two bits are 0b11 (inf or NaN).
+    wire is_special : Bit {
+        it := rec_exp_w[9..7] == 0b11w2
+    }
+
+    outgoing is_inf : Bit dependson in {
+        it := is_special && !rec_exp_w[6]
+    }
+
+    outgoing is_nan : Bit dependson in {
+        it := is_special && rec_exp_w[6]
+    }
+
+    // Mirrored from the is_nan computation: outgoing ports must not be
+    // read inside their own module.
+    wire is_nan_wire : Bit {
+        it := is_special && rec_exp_w[6]
+    }
+
+    // NaN class with the quiet bit (fract bit 22 = in bit 22) clear.
+    outgoing is_snan : Bit dependson in {
+        it := is_nan_wire && !in[22]
+    }
+}
+
+//> Iterative divider and square root for binary32.
+//>
+//> Requests arrive on the `req` pipe and results are returned on the
+//> `result` channel once the multi-cycle computation completes. The
+//> datapath is Hauser's digit recurrence (DIVSQRTRECFN.plan sections
+//> 3 and 4): one digit per cycle over scaled-remainder registers,
+//> followed by a single rounding inside EncodeRecFnBinary32 at the
+//> effective precision.
+//>
+//> Latency: 2 cycles for special cases, 28 for the recurrence path.
+//> `req.ready` is high only while idle, so a request during a
+//> computation is backpressured.
+pub mod DivSqrtRecFnBinary32 {
+    incoming clock : Clock
+
+    server socket req of Pipe[DivSqrtRequest] {
+        it.ready := cycle == 0w6
+    }
+
+    outgoing result : Valid[DivSqrtResponse] {
+        it := if {
+            when cycle == 2w6 => @Valid(${
+                out             = encoder.out,
+                exception_flags = encoder.exception_flags,
+            })
+            else => @Invalid()
+        }
+    }
+
+    //> FSM cycle counter: 0 idle, 29..3 one digit per cycle, 2 delivery.
+    wire cycle_dec : Word[6] {
+        it := cycle - 1w6
+    }
+    reg cycle      : Word[6] {
+        initial it <= 0w6
+        if {
+            when it == 0w6 {
+                if {
+                    when req_valid { it <= mux(early_result, 2w6, 29w6) }
+                }
+            }
+            when it == 2w6 {
+                it <= 0w6
+            }
+            else {
+                it <= cycle_dec
+            }
+        }
+    }
+
+    //> Live request payload (valid only in the fire cycle; the `else`
+    //> arms never matter because every use is gated on req_valid).
+    wire req_valid : Bit {
+        it := match req.data {
+            with @Valid(dontcare) => true
+            else => false
+        }
+    }
+
+    wire req_sqrt_op : Bit {
+        it := match req.data {
+            with @Valid(r) => r->sqrt_op
+            else => false
+        }
+    }
+
+    wire req_a : Word[33] {
+        it := match req.data {
+            with @Valid(r) => r->a
+            else => 0w33
+        }
+    }
+
+    wire req_b : Word[33] {
+        it := match req.data {
+            with @Valid(r) => r->b
+            else => 0w33
+        }
+    }
+
+    wire req_mode : Word[3] {
+        it := match req.data {
+            with @Valid(r) => match r->rounding_mode {
+                with #NearestEven    => 0w3
+                with #TowardZero     => 1w3
+                with #TowardPositive => 2w3
+                with #TowardNegative => 3w3
+                with #MaxMagnitude   => 4w3
+            }
+            else => 0w3
+        }
+    }
+
+    // Operand decodes of the live request.
+    mod dec_a of DivSqrtDecode {
+        it.in := req_a
+    }
+    mod dec_b of DivSqrtDecode {
+        it.in := req_b
+    }
+
+    //> Special-case classification (DIVSQRTRECFN.plan section 2).
+    wire any_nan  : Bit {
+        it := dec_a.is_nan || dec_b.is_nan
+    }
+    wire any_snan : Bit {
+        it := dec_a.is_snan || dec_b.is_snan
+    }
+    // Division conflicts (0/0, inf/inf) and the sqrt-of-negative rule;
+    // each applies to its own operation only.
+    wire invalid_cond   : Bit {
+        it := if {
+            when req_sqrt_op =>
+                !dec_a.is_nan && !dec_a.is_zero && dec_a.sign
+            else =>
+                (dec_a.is_zero && dec_b.is_zero)
+            || (dec_a.is_inf && dec_b.is_inf)
+        }
+    }
+    wire nan_result     : Bit {
+        it := any_nan || (!any_nan && invalid_cond)
+    }
+    wire invalid_result : Bit {
+        it := any_snan || (!any_nan && invalid_cond)
+    }
+    // Division 0/inf = 0 and 0/normal = 0; b = 0 with a = 0 already
+    // fell to the conflict arm above.
+    wire zero_result : Bit {
+        it := if {
+            when req_sqrt_op => !nan_result && dec_a.is_zero
+            else => !nan_result && (dec_a.is_zero || dec_b.is_inf)
+        }
+    }
+    wire inf_result  : Bit {
+        it := if {
+            when req_sqrt_op =>
+                !nan_result && !zero_result && dec_a.is_inf
+            else =>
+                !nan_result && !zero_result
+            && (dec_a.is_inf || dec_b.is_zero)
+        }
+    }
+    // divide_by_zero: finite nonzero dividend over zero. inf / 0 is a
+    // plain infinity with no flags.
+    wire dbz_result   : Bit {
+        it := !req_sqrt_op && !nan_result && !dec_a.is_inf && dec_b.is_zero
+    }
+    wire early_result : Bit {
+        it := nan_result || zero_result || inf_result
+    }
+
+    //> Latched request state.
+    reg sqrt_op_z   : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= req_sqrt_op }
+        }
+    }
+    reg sign_z      : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid {
+                it                                  <= mux(req_sqrt_op, dec_a.sign, dec_a.sign ^^ dec_b.sign)
+            }
+        }
+    }
+    reg round_z     : Word[3] {
+        initial it <= 0w3
+        if {
+            when cycle == 0w6 && req_valid { it <= req_mode }
+        }
+    }
+    reg rec_exp_a_z : Word[9] {
+        initial it <= 0w9
+        if {
+            when cycle == 0w6 && req_valid { it <= dec_a.rec_exp }
+        }
+    }
+    reg rec_exp_b_z : Word[9] {
+        initial it <= 0w9
+        if {
+            when cycle == 0w6 && req_valid { it <= dec_b.rec_exp }
+        }
+    }
+    reg is_nan_z    : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= nan_result }
+        }
+    }
+    reg is_inf_z    : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= inf_result }
+        }
+    }
+    reg invalid_z   : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= invalid_result }
+        }
+    }
+    reg dbz_z       : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= dbz_result }
+        }
+    }
+    reg zero_z      : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= zero_result }
+        }
+    }
+    wire early_z    : Bit {
+        it                                  := is_nan_z || is_inf_z || zero_z
+    }
+
+    //> Early-out delivery values (specials and exact zeros). The
+    //> encoder bypasses sig entirely for NaN/inf; a zero result is
+    //> delivered as sig = 0 at a normal-class exponent, which the
+    //> encoder renders as signed zero with no flags.
+    reg sig_d_z    : Word[24] {
+        initial it <= 0w24
+        if {
+            when cycle == 0w6 && req_valid { it <= 0w24 }
+        }
+    }
+    reg guard_d_z  : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= false }
+        }
+    }
+    reg sticky_d_z : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= false }
+        }
+    }
+    reg exp_d_z    : Word[13] {
+        initial it <= 1899w13
+        if {
+            when cycle == 0w6 && req_valid { it <= 1899w13 }
+        }
+    }
+
+    //> Recurrence entry values, computed from the live decode at fire.
+    //> Scale: rem tracks r * 2^(i+28) throughout (DIVSQRTRECFN.plan).
+    wire sig_a_w26 : Word[26] {
+        it := zext(dec_a.sig)
+    }
+    wire rem0_div  : Word[31] {
+        it := word(sig_a_w26, 0w5)
+    }
+    wire term0_div : Word[31] {
+        it := word(0w2, dec_b.sig, 0w5)
+    }
+    wire sub0_div  : Word[31] {
+        it := word(term0_div[30..0], 0w1)
+    }
+    // sqrt: argument minus the x_0 = 1 square, prescaled by 2 for the
+    // odd exponent class (root of 2*a_frac).
+    wire sig_a_dbl : Word[25] {
+        it := word(dec_a.sig, 0w1)
+    }
+    wire rem0_sqrt : Word[31] {
+        it := mux(dec_a.rec_exp[0],
+        word(0w1, sig_a_dbl - 8388608w25, 0w5),
+        word(sig_a_w26 - 8388608w26, 0w5))
+    }
+
+    //> Datapath registers.
+    reg rem_z  : Word[31] {
+        initial it <= 0w31
+        if {
+            when cycle == 0w6 && req_valid {
+                it                                  <= mux(req_sqrt_op, rem0_sqrt, rem0_div)
+            }
+            when run_cycle {
+                it                                  <= if {
+                    when sqrt_op_z => mux(c_sqrt, rem_dbl - sub_sqrt, rem_dbl)
+                    else => mux(c_div, rem_dbl - sub_z, rem_dbl)
+                }
+            }
+        }
+    }
+    reg term_z : Word[31] {
+        initial it <= 0w31
+        if {
+            when cycle == 0w6 && req_valid { it <= term0_div }
+        }
+    }
+    reg sub_z  : Word[31] {
+        initial it <= 0w31
+        if {
+            when cycle == 0w6 && req_valid { it <= sub0_div }
+        }
+    }
+    //> Partial root, x * 2^27, starting at x_0 = 1.
+    reg x28_z : Word[28] {
+        initial it <= 134217728w28
+        if {
+            when cycle == 0w6 && req_valid { it <= 134217728w28 }
+            when run_cycle && sqrt_op_z && c_sqrt {
+                it                                  <= it + w_z
+            }
+        }
+    }
+    //> Current digit weight 2^(27-i) for sqrt, shifting right.
+    reg w_z : Word[28] {
+        initial it <= 67108864w28
+        if {
+            when cycle == 0w6 && req_valid { it <= 67108864w28 }
+            when run_cycle && sqrt_op_z {
+                it                                  <= word(0w1, it[28..1])
+            }
+        }
+    }
+    //> Division digit collector: c_1 ends at bit 26, c_27 at bit 0.
+    //> Digits 1..26 shift in; digit 27 (cycle 3) folds in without a
+    //> shift, which also keeps c_1 from overflowing the top bit.
+    reg sigx_z : Word[27] {
+        initial it <= 0w27
+        if {
+            when cycle == 0w6 && req_valid { it <= 0w27 }
+            when run_cycle && !sqrt_op_z {
+                it                                  <= word(it[26..0], c_div)
+            }
+        }
+    }
+    //> Sticky: the exact remainder is nonzero. Updated only on set
+    //> digits (an unset digit leaves the remainder, hence the summary,
+    //> unchanged); a later exact hit clears it.
+    reg sticky_z : Bit {
+        initial it <= false
+        if {
+            when cycle == 0w6 && req_valid { it <= false }
+            when run_cycle && c_digit {
+                it                                  <= rem_next != 0w31
+            }
+        }
+    }
+
+    //> Recurrence stage (combinational over the registers).
+    wire run_cycle : Bit {
+        it := cycle >= 3w6 && cycle <= 29w6
+    }
+    wire c_digit   : Bit {
+        it := mux(sqrt_op_z, c_sqrt, c_div)
+    }
+    wire rem_next  : Word[31] {
+        it := if {
+            when sqrt_op_z => mux(c_sqrt, rem_dbl - sub_sqrt, rem_dbl)
+            else => mux(c_div, rem_dbl - sub_z, rem_dbl)
+        }
+    }
+    wire rem_dbl   : Word[31] {
+        // 2 * rem; rem < 2^30 always, so no bit is lost.
+        it := word(rem_z[30..0], 0w1)
+    }
+    wire x28_dbl   : Word[31] {
+        it := word(0w2, x28_z[28..0], 0w1)
+    }
+    wire term_sqrt : Word[31] {
+        // 2 * x28 + w: the trial term (2*x_i + 2^-i) on the rem scale.
+        it := x28_dbl + zext(w_z)
+    }
+    wire sub_sqrt : Word[31] {
+        it := word(term_sqrt[30..0], 0w1)
+    }
+    wire c_sqrt   : Bit {
+        it := rem_z >= term_sqrt
+    }
+    wire c_div    : Bit {
+        it := rem_z >= term_z
+    }
+
+    //> Delivery (cycle 2): normalize the digit string into
+    //> (sig24, guard, round) + sticky, and form the encoder exponent.
+    wire div_c1    : Bit {
+        it := sigx_z[26]
+    }
+    wire div_sig   : Word[24] {
+        it := mux(div_c1, sigx_z[27..3], sigx_z[26..2])
+    }
+    wire div_guard : Bit {
+        it := mux(div_c1, sigx_z[2], sigx_z[1])
+    }
+    wire div_round : Bit {
+        it := mux(div_c1, sigx_z[1], sigx_z[0])
+    }
+    // c_27 sits beyond the round bit when c_1 = 1 and folds into the
+    // sticky; when c_1 = 0 it IS the round bit and the remainder
+    // alone is the sticky.
+    wire div_sticky  : Bit {
+        it := mux(div_c1, sticky_z || sigx_z[0], sticky_z)
+    }
+    wire sqrt_sig    : Word[24] {
+        it := x28_z[28..4]
+    }
+    wire sqrt_guard  : Bit {
+        it := x28_z[3]
+    }
+    wire sqrt_round  : Bit {
+        it := x28_z[2]
+    }
+    wire sqrt_sticky : Bit {
+        it := sticky_z || any(x28_z[2..0])
+    }
+    wire sig_out     : Word[24] {
+        it := mux(sqrt_op_z, sqrt_sig, div_sig)
+    }
+    wire guard_out   : Bit {
+        it := mux(sqrt_op_z, sqrt_guard, div_guard)
+    }
+    wire round_out   : Bit {
+        it := mux(sqrt_op_z, sqrt_round, div_round)
+    }
+    wire sticky_out  : Bit {
+        it := mux(sqrt_op_z, sqrt_sticky, div_sticky)
+    }
+    //> Encoder exponent: value = sig * 2^(exp - 2048), i.e.
+    //> exp = recExp_out + 1769. Division: recExp_out = recA - recB
+    //> + 256, minus one more when c_1 = 0 (the normalization shift);
+    //> the +512 form keeps every intermediate positive. Sqrt:
+    //> recExp_out = (recA >> 1) + 128 for both parities.
+    wire div_diff : Word[11] {
+        it := zext(rec_exp_a_z) + (512w11 - zext(rec_exp_b_z))
+    }
+    wire div_exp  : Word[13] {
+        it := mux(div_c1, zext(div_diff) + 1513w13,
+        zext(div_diff) + 1512w13)
+    }
+    wire sqrt_exp : Word[13] {
+        it := zext(rec_exp_a_z[9..1]) + 1897w13
+    }
+    wire exp_out  : Word[13] {
+        it := mux(sqrt_op_z, sqrt_exp, div_exp)
+    }
+
+    //> One rounding at the effective precision (shared with the FMA).
+    //> The encoder takes (sig, guard, sticky): the round bit folds
+    //> into the sticky on both arms.
+    mod encoder of muladdrecfn::EncodeRecFnBinary32 {
+        it.sign            := sign_z
+        it.exp             := mux(early_z, exp_d_z, exp_out)
+        it.sig             := mux(early_z, sig_d_z, sig_out)
+        it.guard           := mux(early_z, guard_d_z, guard_out)
+        it.sticky          := mux(early_z, sticky_d_z,
+        sticky_out || round_out)
+        it.zero_sign       := sign_z
+        it.invalid_exc     := invalid_z
+        it.divide_by_zero  := dbz_z
+        it.is_nan          := is_nan_z
+        it.is_inf          := is_inf_z
+        it.round_mode      := cast(round_z)
+        it.detect_tininess := #AfterRounding
+    }
+}

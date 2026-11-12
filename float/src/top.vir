@@ -1,0 +1,244 @@
+//! Floating-point testbench.
+//!
+//! Loads operands from the add_mult.img image and streams an
+//! eight-byte result packet out the debug channel, low byte first,
+//! then exits. Image word 3 selects the operation; image word 2
+//! carries per-operation control bits (bit 0 = select_max / signed,
+//! bits 4..2 = rounding mode). For the FMA the rounding mode lives
+//! in image word 4 bits 4..2 (word 2 is the `c` operand there).
+//!
+//! Operations: 0 = fused multiply-add, 1 = comparison,
+//! 2 = IEEE -> recoded, 3 = recoded -> IEEE, 4 = FMIN/FMAX select,
+//! 5 = integer -> recoded, 6 = recoded -> integer, 7 = classify.
+//!
+//! FMA packet: [63..31] recoded result, [30..26] exception flags.
+//! Compare packet: bits [3..0] = unordered, gt, eq, lt.
+//! Converter packets: the converted word at the top, [63..31] for
+//! 33-bit results, [63..32] for 32-bit results.
+//! Select packet: [63..31] the selected recoded operand.
+//! Int-to-float packet: [63..31] recoded result, [30..26] flags.
+//! Float-to-int packet: [63..32] the integer, [31..29] the
+//! three int exception flags.
+//! Classify packet: [63..54] the ten one-hot class bits.
+
+import classifyrecfn
+import comparerecfn
+import fntorecfn
+import hardfloat
+import inttorecfn
+import muladdrecfn
+import recfnclass
+import recfntofn
+import recfntointfn
+import selectrecfn
+
+//> `Top` feeds the image operands to the floating-point units and
+//> streams the selected result packet out the debug channel.
+pub mod Top for virt::Virt {
+    //> The system clock.
+    incoming clock : Clock
+
+    //> Ends the program with exit code 0 once the packet has streamed.
+    outgoing exit : Valid[Word[8]] {
+        it := if {
+            when step == 9w4 => @Valid(0)
+            else => @Invalid()
+        }
+    }
+
+    //> One packet byte per cycle while streaming, low byte first.
+    outgoing debug : Valid[Word[8]] {
+        it := if {
+            when (step >= 1w4) && (step <= 8w4) => @Valid(packet[8..0])
+            else => @Invalid()
+        }
+    }
+
+    // Operands in words 0..2, operation selector in word 3, control
+    // bits in word 2 (FMA rounding mode in word 4). Unwritten image
+    // words read as pseudorandom, so drivers always write words 0..4.
+    @image("add_mult.img")
+    memory operands[8] : Word[64]
+
+    // Cycle counter: sample at 0, stream bytes at 1 through 8, exit at 9.
+    reg step : Word[4] {
+        initial it <= 0
+        if {
+            when divsqrt_mode && it == 0w4 && !result_seen {
+                it <= 0
+            }
+            else {
+                it <= it + 1w4
+            }
+        }
+    }
+
+    // The fused multiply-add, fed straight from the image. Its `c`
+    // operand occupies image word 2, so its rounding mode comes from
+    // image word 4 bits 4..2 instead.
+    mod fma of muladdrecfn::MulAddRecFnBinary32 {
+        it.a               := operands[0][33..0]
+        it.b               := operands[1][33..0]
+        it.c               := operands[2][33..0]
+        it.rounding_mode   := cast(operands[4][5..2])
+        it.detect_tininess := #AfterRounding
+    }
+
+    // The comparison unit, sharing the first two operands.
+    mod cmp of comparerecfn::CompareRecFnBinary32 {
+        it.a := operands[0][33..0]
+        it.b := operands[1][33..0]
+    }
+
+    // IEEE -> recoded, from the low 32 bits of image word 0.
+    mod converter_in of fntorecfn::FnToRecFnBinary32 {
+        it.in := operands[0][32..0]
+    }
+
+    // Recoded -> IEEE, from image word 0.
+    mod converter_out of recfntofn::RecFnToFnBinary32 {
+        it.in := operands[0][33..0]
+    }
+
+    // FMIN / FMAX select over the first two operands.
+    mod selector of selectrecfn::SelectRecFnBinary32 {
+        it.a          := operands[0][33..0]
+        it.b          := operands[1][33..0]
+        it.select_max := operands[2][1..0] == 1w1
+    }
+
+    // Integer -> recoded: the integer in image word 1, control bits
+    // in image word 2 (bit 0 signed, bits 4..2 rounding mode).
+    mod int_to_float of inttorecfn::IntToRecFnBinary32 {
+        it.signed_in       := operands[2][1..0] == 1w1
+        it.in              := operands[1][32..0]
+        it.rounding_mode   := cast(operands[2][5..2])
+        it.detect_tininess := #AfterRounding
+    }
+
+    // Recoded -> integer: control bits in image word 2.
+    mod float_to_int of recfntointfn::RecFnToIntBinary32 {
+        it.in            := operands[0][33..0]
+        it.rounding_mode := cast(operands[2][5..2])
+        it.signed_out    := operands[2][1..0] == 1w1
+    }
+
+    // FCLASS.S classification of image word 0.
+    mod classifier of classifyrecfn::ClassifyRecFnBinary32 {
+        it.in := operands[0][33..0]
+    }
+
+    // Iterative divide/sqrt: the request fires on cycle 0 (the unit
+    // is idle at reset) and the packet samples when its result turns
+    // valid, ~28 cycles later for the recurrence path.
+    mod divsqrt of hardfloat::DivSqrtRecFnBinary32 {
+        it.clock    := clock
+        it.req.data := if {
+            when divsqrt_mode && !result_seen => @Valid(${
+                sqrt_op         = sqrt_mode,
+                a               = operands[0][33..0],
+                b               = operands[1][33..0],
+                rounding_mode   = cast(operands[2][5..2]),
+                detect_tininess = #AfterRounding,
+            })
+            else => @Invalid()
+        }
+    }
+
+    unused divsqrt.req.ready
+
+    wire divsqrt_fired : Bit {
+        it := match divsqrt.result {
+            with @Valid(dontcare) => true
+            else => false
+        }
+    }
+
+    reg result_seen : Bit {
+        initial it <= false
+        if {
+            when divsqrt_mode && divsqrt_fired { it <= true }
+        }
+    }
+
+    // Operation select from image word 3.
+    wire op_select      : Word[4] {
+        it := operands[3][4..0]
+    }
+    wire compare_mode   : Bit {
+        it := op_select == 1w4
+    }
+    wire fntorec_mode   : Bit {
+        it := op_select == 2w4
+    }
+    wire recfntofn_mode : Bit {
+        it := op_select == 3w4
+    }
+    wire select_mode    : Bit {
+        it := op_select == 4w4
+    }
+    wire int_mode       : Bit {
+        it := op_select == 5w4
+    }
+    wire fint_mode      : Bit {
+        it := op_select == 6w4
+    }
+    wire class_mode     : Bit {
+        it := op_select == 7w4
+    }
+    wire div_mode       : Bit {
+        it := op_select == 8w4
+    }
+    wire sqrt_mode      : Bit {
+        it := op_select == 9w4
+    }
+    wire divsqrt_mode   : Bit {
+        it := div_mode || sqrt_mode
+    }
+
+    // The result packet, selected by the operation word.
+    reg packet : Word[64] {
+        initial it <= 0
+        if {
+            when divsqrt_mode {
+                if {
+                    when divsqrt_fired {
+                        it <= match divsqrt.result {
+                            with @Valid(r) =>
+                                word(r->out, r->exception_flags, 0w26)
+                            else => 0w64
+                        }
+                    }
+                    when result_seen && step != 0w4 {
+                        it <= word(0w8, it[64..8])
+                    }
+                }
+            }
+            when !divsqrt_mode {
+                if {
+                    when step == 0w4 {
+                        it <= if {
+                            when class_mode =>
+                                word(classifier.out, 0w54)
+                            when fint_mode =>
+                                word(float_to_int.out,
+                            float_to_int.int_exception_flags, 0w29)
+                            when int_mode =>
+                                word(int_to_float.out,
+                            int_to_float.exception_flags, 0w26)
+                            when select_mode => word(selector.out, 0w31)
+                            when recfntofn_mode => word(converter_out.out, 0w32)
+                            when fntorec_mode => word(converter_in.out, 0w31)
+                            when compare_mode =>
+                                word(0w60, cmp.unordered, cmp.gt, cmp.eq, cmp.lt)
+                            else => word(fma.out, fma.exception_flags, 0w26)
+                        }
+                    }
+                    else {
+                        it <= word(0w8, it[64..8])
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,44 @@
+//! FCLASS.S over recoded binary32.
+//!
+//! Ten-bit one-hot classification in the RISC-V F extension order,
+//! matching the reference implementation's bit order exactly.
+
+import recfnclass
+
+//> Classifies a recoded binary32 value into the ten FCLASS.S
+//> categories, one-hot.
+//>
+//> Bit order, most significant first: quiet NaN, signaling NaN,
+//> positive infinity, positive normal, positive subnormal, positive
+//> zero, negative zero, negative subnormal, negative normal, negative
+//> infinity. The quiet/signaling split reads the NaN payload's top
+//> bit (fraction bit 22), preserved by the format converters.
+pub mod ClassifyRecFnBinary32 {
+    incoming in : Word[33]
+
+    outgoing out : Word[10] dependson in {
+        it := word(is_quiet_nan,
+        is_sig_nan,
+        cls.is_inf && !in[32],
+        cls.is_normal && !in[32],
+        cls.is_subnormal && !in[32],
+        cls.is_zero && !in[32],
+        cls.is_zero && in[32],
+        cls.is_subnormal && in[32],
+        cls.is_normal && in[32],
+        cls.is_inf && in[32])
+    }
+
+    mod cls of recfnclass::RecFnClassBinary32 {
+        it.in := in
+    }
+
+    // NaN quiet/signaling split: fraction bit 22.
+    wire is_sig_nan : Bit {
+        it := cls.is_nan && !in[22]
+    }
+
+    wire is_quiet_nan : Bit {
+        it := cls.is_nan && in[22]
+    }
+}

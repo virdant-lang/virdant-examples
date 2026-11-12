@@ -1,0 +1,171 @@
+//! Integer to recoded-binary32 conversion.
+//!
+//! A 32-bit integer always lands inside binary32's normal range, so
+//! this is exact-normal-or-rounded-normal: no overflow, no underflow,
+//! and the only exception flag ever raised is inexact.
+
+import hardfloat
+
+//> Leading-zero count of an 8-bit byte, 0..8 (8 when x is zero).
+mod CountLeadingZeros8 {
+    incoming x : Word[8]
+
+    outgoing lz : Word[4] dependson x {
+        it := if {
+            when x[7] => 0w4
+            when x[6] => 1w4
+            when x[5] => 2w4
+            when x[4] => 3w4
+            when x[3] => 4w4
+            when x[2] => 5w4
+            when x[1] => 6w4
+            when x[0] => 7w4
+            else => 8w4
+        }
+    }
+}
+
+//> Leading-zero count over 32 bits, 0..32 (32 when x is zero).
+//>
+//> Four byte counters with priority selection: the highest nonzero
+//> byte fixes the high bits of the count and its own counter fixes
+//> the low three bits.
+mod CountLeadingZeros32 {
+    incoming x : Word[32]
+
+    outgoing lz : Word[6] dependson x {
+        it := if {
+            when any(x[32..24]) => zext(clz_byte3.lz)
+            when any(x[24..16]) => zext(clz_byte2.lz) + 8w6
+            when any(x[16..8])  => zext(clz_byte1.lz) + 16w6
+            when any(x[8..0])   => zext(clz_byte0.lz) + 24w6
+            else => 32w6
+        }
+    }
+
+    mod clz_byte3 of CountLeadingZeros8 {
+        it.x := x[32..24]
+    }
+    mod clz_byte2 of CountLeadingZeros8 {
+        it.x := x[24..16]
+    }
+    mod clz_byte1 of CountLeadingZeros8 {
+        it.x := x[16..8]
+    }
+    mod clz_byte0 of CountLeadingZeros8 {
+        it.x := x[8..0]
+    }
+}
+
+//> Converts a 32-bit signed or unsigned integer to recoded binary32.
+//>
+//> `signed_in` high treats `in` as two's complement; low treats it as
+//> unsigned. The result is always a normal or zero recoded value.
+pub mod IntToRecFnBinary32 {
+    incoming signed_in       : Bit
+    incoming in              : Word[32]
+    incoming rounding_mode   : hardfloat::RoundMode
+    incoming detect_tininess : hardfloat::Tininess
+
+    outgoing out : Word[33] dependson signed_in, in, rounding_mode {
+        it := mux(is_zero_magnitude, signed_zero, word(sign, rec_exp, fract))
+    }
+
+    outgoing exception_flags : Word[5] dependson signed_in, in {
+        // Only inexact (bit 4) can ever be raised: a 32-bit integer
+        // cannot overflow or underflow binary32.
+        it := word(inexact, false, false, false, false)
+    }
+
+    // Tininess cannot occur (the result is never subnormal), so the
+    // policy input selects no behavior here.
+    unused detect_tininess
+
+    // Leading-one position: k = 31 - lz, valid when nonzero.
+    mod leading_ones of CountLeadingZeros32 {
+        it.x := magnitude
+    }
+
+    wire sign : Bit {
+        it := signed_in && in[31]
+    }
+
+    // Magnitude; for the most-negative integer the wrapping negation
+    // lands on 0x80000000, which is the correct unsigned magnitude.
+    wire magnitude : Word[32] {
+        it := mux(sign, -in, in)
+    }
+
+    wire is_zero_magnitude : Bit {
+        it := magnitude == 0w32
+    }
+
+    wire signed_zero : Word[33] {
+        it := word(sign, 0w9, 0w23)
+    }
+
+    // Normalize: shift the magnitude up so the leading one sits at
+    // bit 31, then take the top 24 bits as the significand with one
+    // guard bit and a sticky below.
+    wire shifted_16 : Word[32] {
+        it := mux(leading_ones.lz[4], word(magnitude[16..0], 0w16), magnitude)
+    }
+    wire shifted_8  : Word[32] {
+        it := mux(leading_ones.lz[3], word(shifted_16[24..0], 0w8), shifted_16)
+    }
+    wire shifted_4  : Word[32] {
+        it := mux(leading_ones.lz[2], word(shifted_8[28..0], 0w4), shifted_8)
+    }
+    wire shifted_2  : Word[32] {
+        it := mux(leading_ones.lz[1], word(shifted_4[30..0], 0w2), shifted_4)
+    }
+    wire shifted_1  : Word[32] {
+        it := mux(leading_ones.lz[0], word(shifted_2[31..0], 0w1), shifted_2)
+    }
+
+    wire sig     : Word[24] {
+        it := shifted_1[32..8]
+    }
+    wire guard   : Bit {
+        it := shifted_1[7]
+    }
+    wire sticky  : Bit {
+        it := any(shifted_1[7..0])
+    }
+    wire inexact : Bit {
+        it := guard || sticky
+    }
+
+    // Round the magnitude up or leave it, per mode. Rounding toward
+    // +inf means truncating a negative magnitude (toward zero), and
+    // rounding toward -inf means growing it; sign-aware like Rounder.
+    wire round_up : Bit {
+        it := match rounding_mode {
+            with #NearestEven    => guard && (sig[0] || sticky)
+            with #TowardZero     => false
+            with #TowardPositive => !sign && inexact
+            with #TowardNegative => sign && inexact
+            with #MaxMagnitude   => guard
+        }
+    }
+
+    wire rounded : Word[25] {
+        it := sig +. mux(round_up, 1w24, 0w24)
+    }
+
+    // Carry out of the significand rolls the exponent up one; the
+    // significand becomes exactly 1.0.
+    wire carry : Bit {
+        it := rounded[24]
+    }
+    wire fract : Word[23] {
+        it := rounded[23..0]
+    }
+
+    wire leading_position : Word[9] {
+        it := zext(31w6 - leading_ones.lz)
+    }
+    wire rec_exp          : Word[9] {
+        it := mux(carry, leading_position + 257w9, leading_position + 256w9)
+    }
+}

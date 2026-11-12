@@ -1,0 +1,118 @@
+//! Quiet comparisons over recoded binary32.
+//!
+//! Backs the RISC-V F extension comparisons FLT.S, FLE.S, and FEQ.S
+//! with raw predicates computed in parallel. Purely combinational:
+//! no clock, no rounding, no exception flags.
+//!
+//! Design (COMPARERECFN.plan): NaN-class operands force `unordered`;
+//! otherwise an order key — invert the whole word for negatives, set
+//! the sign bit for non-negatives — makes unsigned 33-bit comparison
+//! equal numeric comparison; two forced corners (both operands
+//! zero-class, both inf-class with the same sign) keep
+//! decode-equivalent encodings equal per IEEE.
+
+//> Quiet comparisons over recoded binary32.
+//>
+//> Produces the raw predicates from which FLT.S (`lt`), FLE.S
+//> (`lt || eq`), and FEQ.S (`eq`) are each a one-line select at the
+//> decoder. NaN operands yield `unordered` with every ordered
+//> predicate false; comparisons are quiet, so no exception flags are
+//> ever raised.
+pub mod CompareRecFnBinary32 {
+    incoming a : Word[33]
+    incoming b : Word[33]
+
+    outgoing lt : Bit dependson a, b {
+        it := if {
+            when either_nan => false
+            when both_zero => false
+            when both_inf_same_sign => false
+            else => key_lt
+        }
+    }
+
+    outgoing eq : Bit dependson a, b {
+        it := if {
+            when either_nan => false
+            when both_zero => true
+            when both_inf_same_sign => true
+            else => key_eq
+        }
+    }
+
+    outgoing gt : Bit dependson a, b {
+        it := if {
+            when either_nan => false
+            when both_zero => false
+            when both_inf_same_sign => false
+            else => key_gt
+        }
+    }
+
+    outgoing unordered : Bit dependson a, b {
+        it := either_nan
+    }
+
+    // Either operand NaN-class: every comparison is unordered.
+    wire either_nan : Bit {
+        it := a_is_nan || b_is_nan
+    }
+
+    // Operand A: recoded exponent field and decode-equivalence class.
+    wire a_rec_exp : Word[9] {
+        it := a[32..23]
+    }
+    wire a_is_nan  : Bit {
+        it := (a_rec_exp[9..7] == 0b11w2) && a_rec_exp[6]
+    }
+    wire a_is_inf  : Bit {
+        it := (a_rec_exp[9..7] == 0b11w2) && !a_rec_exp[6]
+    }
+    wire a_is_zero : Bit {
+        it := a_rec_exp[9..6] == 0w3
+    }
+
+    // Operand B: same fields.
+    wire b_rec_exp : Word[9] {
+        it := b[32..23]
+    }
+    wire b_is_nan  : Bit {
+        it := (b_rec_exp[9..7] == 0b11w2) && b_rec_exp[6]
+    }
+    wire b_is_inf  : Bit {
+        it := (b_rec_exp[9..7] == 0b11w2) && !b_rec_exp[6]
+    }
+    wire b_is_zero : Bit {
+        it := b_rec_exp[9..6] == 0w3
+    }
+
+    // Order keys: invert the whole word for negatives, set the sign
+    // bit for non-negatives, so unsigned key order equals numeric
+    // order (the recoded exponent is monotone across the subnormal
+    // and normal classes, and sits above the fraction in the word).
+    wire a_key : Word[33] {
+        it := mux(a[32], ~a, a | word(1w1, 0w32))
+    }
+    wire b_key : Word[33] {
+        it := mux(b[32], ~b, b | word(1w1, 0w32))
+    }
+
+    wire key_lt : Bit {
+        it := a_key < b_key
+    }
+    wire key_eq : Bit {
+        it := a_key == b_key
+    }
+    wire key_gt : Bit {
+        it := a_key > b_key
+    }
+
+    // IEEE corners: -0 == +0 (and any two zero-class encodings are the
+    // same value), and infinity equals infinity of the same sign.
+    wire both_zero          : Bit {
+        it := a_is_zero && b_is_zero
+    }
+    wire both_inf_same_sign : Bit {
+        it := a_is_inf && b_is_inf && !(a[32] ^^ b[32])
+    }
+}

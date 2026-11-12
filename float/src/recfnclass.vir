@@ -1,0 +1,54 @@
+//! Decode-equivalence class tests for recoded binary32.
+//!
+//! One shared helper so the class field tests live in exactly one
+//! place. The existing verified modules keep their local copies; new
+//! modules instantiate this one (see COMPARERECFN.plan section 7).
+
+//> The decode-equivalence classes of a recoded binary32 value.
+//>
+//> Zero-class (recExp 0..63), subnormal (107..129), normal
+//> (130..383), infinity (384..447), and NaN (448..511). Exactly one
+//> class output is high for any input; encodings below recExp 107
+//> that are not zero-class are invalid and classify as subnormal,
+//> matching the reference implementation.
+pub mod RecFnClassBinary32 {
+    incoming in : Word[33]
+
+    outgoing is_zero : Bit dependson in {
+        it := is_zero_class
+    }
+
+    outgoing is_nan : Bit dependson in {
+        it := is_special && rec_exp[6]
+    }
+
+    outgoing is_inf : Bit dependson in {
+        it := is_special && !rec_exp[6]
+    }
+
+    outgoing is_subnormal : Bit dependson in {
+        it := finite_nonzero && rec_exp < 130w9
+    }
+
+    outgoing is_normal : Bit dependson in {
+        it := finite_nonzero && rec_exp >= 130w9
+    }
+
+    wire rec_exp : Word[9] {
+        it := in[32..23]
+    }
+
+    // Special class: recExp top two bits are 0b11 (infinity or NaN).
+    wire is_special : Bit {
+        it := rec_exp[9..7] == 0b11w2
+    }
+
+    wire finite_nonzero : Bit {
+        it := !is_zero_class && !is_special
+    }
+
+    // Zero class: recExp top three bits all zero.
+    wire is_zero_class : Bit {
+        it := rec_exp[9..6] == 0w3
+    }
+}

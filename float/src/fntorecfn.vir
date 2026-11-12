@@ -1,0 +1,134 @@
+//! IEEE binary32 to recoded-format conversion.
+//!
+//! Pure bit repacking plus subnormal normalization: the value is
+//! unchanged, no rounding, no flags. Inverse of RecFnToFnBinary32.
+
+//> Leading-zero count of a 23-bit field, 0..23 (23 when x is zero).
+//>
+//> Flat priority from the top bit down, in the CountLeadingZeros8
+//> style: obviously correct beats clever. Boundaries: x with bit 22
+//> set -> 0; x = 1 -> 22; x = 0 -> 23.
+mod CountLeadingZeros23 {
+    incoming x : Word[23]
+
+    outgoing lz : Word[5] dependson x {
+        it := if {
+            when x[22] => 0w5
+            when x[21] => 1w5
+            when x[20] => 2w5
+            when x[19] => 3w5
+            when x[18] => 4w5
+            when x[17] => 5w5
+            when x[16] => 6w5
+            when x[15] => 7w5
+            when x[14] => 8w5
+            when x[13] => 9w5
+            when x[12] => 10w5
+            when x[11] => 11w5
+            when x[10] => 12w5
+            when x[9]  => 13w5
+            when x[8]  => 14w5
+            when x[7]  => 15w5
+            when x[6]  => 16w5
+            when x[5]  => 17w5
+            when x[4]  => 18w5
+            when x[3]  => 19w5
+            when x[2]  => 20w5
+            when x[1]  => 21w5
+            when x[0]  => 22w5
+            else => 23w5
+        }
+    }
+}
+
+//> Converts an IEEE binary32 word to the 33-bit recoded format.
+//>
+//> IEEE input: [31] sign, [30..23] biased exponent, [22..0] fraction.
+//> Recoded output: [32] sign, [31..23] recExp, [22..0] fract.
+pub mod FnToRecFnBinary32 {
+    incoming in : Word[32]
+
+    outgoing out : Word[33] dependson in {
+        it := word(sign, rec_exp, rec_fract)
+    }
+
+    // Subnormal normalization distance (0..22 for a nonzero fraction).
+    mod normalizer of CountLeadingZeros23 {
+        it.x := fract
+    }
+
+    wire sign   : Bit {
+        it := in[31]
+    }
+    wire exp_in : Word[8] {
+        it := in[31..23]
+    }
+    wire fract  : Word[23] {
+        it := in[23..0]
+    }
+
+    wire is_zero_exp   : Bit {
+        it := exp_in == 0w8
+    }
+    wire is_max_exp    : Bit {
+        it := exp_in == 0xFFw8
+    }
+    wire is_zero_fract : Bit {
+        it := fract == 0w23
+    }
+
+    wire norm_dist      : Word[5] {
+        it := normalizer.lz
+    }
+    wire norm_dist_wide : Word[9] {
+        it := zext(norm_dist)
+    }
+
+    // Left barrel over Word[45]: stages 16, 8, 4, 2, 1 on the
+    // norm_dist bits (norm_dist <= 22, but includes values needing
+    // the 8 stage, e.g. 11 = 8 + 2 + 1).
+    wire fract_wide : Word[45] {
+        it := zext(fract)
+    }
+    wire shifted_16 : Word[45] {
+        it := mux(norm_dist[4], word(fract_wide[29..0], 0w16), fract_wide)
+    }
+    wire shifted_8  : Word[45] {
+        it := mux(norm_dist[3], word(shifted_16[37..0], 0w8), shifted_16)
+    }
+    wire shifted_4  : Word[45] {
+        it := mux(norm_dist[2], word(shifted_8[41..0], 0w4), shifted_8)
+    }
+    wire shifted_2  : Word[45] {
+        it := mux(norm_dist[1], word(shifted_4[43..0], 0w2), shifted_4)
+    }
+    wire shifted_1  : Word[45] {
+        it := mux(norm_dist[0], word(shifted_2[44..0], 0w1), shifted_2)
+    }
+
+    // The 22 bits below the dropped leading one, shifted up by one;
+    // bit 0 is zero. Worked example: fract = 1 -> norm_dist 22 ->
+    // rec_exp 107, rec_fract 0 (the smallest subnormal, 2^-149).
+    wire subnormal_fract : Word[23] {
+        it := word(shifted_1[22..0], 0w1)
+    }
+
+    // Worked example: 1.0 (exp_in 127) -> rec_exp 256.
+    wire rec_exp : Word[9] {
+        it := if {
+            when is_zero_exp && is_zero_fract => 0w9
+            when is_zero_exp => 129w9 - norm_dist_wide
+            when is_max_exp && is_zero_fract => 0b110000000w9
+            when is_max_exp => 0b111000000w9
+            else => zext(exp_in) + 129w9
+        }
+    }
+
+    wire rec_fract : Word[23] {
+        it := if {
+            when is_zero_exp => mux(is_zero_fract, 0w23, subnormal_fract)
+            when is_max_exp => mux(is_zero_fract, 0w23, fract)
+            else => fract
+        }
+    }
+}

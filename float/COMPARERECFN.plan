@@ -1,0 +1,283 @@
+COMPARERECFN.plan
+=================
+
+Implementation plan for `CompareRecFnBinary32` — the comparison
+module backing the RISC-V F extension instructions FLT.S, FLE.S,
+and FEQ.S — in `~/projects/virdant/float/`.
+
+Status: plan only. No RTL written yet.
+
+------------------------------------------------------------------------
+0. Goal, artifacts, and scope
+------------------------------------------------------------------------
+
+New file    : src/comparerecfn.vir  (package `comparerecfn`)
+New module  : pub mod CompareRecFnBinary32
+             (the only pub item; any helper mods stay non-pub in the
+             same file, per the established project convention)
+Modified    : src/top.vir  (testbench gains a compare mode)
+Modified    : add_mult    (writes an operation selector word)
+New driver  : ./compare    (recodes two operands, prints the
+             predicates, self-checks against a Python reference)
+Docs        : ALGORITHM.md section 5 gains the module-mapping row
+
+Scope is the comparison ONLY. FMIN.S/FMAX.S become a small mux module
+ON TOP of this one later (see section 7); FCLASS.S stays out of scope.
+
+The module imports nothing: its inputs are bare `Word[33]` values and
+its outputs are predicates. No rounding mode, no tininess, no clock —
+this is pure combinational logic.
+
+------------------------------------------------------------------------
+1. Ground truth: decode-equivalence classes of the recoded format
+------------------------------------------------------------------------
+
+Reused from MULADDRECFN.plan section 1, with one correction that
+matters here: comparison must treat each DECODE-EQUIVALENCE CLASS as
+one value, not just the canonical encodings our FMA emits.
+
+Layout of `Word[33]`: [32] sign, [31..23] recExp (9 bits), [22..0]
+fract. Field tests (identical to DecodeRecFnBinary32):
+
+    rec_exp[9..7] == 0b11   -> special (inf or NaN)
+    special &&  rec_exp[6]  -> NaN
+    special && !rec_exp[6]  -> infinity
+    rec_exp[9..6] == 0      -> zero
+
+Decode-equivalence classes (what a value DECODES to, not what it
+encodes as):
+
+    zero-class   recExp   0..63    (all decode to signed zero;
+                                    low bits ignored)
+    subnormal    recExp 107..129
+    normal       recExp 130..383
+    inf-class    recExp 384..447   (all decode to signed infinity)
+    NaN-class    recExp 448..511   (all decode to NaN)
+
+Our own modules emit only canonical encodings (zero = 33'h0,
+inf recExp = 384, NaN recExp = 448), but a compare in the wild can
+receive anything decodable. The design below is robust to the full
+classes, not just canonical words.
+
+Uniform value formula (verified in MULADDRECFN.plan):
+    value = sig24 * 2^(recExp - 279),  sig24 = 2^23 + fract
+valid for subnormals and normals alike; recExp is therefore monotone
+in value within each sign — this is what makes lexicographic
+comparison work.
+
+------------------------------------------------------------------------
+2. Design: the order key, with two forced corners
+------------------------------------------------------------------------
+
+Step 1 — NaN first. If either operand is NaN-class:
+
+    lt = 0, eq = 0, gt = 0, unordered = 1
+
+RISC-V F compares are QUIET: FEQ.S/FLT.S/FLE.S never raise invalid
+on qNaN, they simply return false (FEQ returns 0, FLT/FLE return 0).
+Our FPU does not model sNaN (documented simplification), so no flags
+are produced at all.
+
+Step 2 — the order key. For non-NaN operands, map each to a key whose
+UNSIGNED 33-bit order equals the numeric order:
+
+    key(x) = x[32] ? ~x : x | word(1w1, 0w32)
+
+Setting the sign bit for non-negatives and inverting everything for
+negatives makes `key_a < key_b` unsigned equal `a < b` numeric. The
+recoded exponent is already monotone across subnormal and normal
+(and sits above fract in the word, so exponent class dominates and
+fract breaks ties). One mux layer plus one XOR layer; no adder, no
+barrel shifter.
+
+Step 3 — forced corner: both operands zero-class. The key alone
+orders -0 < +0 (and orders two zero-encodings with different garbage
+low bits), but IEEE says -0 == +0 (and all zero-class encodings are
+the same value). Force:
+
+    both zero-class -> eq = 1, lt = gt = 0
+
+Step 4 — forced corner: both operands inf-class with the same sign.
+Same concern (non-canonical low bits would order -inf vs -inf); IEEE
+says inf == inf. Force:
+
+    both inf, same sign -> eq = 1, lt = gt = 0
+
+Everything else (mixed class, mixed sign, inf vs finite, zero vs
+finite, subnormal vs normal, boundary pairs) is correct by the
+monotonicity argument; no further special cases. Sanity examples:
+zero-class vs subnormal: recExp 0..63 < 107, exponent bits sit above
+fract so garbage fract bits cannot reorder across the boundary.
+-inf vs -1e30: negative keys invert, so the larger inf-class word
+becomes the smaller key. Min-normal (130) vs max-subnormal (129):
+adjacent classes compare by recExp directly.
+
+Predicates (all computed in parallel, no mode input):
+
+    FLT.S -> lt
+    FLE.S -> lt || eq
+    FEQ.S -> eq
+    unordered (for the core's branch logic / min-max later)
+
+------------------------------------------------------------------------
+3. Module structure of src/comparerecfn.vir
+------------------------------------------------------------------------
+
+One module, no helper mods needed (the class tests are three wire
+definitions per operand; extracting a `RecFnClass` helper saves
+nothing at this size). Draft interface:
+
+    //> Quiet comparisons over recoded binary32: raw predicates for
+    //> FLT.S, FLE.S, and FEQ.S.
+    pub mod CompareRecFnBinary32 {
+        incoming a : Word[33]
+        incoming b : Word[33]
+
+        outgoing lt        : Bit dependson a, b
+        outgoing eq        : Bit dependson a, b
+        outgoing gt        : Bit dependson a, b
+        outgoing unordered : Bit dependson a, b
+    }
+
+Internal wires (roughly, in order):
+
+    a_rec_exp : Word[9]   = a[32..23]        (slice)
+    b_rec_exp : Word[9]   = b[32..23]
+    a_is_nan / b_is_nan : Bit               (special && bit6)
+    a_is_inf / b_is_inf : Bit               (special && !bit6)
+    a_is_zero / b_is_zero : Bit              (top 3 bits == 0)
+    a_key : Word[33]                          (mux(a[32], ~a, a | word(1w1, 0w32)))
+    b_key : Word[33]
+    key_lt / key_eq / key_gt : Bit             (<, ==, > on Word[33])
+    both_zero : Bit
+    both_inf_same_sign : Bit
+
+Outputs as if-expressions (arm order matters, NaN first):
+
+    lt := if {
+        when unordered => false
+        when both_zero => false
+        when both_inf_same_sign => false
+        else => key_lt
+    }   (eq, gt, unordered analogous)
+
+Language constraints as in MULADDRECFN.plan section 0: no `*`,
+no `<<`/`>>` (not needed here anyway), no loops, no functions, no
+generics; slices exclusive-on-top; `dependson` on every outgoing;
+`unused` not expected to be needed (every input is read).
+
+Naming/style: CamelCase module, snake_case wires, `//>` docstrings,
+4-space indent, `//!` package docstring at line 1, vir check clean
+(errors AND warnings) after every step.
+
+------------------------------------------------------------------------
+4. Testbench and driver changes
+------------------------------------------------------------------------
+
+The existing `src/top.vir` streams one 64-bit packet out the debug
+channel. Extend it to dual-mode rather than adding a second program
+top:
+
+    - instantiate `comparerecfn::CompareRecFnBinary32` alongside the FMA
+    - image word 3 becomes the operation selector: 0 = FMA, 1 = compare
+    - FMA packet: word(fma.out, fma.exception_flags, 0w26)   (unchanged)
+    - compare packet: word(0w60, cmp.unordered, cmp.gt, cmp.eq, cmp.lt)
+      (four predicate bits in the low nibble; same 8-byte stream)
+    - mux the packet source on the selector before the packet reg
+
+CRITICAL: `add_mult` currently writes only 3 image words; the rest of
+an image-initialized memory reads as PSEUDORANDOM, so a new selector
+slot would default to garbage and break FMA runs. Therefore
+`add_mult` must be updated to explicitly write word 3 = 0 in the
+same patch, BEFORE any compare-mode testing.
+
+New driver `./compare a b`: recodes two binary32 operands (reusing
+the recode/decode helpers from add_mult — factor them into a shared
+`fputils.py` at that point), runs the testbench in compare mode,
+prints lt/eq/gt/unordered, and SELF-CHECKS: it independently decodes
+both operands in Python and asserts the hardware predicates match
+Python's own comparison (with -0 == +0 and NaN unordered). Every run
+is a test.
+
+------------------------------------------------------------------------
+5. Build order (vir check clean after every step)
+------------------------------------------------------------------------
+
+ 1. src/comparerecfn.vir: module + internal wires + outputs.
+    vir check.
+ 2. top.vir: compare instance + selector + packet mux; add_mult
+    writes the selector word (0). vir check + re-run ./add_mult 2 3 1
+    expecting 7.0 exactly (regression).
+ 3. ./compare: driver with recode/decode factored into fputils.py.
+ 4. Verification per section 6; fix until green.
+ 5. ALGORITHM.md: module-mapping table row + pointer here.
+
+No subagents required: single module, ~60 lines, well-specified
+above. Hand-writing is faster than the fan-out overhead.
+
+------------------------------------------------------------------------
+6. Verification vectors
+------------------------------------------------------------------------
+
+Each vector: (a, b) -> (lt, eq, gt, unordered). Run through
+./compare with its built-in Python self-check.
+
+Class coverage:
+    (1.0, 2.0)        -> lt          basic positive
+    (2.0, 1.0)        -> gt          basic positive, reversed
+    (1.5, 1.5)        -> eq          identical words
+    (-1.0, 1.0)       -> lt          mixed sign
+    (-5.0, -1.0)      -> lt          both negative (key inversion)
+    (0.0, -0.0)       -> eq          THE zero corner (lt = gt = 0)
+    (-0.0, -0.0)      -> eq          same-sign zeros
+    (-0.0, -1.0)      -> gt          -0 > -1
+    (0.0, 1e-45)      -> lt          zero vs smallest subnormal (2^-149)
+    (1.17549421e-38, 1.17549415e-38) -> gt
+                                     min-normal vs max-subnormal boundary
+    (-1e-45, 0.0)     -> lt          negative subnormal vs zero
+    (1e30, inf)       -> lt          finite vs inf (positive side)
+    (-inf, -1e30)     -> lt          finite vs inf (negative side)
+    (inf, inf)        -> eq          both-inf same sign (forced corner)
+    (-inf, -inf)      -> eq          both-inf same sign, negative
+    (inf, -inf)       -> gt          inf ordering across signs
+    (nan, 1.0)        -> unordered   (all predicates 0)
+    (1.0, nan)        -> unordered   (NaN on either side)
+    (nan, nan)        -> unordered
+    (nan, inf)        -> unordered   NaN dominates inf
+
+Extras worth one run each:
+    (-0.0, 0.0) written through BOTH canonical and non-canonical
+    zero-class encodings (e.g. recExp = 0 with garbage fract) to
+    prove the both_zero corner, not just canonical words.
+    Same for inf-class with recExp != 384 (e.g. 400) proving
+    both_inf_same_sign.
+
+Acceptance: vir check clean (0 warnings); every vector's hardware
+predicates equal the Python reference; the add_mult regression (2 3 1
+-> 7.0) still passes.
+
+------------------------------------------------------------------------
+7. Decisions, deferrals, open questions
+------------------------------------------------------------------------
+
+- Decided: robustness to full decode-equivalence classes (forced
+  zero and inf corners), not just canonical encodings.
+- Decided: quiet semantics only; no exception flags in this module.
+  If signaling comparisons are ever needed, they are the same module
+  plus an sNaN detector — deferred until sNaN modeling exists at all.
+- Decided: dual-mode testbench over a second top; keeps one streaming
+  path and one exit protocol.
+- Deferred: FMIN.S/FMAX.S module (SelectRecFnBinary32): mux a/b on
+  lt/gt with spec rules (NaN -> qNaN result, min(+0,-0) = -0). It
+  consumes this module's outputs; do not design it until compare is
+  verified.
+- Deferred: FCLASS.S (10-class encoder) — rare; separate small plan.
+- Open: whether `vir poke --top comparerecfn::CompareRecFnBinary32`
+  works for a clockless module (would give an interactive path and
+  let the testbench stay FMA-only). Not blocking; testbench approach
+  chosen for uniformity with the add_mult flow.
+- Open: once verified, consider promoting the class-test wires into
+  a tiny shared helper so DecodeRecFnBinary32, CompareRecFnBinary32,
+  and the future FnToRecFnBinary32 stop duplicating three slices
+  each. Cross-package sharing would require making it pub somewhere;
+  not worth it at current duplication levels.

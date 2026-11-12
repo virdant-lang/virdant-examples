@@ -1,0 +1,321 @@
+MULADDRECFN.plan
+================
+
+Implementation plan for `MulAddRecFnBinary32` in
+`~/projects/virdant/float/src/muladdrecfn.vir`.
+
+Status: plan only. No RTL written yet.
+Ground truth: the recoded-format encoding below was extracted from the
+actual berkeley-hardfloat sources (`recFNFromFN.scala`,
+`fNFromRecFN.scala`, `rawFloatFromFN.scala`, `rawFloatFromRecFN.scala`)
+and hand-verified on worked examples. It supersedes the sketchier
+format description in earlier conversation.
+
+------------------------------------------------------------------------
+0. Language constraints discovered (these shape everything below)
+------------------------------------------------------------------------
+
+Empirically established for this Virdant (v0.4.0-era toolchain):
+
+- No generic module parameters (the `[n : Nat]` mod syntax fails).
+  All widths are hard-coded for binary32.
+- No `*` operator on `Word[n]`. The 24x24 multiply must be built
+  from `+.`/slices.
+- No `<<`/`>>`. Constant shifts = `word()` + slices.
+  Dynamic shifts = barrel shifter, one `mux` per shift-amount bit
+  (the idiom in skills/idioms.md "Barrel shifter").
+- No loops, no user-defined functions. Repetitive structure is
+  written out explicitly; reusable logic becomes submodules.
+- Files are packages: `muladdrecfn.vir` is package `muladdrecfn`.
+  The `pub mod MulAddRecFnBinary32` must MOVE from `hardfloat.vir`
+  into `muladdrecfn.vir` (non-pub helpers must live in the same
+  file per the requirement, and same-package only).
+
+Conventions: CamelCase module/type names (`RecFn`, not `RecFN`),
+snake_case ports, aligned colons, `//>` doc comments, 4-space indent,
+`vir check` clean (no errors, no warnings) after every step.
+
+------------------------------------------------------------------------
+1. Recoded binary32 format (verified ground truth)
+------------------------------------------------------------------------
+
+Layout of `Word[33]`:
+
+    [32]      sign
+    [31..23]  recExp : Word[9]   (recoded exponent, expWidth+1 = 9 bits)
+    [22..0]   fract  : Word[23]  (fraction)
+
+Recoded exponent classes (top 3 bits of recExp, recExp[8:6]):
+
+    000        zero (canonical: whole word = 33'h0)
+    001..010   subnormal  (recExp in 107..129, i.e. sExp < 130)
+    010..101   normal     (recExp = biasedExp + 129, range 130..383)
+    110        +inf/-inf  (recExp = 9'h1C0 = 110_000000, fract = 0)
+    111        NaN        (recExp = 9'h1E0 = 111_000000, fract = payload)
+
+Decode rules (from rawFloatFromRecFN):
+
+    isZero    = recExp[8:6] == 0
+    isSpecial = recExp[8:7] == 3
+    isNaN     = isSpecial &&  recExp[6]
+    isInf     = isSpecial && !recExp[6]
+    sExp      = zero-extended recExp (9-bit unsigned)
+    sig24     = { 1'b1, fract }   (explicit leading 1, for nonzero)
+
+UNIFORM VALUE FORMULA (verified on normals and subnormals):
+
+    value = sig24 * 2^(sExp - 279)
+
+    - normal:   sExp = biasedExp + 129, sig24 = 2^23 + fract
+    - subnormal: sExp = 129 - normDist (normDist = clz of IEEE fract),
+      sig24 = 2^23 + storedFract, where the stored fraction is the
+      normalized fraction BELOW its leading 1, shifted up one:
+      storedFract = ((ieeeFract << normDist) & 0x3F_FFFF) << 1
+      (the dropped leading 1 reappears as the explicit bit in sig24)
+
+Encode rules (from rawFloatFromFN + recFNFromFN):
+
+    - normal:    recExp = ieeeExp + 129,        fract = ieeeFract
+    - subnormal: normDist = clz(ieeeFract); recExp = 129 - normDist;
+                 fract = ((ieeeFract << normDist) & 0x3F_FFFF) << 1
+    - zero:      canonical 33'h0
+                 (real HardFloat emits 000_101010 with fract=0; the
+                 low bits are decode-ignored, we canonicalize to 0)
+    - infinity:  recExp = 110_000000, fract = 0
+    - NaN:       recExp = 111_000000, fract = payload (quiet bit in
+                 fract[22], matching IEEE convention)
+
+Boundary check: smallest normal sExp = 130 (biasedExp 1);
+largest subnormal sExp = 129. Monotone: 000 < 001.. < 010.. < ... <
+101 < 110 < 111, so same-sign comparison is lexicographic on the raw
+word, as promised.
+
+------------------------------------------------------------------------
+2. Module structure of src/muladdrecfn.vir (package muladdrecfn)
+------------------------------------------------------------------------
+
+    pub mod MulAddRecFnBinary32        -- top: instantiates the pipeline
+    mod DecodeRecFnBinary32            -- recFN -> sign/sExp/sig24/class
+    mod MulSig24                       -- 24x24 -> 48-bit exact product
+    mod AlignAddend                    -- barrel-shift c under product,
+                                          emits aligned sig + sticky
+    mod SignMagAdd                     -- sign-magnitude add/sub
+    mod CountLeadingZeros48            -- priority encoder (no builtin)
+    mod Normalize                      -- one LZ-count + one shift
+    mod Rounder                        -- RoundMode -> rounded + inexact
+    mod EncodeRecFnBinary32            -- recode + overflow/underflow/flags
+
+All helpers non-pub (same-package use only, per requirement).
+
+2a. DecodeRecFnBinary32
+-----------------------
+    incoming in : Word[33]
+    outgoing sign : Bit
+    outgoing s_exp : Word[9]
+    outgoing sig : Word[24]            // {1'b1, fract} or 0 for zero
+    outgoing is_zero / is_inf / is_nan : Bit
+
+Pure slicing + comparisons on recExp[8:6]. No dependson surprises:
+all outputs dependson in.
+
+2b. MulSig24 (the 24x24 multiplier)
+-----------------------------------
+No `*` operator, so: bit-serial shift-add over the 24 bits of a.
+
+    prod := fold over i = 23..0 of:
+        acc = acc +. mux(a_sig[i], b_sig shifted left by i, 0)
+
+Each shift-by-constant-i is `word(b_sig, 0w_i)` sliced to 48 bits.
+24 explicit stages; each stage is one `+.` (Word[48] result + carry,
+accumulate into Word[49] then confirm bit 48 unused... actually
+24-bit x 24-bit fits exactly in 48 bits: max = (2^24-1)^2 <
+2^48, so Word[48] accumulation with `+.` carry folded in).
+
+This is the big combinational stack (24 adders). Acceptable for a
+first correct implementation; note for later: radix-4 Booth +
+Wallace tree, or splitting across pipeline stages.
+
+2c. AlignAddend
+---------------
+Inputs: c_sig (24b), c_exp (9b), prod_sig (48b), prod_exp (9b).
+Outputs: aligned (window width), sticky, plus which-side info.
+
+Key simplification (documented in ALGORITHM.md): only the top ~24
+bits of the shifted addend plus a sticky bit matter. Clamp the
+shift: amounts >= 56 contribute sticky=1 and aligned=0.
+
+    diff = prod_exp - c_exp          (9-bit signed compare)
+    if diff in [0, 56):  barrel-shift c_sig right by diff
+                         (6 mux stages: 1,2,4,8,16,32), sticky = OR
+                         of bits shifted past the window
+    if diff >= 56:       aligned = 0, sticky = any(c_sig)
+    if diff < 0:         swap case: the ADDEND is the bigger operand.
+                         Shift the 48-bit product right by -diff
+                         (clamped at 56), base window on c_exp.
+
+Window choice: 48 (product) + 32 (guard zone) = 80 bits total;
+the aligned addend lands in the low 56. Exact bit budget to be
+pinned when writing RTL; the invariant is:
+window holds both operands aligned to the same binary point, and
+sticky captures everything shifted out.
+
+2d. SignMagAdd
+--------------
+Inputs: two magnitudes (window width) + signs + sticky.
+Output: sum magnitude (window+1 bits incl. carry), sign, sticky-out.
+
+    same signs:  sum = A +. B,        sign = A_sign
+    diff signs:  sum = A -. B or B -. A (borrow tracks which is
+                 larger), sign = sign of the larger magnitude;
+                 sticky folds into the borrow chain LSB.
+
+2e. CountLeadingZeros48
+-----------------------
+No builtin, no loops, no functions. Implement as a priority
+encoder via nested `when`/`else` over ranges (compare against
+power-of-2 thresholds), i.e. a 48 -> 6 bit encoder. Written as
+one mod, ~12 nested arms using mid-point comparisons
+(`x[47..24] == 0` style range tests). Mechanically verifiable
+against a few known vectors.
+
+2f. Normalize
+-------------
+Inputs: sum (window+1 bits), s_exp_of_sum, sticky.
+Output: normalized sig (25 bits: 24 + 1 guard), adjusted exp.
+
+    lz = CountLeadingZeros48(sum)
+    shift left by lz (constant-shift barrel, 6 mux stages),
+    decrement exp by lz (wide enough: 10-bit signed)
+    carry-out case (sum bit above window): exp + 1, shift right 1.
+
+Note: after effective ADDITION the result has at most 1 bit of
+carry or ~1 leading zero; after effective SUBTRACTION with
+cancellation the LZ count can be up to ~48. The recoded format
+guarantees this is ONE normalize step, not a loop.
+
+2g. Rounder
+-----------
+Inputs: sig (25 bits = 24 + guard), sticky, round_mode, sign.
+Outputs: rounded sig (24 bits), carry-out bit, inexact.
+
+match round_mode:
+    #NearestEven    -> round up iff guard && (lsb || sticky)
+    #TowardZero     -> never round up
+    #TowardPositive -> round up iff !sign && (guard || sticky)
+    #TowardNegative -> round up iff  sign && (guard || sticky)
+    #MaxMagnitude   -> round up iff (guard || sticky)
+
+Round-up carry propagates: sig+1 may carry into the exponent.
+
+2h. EncodeRecFnBinary32
+-----------------------
+Inputs: sign, exp (10-bit signed, post-normalize/round), sig24,
+inexact, is_nan_in / is_inf_in (propagated specials).
+Outputs: Word[33] out, exception_flags Word[5].
+
+    NaN in            -> out = 111_000000 + payload, invalid flag
+    0 * inf, 0/0 style invalids handled at top level
+    exp >= 256 (recoded scale)   -> overflow: ±inf (nearest) or
+                       ±max_finite (toward-zero), flags overflow+inexact
+    exp < 107-ish subnormal boundary -> renormalize right, flags
+                       underflow iff tininess && inexact
+    else -> recExp = exp - 129... (inverse of decode), fract = sig[22..0]
+
+Flag bit order: [0] invalid, [1] divide_by_zero, [2] overflow,
+[3] underflow, [4] inexact.
+
+2i. Top level: pub mod MulAddRecFnBinary32
+------------------------------------------
+    - Decode a, b, c (three Decode instances)
+    - Special-case pre-pass (combinational):
+        any NaN in           -> NaN out, invalid
+        0 * inf or inf * 0   -> NaN out, invalid
+        a or b zero          -> pass c through (re-rounded? no:
+                                c is already recoded; result = c,
+                                but sign/exponent path still runs
+                                flags correctly)
+        result zero          -> canonical 33'h0
+    - MulSig24 on a_sig, b_sig; prod_exp = a_exp + b_exp - 129
+      (recoded exponents are already offset; subtract one bias)
+    - AlignAddend, SignMagAdd, Normalize, Rounder, Encode
+    - Wire through rounding_mode; detect_tininess feeds Encode.
+
+------------------------------------------------------------------------
+3. Simplifications (documented, deliberate)
+------------------------------------------------------------------------
+
+- Single-cycle combinational. The real HardFloat MulAddRecFN is a
+  4-stage pipeline. Ours must be functionally correct first;
+  pipelining (regs between Decode/Mul/Align/Add/Norm/Round) is
+  future work and easy to retrofit since the stage boundaries
+  already exist as module boundaries.
+- Alignment shift clamped at 56 with sticky folding (standard trick,
+  documented in ALGORITHM.md section 1, fact 2).
+- NaN payload canonicalized (quiet NaN), not bitwise-propagated.
+- Zero canonicalized to 33'h0 (decode-compatible with real
+  HardFloat's 000_101010 quirk, noted in section 1).
+- Signaling-NaN distinction is NOT modeled (HardFloat's Chisel
+  core also treats all NaNs as quiet at this level).
+
+------------------------------------------------------------------------
+4. Build order (vir check clean after EVERY step)
+------------------------------------------------------------------------
+
+ 1. Create src/muladdrecfn.vir with package docstring; move
+    MulAddRecFnBinary32 stub (ports + unused + stub drivers) from
+    hardfloat.vir; delete the stub there; add `import muladdrecfn`
+    to hardfloat.vir only if something references it (nothing does
+    yet). vir check.
+ 2. DecodeRecFnBinary32 (pure slicing). vir check.
+ 3. CountLeadingZeros48. vir check + hand vectors.
+ 4. MulSig24 (24 explicit stages). vir check.
+ 5. AlignAddend (6-stage barrel + clamp + sticky + swap). vir check.
+ 6. SignMagAdd. vir check.
+ 7. Normalize. vir check.
+ 8. Rounder (match on RoundMode). vir check.
+ 9. EncodeRecFnBinary32 (recode + flags + tininess). vir check.
+10. Top-level wiring + special-case pre-pass. vir check.
+11. Functional verification (section 5).
+12. Update ALGORITHM.md module-mapping table if module names drift.
+
+------------------------------------------------------------------------
+5. Verification plan
+------------------------------------------------------------------------
+
+`vir run` / `vir poke` against top.vir (temporary debug top that
+drives MulAddRecFnBinary32). Test vectors, each with expected
+out + exception_flags:
+
+    1. 1.0 * 1.0 + 0.0        -> 1.0, no flags
+    2. 1.0 * 2.0 + 3.0        -> 5.0
+    3. 0.1 + 0.2              -> correctly-rounded single round
+    4. cancellation: (1 + 2^-20) - 1 via FMA(1, 2^-20-ish, -1)
+       -> tiny subnormal-ish result, inexact set, exercises LZ path
+    5. overflow: max_finite * 2 + 0 -> inf, overflow + inexact
+    6. underflow: min_normal * 0.5 + 0 -> subnormal, inexact,
+       underflow iff tininess policy says so (both settings)
+    7. all five rounding modes on a exact-tie case (guard=1,
+       sticky=0): NearestEven vs MaxMagnitude must differ
+    8. 0 * inf -> NaN, invalid
+    9. NaN propagation -> NaN, invalid
+   10. -0.0 results: (-1) * 0 + (-0) sign handling
+   11. subnormal operands in and out (storedFract << 1 path)
+   12. exact product check: (2^24-1)^2 must appear unrounded in
+       the datapath (poke intermediate... only feasible via a
+       debug output or by observing final result of a crafted case)
+
+Acceptance: vir check clean; vectors 1-12 produce expected values;
+no warnings (all unused inputs consumed or explicitly `unused`).
+
+------------------------------------------------------------------------
+6. Open questions
+------------------------------------------------------------------------
+
+- Window width for AlignAddend (80 proposed): must verify the
+  sticky-vs-guard boundary survives the worst-case cancellation
+  (effective subtraction, exp diff 0, 24-bit cancel) — derive
+  formally before RTL, not after.
+- Whether Virdant `match` on a 9-bit Word for the LZ encoder
+  compiles to reasonable logic or needs the compare-tree form.
+- Pipeline registers: which platform (virt vs ice40) and whether
+  `initial` is allowed, once we go multi-cycle.

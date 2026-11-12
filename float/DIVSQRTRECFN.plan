@@ -1,0 +1,513 @@
+DIVSQRTRECFN.plan
+=================
+
+Implementation plan for `DivSqrtRecFnBinary32` in
+`~/projects/virdant/float/src/hardfloat.vir`.
+
+Status: plan only. No RTL written yet (the module is a stub).
+Ground truth: the recurrences in sections 3 and 4 were derived from
+`DivSqrtRecFN_small.scala` (read in full) and hand-verified on worked
+examples AND 6000 randomized cases against `Fraction`-exact arithmetic
+(3000 division + 3000 sqrt, 0 mismatches; model at /tmp/divsqrt_*.py,
+to be promoted per section 8). The special-case tables in section 2
+were extracted from the Scala and cross-checked against the IEEE
+semantics probed during the FMA work (HANDOFF "IEEE corner
+semantics"). The encoder interface in section 5 is the existing,
+fuzz-verified `EncodeRecFnBinary32`.
+
+------------------------------------------------------------------------
+0. What is new for this module (multi-cycle hardware)
+------------------------------------------------------------------------
+
+Every existing module is combinational. `DivSqrtRecFnBinary32` is the
+project's first sequential module: digit-recurrence divide/sqrt takes
+~29 cycles. Virdant supports this directly:
+
+- `reg x : Word[n] { it <= expr }` -- clocked register, implicitly
+  clocked by the single in-scope `Clock` (must have exactly one;
+  diagnostics: "Missing on clause for reg X").
+- Driver blocks push conditional `it <=` assignments; `reg` reads as
+  `it` inside its own driver block.
+- Handshake: builtin `Valid[T]` (`@Valid(x)` / `@Invalid()`) and the
+  builtin generic socket `Pipe[T]` (producer drives `data` as
+  Valid[T]; consumer drives `ready`). The "fires" idiom: a transfer
+  fires when the payload is @Valid AND the peer is ready (idioms.md
+  "Handshake"). Backpressure: drive `ready` only when idle.
+- No loops/functions: the per-cycle recurrence is ONE combinational
+  stage (muxes + constant shifts only: `rem << 1` is `word()` + slice)
+  re-evaluated every cycle against the `reg` state. Nothing unrolls.
+- All widths hard-coded for binary32 (no generics -- section 0 of
+  MULADDRECFN.plan still applies).
+
+Conventions: CamelCase modules, snake_case ports, `//>` doc comments,
+4-space indent, `vir check` clean after every step, `vir format` after
+structural edits, non-pub helpers stay in their own package's file.
+
+------------------------------------------------------------------------
+1. Recoded binary32 format recap
+------------------------------------------------------------------------
+
+As established (MULADDRECFN.plan section 1 -- the reference):
+
+    Word[33] = [sign][recExp Word[9]][fract Word[23]]
+    value    = sig24 * 2^(recExp - 279),  sig24 = 2^23 + fract
+    classes: 0..63 zero | 107..129 subnormal | 130..383 normal
+             384..447 inf | 448..511 NaN
+
+Zero/inf/NaN operands decode by CLASS (any low bits). Subnormal and
+normal decode identically (uniform formula) -- this is what makes the
+div/sqrt datapath simple: one normalized significand + one signed
+exponent for every nonzero finite input.
+
+Scala cross-reference (rawFloatFromRecFN): the Scala's RawFloat has
+`sExp = recExp` (zero-extended) and `sig = {0, 1, fract}` (25 bits).
+The Scala's mod-256 exponent tricks and `[0.5,1)` significand forms
+are implementation details of ITS rounder; this plan delivers
+NORMALIZED significands at TRUE recoded exponents into OUR encoder
+instead (section 5), which removes those tricks entirely.
+
+------------------------------------------------------------------------
+2. Special cases (combinational, resolved in one cycle)
+------------------------------------------------------------------------
+
+Decode both operands (sqrt: operand a only) into
+(sign, recExp, sig24) by class. Then:
+
+DIVISION (sqrt_op = 0), in priority order:
+
+  condition                        result          flags
+  -------------------------------- --------------- -------------------
+  a or b is sNaN                   qNaN(a-quieted) invalid
+  a or b is qNaN                   that qNaN       (none)
+  a=0 and b=0                      qNaN            invalid
+  a=inf and b=inf                  qNaN            invalid
+  a=inf (b finite or 0)            sign(a^b) inf   (none; even b=0)
+  b=0 (a finite nonzero)           sign(a^b) inf   divide_by_zero
+  a=0 (b normal)                   sign(a^b) zero  (none)
+  else                             recurrence      (section 3)
+
+  - inf/0 = inf with NO flags (dividend not finite; confirmed against
+    the Scala: its divide-by-zero majorExc term requires !isInf(a)).
+  - divide_by_zero result is INF (not max-finite) in all modes.
+  - qNaN propagation policy must MATCH the FMA (first NaN operand,
+    quieted; sNaN raises invalid, qNaN silent -- HANDOFF probed
+    semantics). Reuse the same selection logic shape as Decode.
+
+SQUARE ROOT (sqrt_op = 1):
+
+  condition                        result          flags
+  -------------------------------- --------------- -------------------
+  a is sNaN                        qNaN(a-quieted) invalid
+  a is qNaN                        that qNaN       (none)
+  a=+0                             +0              (none)
+  a=-0                             -0              (none)
+  a=+inf                           +inf            (none)
+  a<0 (finite, sign=1, nonzero)    qNaN            invalid
+  else                             recurrence      (section 4)
+
+Sign output: div = a.sign ^ b.sign; sqrt = a.sign (so sqrt(-0)=-0).
+
+HardFloat names its flag bit 1 "infinite"; in this project it is
+`divide_by_zero` (ALGORITHM.md flag table). The Scala's
+`invalidExc`/`infiniteExc` (majorExc && isNaN / !isNaN) map directly:
+invalid_exc drives the encoder's `invalid_exc` input; divide_by_zero
+drives the encoder's is_inf path with the dbz flag -- see section 5
+for the exact wiring. NOTE: check how EncodeRecFnBinary32 currently
+reports divide_by_zero (the FMA never raises it); if the encoder has
+no dbz input, add one (one mux into exception_flags[1], keeping the
+encoder's existing behavior bit-identical when dbz=0 -- fuzz the
+encoder change separately before wiring div/sqrt).
+
+------------------------------------------------------------------------
+3. Division algorithm (verified)
+------------------------------------------------------------------------
+
+Restoring digit recurrence on the significands, Hauser's scaled
+remainder form. Let a_frac, b_frac in [1,2) be the operand
+significands (a_frac = sig24/2^23). Quotient q = a_frac/b_frac in
+[0.5, 2). Digits c_i (i = 1..27), c_i in {0,1}, weight 2^(1-i) (so
+c_1 is the integer bit):
+
+    q = sum_{i=1..27} c_i * 2^(1-i)
+    r_i = a_frac - q_i * b_frac        (exact remainder after i digits)
+    c_i = (r_{i-1} >= 2^(-i) * b_frac) (restoring decision)
+    r_i = r_{i-1} - c_i * 2^(-i) * b_frac
+
+Integer units (all registers Word[26], verified bounds rem_i < 2^25):
+
+    rem_i = r_i * 2^(i+24)
+    rem_0 = sig24_a << 1                       (26 bits)
+    term  = sig24_b << 1        (decision: rem >= term, CONSTANT)
+    sub   = sig24_b << 2        (per set digit: rem <- 2*rem - sub)
+    c_i   = (rem >= term);  rem <- 2*rem - (c_i ? sub : 0)
+    sticky= (exact final remainder != 0)  -- tracked as rem != 0
+
+PROOF of the units (verified symbolically and numerically):
+rem_{i+1} = r_{i+1}*2^(i+1+24) = (r_i - c_i 2^-i b_frac)*2^(i+25)
+          = 2*rem_i - c_i*b_frac*2^25 = 2*rem_i - c_i*(sig24_b << 2).
+Bounds: after a set digit r_i < 2^-i * b_frac <= 2^(1-i), so
+rem_i < 2^25 -- Word[26] suffices (matches Hauser's sigWidth+2).
+
+Digit budget: 27 digits (c_1..c_27) UNIFORMLY, which is sufficient
+for correct rounding in both magnitude cases:
+  - a >= b (c_1 = 1): significand = c_1..c_24, guard = c_25,
+    round = c_26, and rem != 0 subsumes c_27 and beyond (sticky).
+  - a < b (c_1 = 0): normalized significand = c_2..c_25 (2q in [1,2)),
+    guard = c_26, round = c_27, sticky = rem != 0.
+(The 27th digit is redundant when c_1 = 1; keep the budget uniform --
+Hauser's skipCycle2 saves that cycle and is an optimization to revisit
+after correctness. NOTE: verify via the model that the (sig, guard,
+round, sticky) 4-tuple is sufficient at all 5 modes -- it is the
+standard condition, and the encoder already implements it.)
+
+Exponent: recExp_quot = recExp_a - recExp_b + 256, minus 1 more when
+c_1 = 0 (normalization shift). Range: [107,383] inputs give
+[-21, 532]; the encoder classifies (< 107 underflow, >= 384
+overflow). NO saturation clamp needed (the Scala's sSatExpQuot clamp
+at 448 exists for ITS narrower exponent register).
+
+Worked examples (verified digit strings, c_1 first):
+    1.5 / 1.0 = 1.1000_0000 ...  (27 digits: 110000...0, sticky 0, exact)
+    1.0 / 1.5 = 0.0101_0101 ...  (010101...0101, sticky 1, c_1 = 0 case)
+    max_sig / 1.0 = 1.1111...1000 (27 digits 111..1000, sticky 0:
+    the largest significand divided by 1.0 is exact at the grid)
+
+------------------------------------------------------------------------
+4. Square root algorithm (verified)
+------------------------------------------------------------------------
+
+Same recurrence shape on sqrt(arg), arg in [1,4). Parity fold: for
+even recExp_a the argument is a_frac (root in [1, 1.415) subset of
+[1,2)); for odd recExp_a the argument is 2*a_frac (root in
+[1.414, 2)). In BOTH cases the root x = 1 + sum c_i 2^(-i) lies in
+[1,2), so the result is always NORMAL-CLASS: no underflow/overflow
+is possible (recExp_out below), and no normalization shift.
+
+    digits c_i (i = 1..27), weight 2^(-i):
+    x = 1 + sum c_i * 2^(-i)
+    r_i = arg - x_i^2
+    c_i = (r_{i-1} >= 2^(-i) * (2*x_{i-1} + 2^(-i)))
+    r_i = r_{i-1} - c_i * 2^(-i) * (2*x_{i-1} + 2^(-i))
+
+    (For even recExp, c_1 = 0 is known a priori since sqrt([1,2)) <
+    1.5; computing it anyway keeps the datapath uniform. Hauser folds
+    it at entry -- optimization to revisit.)
+
+Integer units (Word[30] rem, Word[27] x26 -- the x8 scale keeps every
+decision and subtraction integral through i = 27; bounds rem < 2^29):
+
+    x26_i = x_i * 2^26        (x26_0 = 2^26, i.e. x_0 = 1)
+    rem_i = r_i * 2^(i+27)
+    even: rem_0 = (a_frac - 1)     * 2^27 = (sig24_a        - 2^23) << 4
+    odd:  rem_0 = (2*a_frac - 1)   * 2^27 = ((sig24_a << 1) - 2^23) << 4
+    term_i  = 2*x26 + (i <= 26 ? 2^(26-i) : 1)   (the ceil rule keeps
+              the i=27 decision exact: rem >= 2*x26 + frac <=> >= +1)
+    c_i = (rem >= term_i)
+    rem <- 2*rem - c_i * (4*x26 + (i <= 27 ? 2^(27-i) : 0))
+    x26 <- x26 + c_i * (i <= 26 ? 2^(26-i) : 0)   (sub-ulp digits
+              beyond i=26 do not move x26; they live in guard/round/
+              sticky positions of the delivered sig)
+    sticky = (exact final remainder != 0)
+
+PROOF: rem_{i+1} = r_{i+1}*2^(i+1+27)
+ = (r_i - c_i 2^-i (2x_i + 2^-i))*2^(i+28) = 2*rem_i - c_i*(2x_i+2^-i)*2^28
+ = 2*rem_i - c_i*(4*x26 + 2^(27-i)) in x26 units. All verified on 3000
+ random operands per parity against exact Fraction sqrt.
+
+Exponent: recExp_sqrt = (recExp_a >> 1) + 128  (BOTH parities).
+Proof: even recExp_a = 2k+256: value = a_frac*2^(2k), root = x*2^k,
+recExp_out = k+256 = (recExp_a>>1) + 128. Odd recExp_a = 2k+1+256:
+value = a_frac*2^(2k+1) = (2*a_frac)*2^(2k), root = x*2^k (x = root of
+2*a_frac), recExp_out = k + 256 = ((recExp_a - 257)>>1) + 256 =
+(recExp_a>>1) + 128. Range: recExp_a in [107, 447] gives recExp_out in
+[181, 351] -- always normal class, never over/underflows.
+
+Delivery: sig24 = x26[26..3] (the 24 bits below the leading 1),
+guard = x26[2], round = x26[1], sticky |= x26[0].
+
+Worked examples (verified):
+    sqrt(1.25)  even: x = 1.0001111000110111...  (sticky 1)
+    sqrt(2.25)  odd:  x = 1.1000000...           (= 1.5, sticky 0, exact)
+    sqrt(2.0)   odd:  x = 1.01101010000010011110... (= sqrt 2, sticky 1)
+    sqrt(1.0)   even: x = 1.0000000...           (sticky 0, exact)
+
+------------------------------------------------------------------------
+5. Rounding: reuse EncodeRecFnBinary32
+------------------------------------------------------------------------
+
+The FMA's encoder (muladdrecfn.vir `EncodeRecFnBinary32`, fuzz-verified
+through ~50k differential cases) rounds at the effective precision
+with the established semantics: pre-carry exponent grid, 24-bit ulp,
+guard/round/sticky, tininess-after-rounding, post-rounding overflow,
+exact-zero zero-sign, canonical NaN/inf/zero encodings. Reuse it --
+do NOT write a second rounder.
+
+Its interface:
+    incoming sign, exp Word[13], sig Word[24], guard, sticky,
+            zero_sign, invalid_exc, is_nan, is_inf,
+            round_mode, detect_tininess
+    outgoing out Word[33], exception_flags Word[5]
+Exp convention (muladdrecfn.vir line 14): value = sig * 2^(exp - 2048),
+i.e. exp = recExp + 1769, PRE-carry.
+
+Div/sqrt wiring:
+    exp    = recExp_out + 1769           (recExp_out from section 3/4;
+             div range [1748, 2301] fits Word[13])
+    sig    = the 24-bit normalized significand
+    guard/round folded: guard -> guard, round -> sticky (OR), plus
+             the recurrence sticky. NOTE the encoder takes (sig,
+             guard, sticky): its internal rule is LSB = sig[0],
+             guard, sticky -- deliver round OR'd into sticky exactly
+             as the FMA's normal path does.
+    zero_sign: for div-by-zero / a=0 results the sign is sign(a)^sign(b);
+             for sqrt(+-0) the operand sign. Exact zero results from the
+             recurrence (a=0/b-normal) carry sign(a)^sign(b) as well.
+    invalid_exc: from section 2 tables.
+    is_nan / is_inf: section 2 special classes (is_inf also covers
+             divide-by-zero and overflow-to-inf handling per the
+             encoder's existing semantics -- VERIFY against how the
+             FMA drives is_inf for overflow, since div/sqrt need
+             max-finite saturation in directed modes exactly like the
+             FMA; the encoder already implements that split).
+
+ACTION (blocking decision, smallest-change first): `EncodeRecFnBinary32`
+is non-pub in package `muladdrecfn`. Options:
+  (a) mark it `pub` (and its port types) in muladdrecfn.vir; hardfloat
+      imports it. Minimal change; slightly blurs "one family per
+      package" (the encoder is FMA-shaped but semantically generic).
+  (b) extract it into its own package `rawencode.vir` (the house
+      pattern used for RecFnClassBinary32) and have muladdrecfn import
+      it back. Cleaner, touches more files.
+Plan: do (a) first to unblock; consider (b) in the cleanup pass
+(HANDOFF item 5). If the divide_by_zero flag needs an encoder input,
+add it under (a) too and re-fuzz the FMA batteries to prove
+bit-identical behavior.
+
+------------------------------------------------------------------------
+6. FSM and handshake
+------------------------------------------------------------------------
+
+`pub mod DivSqrtRecFnBinary32` in package `hardfloat` (the stub's
+interface is already declared: `server socket req of Pipe[DivSqrtRequest]`
+and `outgoing result : Valid[DivSqrtResponse]`). Keep those exact port
+shapes; the top module connects via `:=:`.
+
+States (reg cycleNum : Word[6]; reg state or encode state in cycleNum):
+
+    IDLE      inReady = 1, result = @Invalid()
+              on req fires: latch request + decode; if special case
+              -> DONE_NOW (1 cycle), else start recurrence
+              (cycleNum := 28 = 1 entry + 27 digits)
+    RUN       one digit per cycle (combinational recurrence stage over
+              the regs); cycleNum decrements
+    DONE      cycleNum == 1: result = @Valid({out, flags}) for one
+              cycle, then back to IDLE
+
+Worst-case latency: 1 (decode) + 27 (digits) + 1 (result visible)
+= 29 cycles. Special cases: 2 cycles. inReady is high only in IDLE,
+so a second request during a computation is backpressured (the test
+image never issues one; a two-request test vector is future work).
+
+Per-cycle recurrence stage (combinational over regs; constant shifts
+via word()+slices, mux per decision -- no barrels needed: the only
+dynamic shifts are by 1):
+
+    div :  rem_n = (rem << 1) - (rem >= term ? sub : 0)   (Word[26] ops)
+    sqrt:  term/sub from x26 and cycle-dependent constant bit
+           (2^(26-i) is a 1-of-28 hot wire decoded from cycleNum --
+           a 27-input one-hot decode = Word[27] with a single 1 at
+           position (26 - cycleNum); build with word() + mux tree
+           over cycleNum, ~27 mux stages... NOTE this is the widest
+           new logic; alternative: maintain the bit weight as a
+           SHIFTING reg (Hauser's fractB_Z >> 1 per cycle) instead of
+           decoding from cycleNum -- RECOMMENDED, it is one word[27]
+           reg and a constant right shift).
+
+Recommended registers (names per the Scala where they match):
+    sqrt_op_Z, sign_Z, recExp_out_Z (Word[11] signed-biased), 
+    term_reg (div: constant sig24_b<<1; sqrt: the shifting
+    (2*x26 + bitweight) register), rem (Word[30] div reuses Word[26]),
+    sigX (Word[27] sqrt / div collects digits into a Word[27] shift
+    register: c_i enters at the top, shifts left 1 per cycle --
+    avoids the one-hot bitMask decode entirely), sticky_Z,
+    round_mode_Z, plus the special-case latches (is_nan_Z, is_inf_Z,
+    is_zero_Z, invalid_Z, dbz_Z, zero_sign_Z).
+
+The sigX-as-shift-register trick replaces both the Scala's bitMask
+decode and the one-hot term decode for div; for sqrt the shifting
+term register replaces it. NO barrel shifters are needed anywhere in
+this module (only <<1, >>1, >>4 constants).
+
+------------------------------------------------------------------------
+7. Testbench protocol extension (src/top.vir)
+------------------------------------------------------------------------
+
+New operations (image word 3 low bits):
+    8 = divide (op_select == 8w3)
+    9 = sqrt    (op_select == 9w3)
+
+Image words (write ALL of 0..4 as always):
+    word 0: operand a (33-bit recoded)
+    word 1: operand b (33-bit recoded; ignored for sqrt)
+    word 2: bit 0 unused (b is always the divisor), bits 4..2 =
+            rounding mode via cast() -- SAME convention as ops 4..6
+    word 3: operation selector (8 or 9)
+    word 4: unused for div/sqrt
+
+Wiring: instantiate the module with a client socket feeding it:
+    mod divsqrt of hardfloat::DivSqrtRecFnBinary32
+    client socket reqsrc of Pipe[DivSqrtRequest] { it.data := ... }
+    reqsrc :=: divsqrt.req   -- CHECK direction (server side is the
+    module; the client side is top). The module needs `clock` and a
+    reset or reg-initial values; top.vir's `step` reg pattern shows
+    the idiom (`initial it <= 0`).
+
+Handshake over cycles: top presents @Valid(request) while step is in
+a request window and waits for result.valid; simplest protocol:
+    step 0:      drive req.data = @Valid(request) (req.ready is high
+                 in IDLE, so it fires at step 0)
+    step 1..~30: req.data = @Invalid(); wait for divsqrt.result.valid
+    on valid:    latch {out, flags} into the packet reg
+    exit:        extend the exit step (currently 9) to ~40 (div/sqrt
+                 worst case 29 + margin). The debug streaming (steps
+                 1..8) must move AFTER the result latch for div/sqrt:
+                 gate the packet-sample cycle on result.valid instead
+                 of `step == 0` -- RESTRUCTURE: packet <= sample when
+                 (op is div/sqrt ? result.valid-fired : step == 0).
+Packet layout (same as FMA): [63..31] recoded out, [30..26] flags.
+
+`fputils.run_packet` gains ops 8/9 (words list + 12 -> 45 cycles).
+
+------------------------------------------------------------------------
+8. Verification plan
+------------------------------------------------------------------------
+
+Independent references (the fuzz methodology that worked for the FMA):
+
+1. `divmodel.py` (project file): promote /tmp/divsqrt_clean.py +
+   the exact-Fraction sqrt model into one Fraction-exact reference:
+   decode f32 bits -> (sign, recExp, sig24) -> special cases (section
+   2 tables) -> recurrence -> round at the 24-bit grid with
+   guard/round/sticky at all 5 modes -> recoded out + flags. This is
+   the arbiter. ALSO keep a bit-exact cycle-level model of the RTL
+   datapath (the pipemodel.py role) so mismatches dissect per stage.
+
+2. C oracle (recreate /tmp/coracle pattern): plain `a / b` and
+   `sqrtf(a)` under `fesetround` + `fetestexcept`; reads 2 hex u32
+   operands + mode index, prints result bits + flags. Cross-check the
+   Python reference against it on ~1500 cases before trusting either
+   (same as the FMA's glibc fmaf cross-check).
+
+3. Corner battery: zeros (+0/-0 as dividend, divisor, both),
+   infinities, NaNs (q and s), 0/0, inf/inf, inf/0, finite/0, a=0,
+   sqrt(-x) family, sqrt(-0)/+0, subnormal operands, exponent
+   extremes (min subnormal, max finite), exact powers
+   (sqrt of 4, 16, 2^-2...), exact quotients (q with tail 0),
+   exact-tie quotients (tail exactly 1/2 ulp at the guard), each in
+   all 5 modes. ~150 vectors like the FMA battery.
+
+4. Fuzzer (`fuzz_divsqrt.py` or extend fuzz.py with op modes):
+   biased random operands (normals, subnormals, exponents near
+   boundaries, cancellation-prone pairs a ~ b), all 5 modes, values
+   AND flags compared against divmodel.py; parallel workers per
+   fuzz_worker.py's pattern (private project copy; NOTE the worker's
+   image/copy plumbing needs the ops 8/9 additions).
+
+5. Worked examples of sections 3/4 become the first regression
+   vectors (digit strings assertable at the model level).
+
+6. Cycle-count assertions: assert result arrives exactly at the
+   documented cycle for a normal and a special case (guards against
+   FSM off-by-ones), and that inReady backpressures a second request.
+
+Simulation-load note: each `vir run` costs ~1s; a 600-case worker
+takes ~12 minutes. Budget accordingly (the sticky agent's timeout
+lesson: ONE battery run per verification pass, not per tweak).
+
+------------------------------------------------------------------------
+9. Implementation steps (each gated by `vir check` + corner battery)
+------------------------------------------------------------------------
+
+ 1. Promote the verified models to `divmodel.py` (+ oracle cross-check).
+ 2. Add ops 8/9 + extended handshake to top.vir/fputils (dummy module
+    output first: wire the stub to a constant) and prove the plumbing
+    with `vir run` on a hand vector.
+ 3. DivSqrtDecode: combinational decode + section 2 special cases;
+    verify specials through the testbench against divmodel.
+ 4. Division datapath + FSM (IDLE/RUN/DONE); verify vs divmodel with
+    the worked examples, then the corner battery, then fuzz.
+ 5. Sqrt datapath (shares the FSM; the parity fold is entry-only);
+    same verification ladder.
+ 6. Wire EncodeRecFnBinary32 (pub per section 5) + flags; full fuzz.
+ 7. Cycle-count/backpressure assertions; update HANDOFF.md item 2.
+
+------------------------------------------------------------------------
+10. Open questions (resolve during implementation, in order)
+------------------------------------------------------------------------
+
+- Encoder `divide_by_zero` input: does the FMA encoder already have
+  a path for flag bit 1? (grep exception_flags wiring; likely a
+  one-mux addition -- re-fuzz the FMA after touching it.)
+- NaN payload policy: confirm the FMA's exact NaN-selection logic
+  and reuse it verbatim (the fuzz reference must agree).
+- Sticky exactness through the LAST digit: div rem stays exact
+  (constant sub); sqrt sub carries the 2^(27-i) term which stays
+  integral through i=27 in the Word[30] units -- asserted by the
+  model, assert again in RTL vectors.
+- Two-request backpressure test: deferred (single-request testbench);
+  the FSM must still be written so a second req during RUN is held
+  off by inReady=0.
+
+------------------------------------------------------------------------
+11. Implementation corrections (post-implementation, verified)
+------------------------------------------------------------------------
+
+Corrections found while implementing against this plan. The RTL is the
+current muladdrecfn/hardfloat state; divmodel.py is the promoted
+reference (Fraction-exact, integer-comparison rounding -- see 11.3).
+
+11.1 Division digit weight. The decision term in the section-3 units
+is b_frac * 2^(i-1+24+1) = sig24_b << 5 at the 2^(i+28) scale actually
+used (not << 4): digits have weight 2^(1-i), c_1 = the integer bit.
+
+11.2 Workspace scale. Both datapaths run at rem = r * 2^(i+28)
+(Word[31]): division terms are constants (sig_b << 5, sub = << 6);
+sqrt keeps x28 = x * 2^27 (Word[28]) and a shifting digit-weight
+register w = 2^(27-i), with term = 2*x28 + w, sub = 2*term. All
+decisions/subtractions stay exactly integral through all 27 digits;
+sticky = (final exact remainder != 0).
+
+11.3 The quotient's denominator is NOT a power of two in general, so
+fuzz.round_scaled (FMA reference) cannot round divisions. divmodel
+rounds with pure integer comparisons instead (_floor_over_lin /
+round_div_exact): t = floor(va/2^eulp), rem vs one-half by comparing
+2N against (2t+1)D. Same tail rules as ref_fma (overflow implies
+inexact; tininess after rounding; flush-to-zero keeps magnitude sign).
+
+11.4 Cycle budget: uniform 27 digits (no skipCycle2 needed for
+correctness). sigx shifts uniformly every run cycle (the 27th shift
+lands c_1 at bit 26 with no overflow). Latency: 28 cycles to the
+result for the recurrence path, 2 for special cases.
+
+11.5 Special-case table corrections: finite / inf = +-0 (NOT inf);
+the division infinity result comes only from a = inf (including
+inf/0, no flags). The quiet bit is fract bit 22 = word bit 22.
+
+11.6 Virdant lessons (new since MULADDRECFN.plan section 0):
+- Statement conditionals are ALWAYS `if { when ... }`; a bare `when`
+  in a reg driver body is a syntax error that cascades confusingly
+  (downstream items report "unresolved"). Sequential `when` arms in
+  one if are legal; the else binds to the last when.
+- Struct field projection is `->` (r->out), not `.`; struct literals
+  are `${field = expr, ...}`.
+- Slices are [hi..lo] = bits hi-1..lo (so all-bits is [w-1..0]... 
+  note [27..0] on Word[28] = bits 26..0: the slice bound is the bit
+  ABOVE the top taken).
+- `+.`/`-.` widen by a carry/borrow bit; plain `+`/`-` keep width.
+  Use plain ops where no carry can occur, zext for width matching.
+- A `client socket` on the platform-top module exposes undeclared
+  platform ports; drive an instance's server-socket channels directly
+  (it.req.data := ...) instead.
+- `initial` applies only when no driver assigns that cycle: gate
+  "hold" arms explicitly or the first cycle latches pseudorandom.
+- Registers are pruned from the VCD unless their full value is read.

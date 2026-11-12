@@ -1,0 +1,88 @@
+//! FMIN.S / FMAX.S operand select over recoded binary32.
+//!
+//! Wraps the verified comparison unit: NaN rules first (RISC-V F
+//! extension: both NaN -> canonical quiet NaN, exactly one NaN -> the
+//! other operand as-is), then ordering, with the sign-aware zero tie.
+
+import comparerecfn
+
+//> FMIN.S / FMAX.S operand select over recoded binary32.
+//>
+//> `select_max` low selects the smaller operand (FMIN.S); high the
+//> larger (FMAX.S). Quiet operation: no exception flags.
+pub mod SelectRecFnBinary32 {
+    incoming a          : Word[33]
+    incoming b          : Word[33]
+    incoming select_max : Bit
+
+    outgoing out : Word[33] dependson a, b, select_max {
+        it := selected
+    }
+
+    // The comparison unit backing the ordering decision. The tie
+    // case is the else arm (neither lt nor gt), and NaN is tested
+    // locally, so eq and unordered are deliberately unused here.
+    mod cmp of comparerecfn::CompareRecFnBinary32 {
+        it.a := a
+        it.b := b
+    }
+    unused cmp.eq
+    unused cmp.unordered
+
+    // NaN-class field tests (duplicated here; the decode helpers in
+    // the muladdrecfn package are not pub).
+    wire a_rec_exp : Word[9] {
+        it := a[32..23]
+    }
+    wire b_rec_exp : Word[9] {
+        it := b[32..23]
+    }
+    wire a_is_nan  : Bit {
+        it := (a_rec_exp[9..7] == 0b11w2) && a_rec_exp[6]
+    }
+    wire b_is_nan  : Bit {
+        it := (b_rec_exp[9..7] == 0b11w2) && b_rec_exp[6]
+    }
+
+    // On a tie the sign-1 operand wins for min, the sign-0 for max:
+    //   min(+0, -0): a sign 0 != 1 -> b = -0
+    //   min(-0, +0): a sign 1 == 1 -> a = -0
+    //   max(+0, -0): tie_sign 0: a sign 0 -> a = +0
+    //   max(-0, +0): a sign 1 != 0 -> b = +0
+    wire tie_sign : Bit {
+        it := !select_max
+    }
+    wire tie_pick : Word[33] {
+        it := if {
+            when a[32] == tie_sign => a
+            else => b
+        }
+    }
+
+    // Ordering among non-NaN operands: the comparator's predicates
+    // pick the operand; ties fall through to the sign-aware rule.
+    wire ordered_pick : Word[33] {
+        it := if {
+            when cmp.lt => mux(select_max, b, a)
+            when cmp.gt => mux(select_max, a, b)
+            else => tie_pick
+        }
+    }
+
+    // Canonical quiet NaN: sign 0, recExp 448, quiet bit set, so the
+    // result round-trips through RecFnToFnBinary32 to IEEE 0x7FC00000.
+    wire canonical_nan : Word[33] {
+        it := word(0w1, 0b111000000w9, 0x40_0000w23)
+    }
+
+    // NaN rules first, then ordering. A single-NaN result is returned
+    // bitwise as-is, payload preserved.
+    wire selected : Word[33] {
+        it := if {
+            when a_is_nan && b_is_nan => canonical_nan
+            when a_is_nan => b
+            when b_is_nan => a
+            else => ordered_pick
+        }
+    }
+}
