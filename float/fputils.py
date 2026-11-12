@@ -77,12 +77,14 @@ def decode(recoded):
     return -value if sign else value
 
 
-def run_packet(words, cycles=12):
+def run_packet(words, cycles=12, n_bytes=8):
     """Write the image words (MSB-first) and run the testbench.
 
-    Returns the 64-bit result packet streamed out the debug channel.
-    Word layout is fixed by src/top.vir: operands in words 0..2,
-    operation selector (0 = FMA, 1 = compare) in word 3.
+    Returns the n_bytes-byte result packet (default 8) streamed out
+    the debug channel, low byte first. Two-request div/sqrt runs
+    stream 16 bytes: request 1's packet in bits [63..0], request 2's
+    in bits [127..64]. Word layout is fixed by src/top.vir: operands
+    in words 0..2, operation selector (0 = FMA, 1 = compare) in word 3.
     """
     image_path = os.path.join(IMAGE_DIR, "add_mult.img")
     with open(image_path, "wb") as img:
@@ -99,9 +101,10 @@ def run_packet(words, cycles=12):
         sys.stderr.write(result.stderr.decode("utf-8", "replace"))
         sys.exit("vir run failed with exit code {}".format(result.returncode))
 
-    # The debug channel emits eight raw packet bytes, low byte first,
+    # The debug channel emits the raw packet bytes, low byte first,
     # on the simulator's diagnostic (stderr) stream.
     packet_bytes = result.stderr
-    if len(packet_bytes) < 8:
-        sys.exit("expected 8 result bytes, got {!r}".format(packet_bytes))
-    return int.from_bytes(packet_bytes[:8], "little")
+    if len(packet_bytes) < n_bytes:
+        sys.exit("expected {} result bytes, got {!r}"
+                 .format(n_bytes, packet_bytes))
+    return int.from_bytes(packet_bytes[:n_bytes], "little")

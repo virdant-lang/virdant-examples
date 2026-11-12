@@ -20,6 +20,15 @@
 //! Float-to-int packet: [63..32] the integer, [31..29] the
 //! three int exception flags.
 //! Classify packet: [63..54] the ten one-hot class bits.
+//!
+//! Div/sqrt packets additionally carry the request's latency in
+//! cycles in bits [25..18] (1 for the special-case path -- the FSM
+//! jumps straight to its delivery state -- 28 for the recurrence
+//! path). With image word 2 bit 0 set (second-request
+//! enable, unused by any other op), a second request is issued from
+//! image words 5/6 (mode in word 7 bits 4..2) once the first result
+//! has been consumed, and a second 8-byte packet follows: 16 bytes
+//! total, exit at step 17.
 
 import classifyrecfn
 import comparerecfn
@@ -41,7 +50,8 @@ pub mod Top for virt::Virt {
     //> Ends the program with exit code 0 once the packet has streamed.
     outgoing exit : Valid[Word[8]] {
         it := if {
-            when step == 9w4 => @Valid(0)
+            when (step == 9w5) && !divsqrt_second => @Valid(0)
+            when (step == 17w5) && divsqrt_second => @Valid(0)
             else => @Invalid()
         }
     }
@@ -49,7 +59,8 @@ pub mod Top for virt::Virt {
     //> One packet byte per cycle while streaming, low byte first.
     outgoing debug : Valid[Word[8]] {
         it := if {
-            when (step >= 1w4) && (step <= 8w4) => @Valid(packet[8..0])
+            when (step >= 1w5) && (step <= 8w5) => @Valid(packet[8..0])
+            when (step >= 9w5) && (step <= 16w5) => @Valid(packet2[8..0])
             else => @Invalid()
         }
     }
@@ -60,15 +71,16 @@ pub mod Top for virt::Virt {
     @image("add_mult.img")
     memory operands[8] : Word[64]
 
-    // Cycle counter: sample at 0, stream bytes at 1 through 8, exit at 9.
-    reg step : Word[4] {
+    // Cycle counter: sample at 0, stream bytes at 1 through 8 (and
+    // 9 through 16 for a second div/sqrt request), exit at 9 (17).
+    reg step : Word[5] {
         initial it <= 0
         if {
-            when divsqrt_mode && it == 0w4 && !result_seen {
+            when divsqrt_mode && it == 0w5 && !divsqrt_done {
                 it <= 0
             }
             else {
-                it <= it + 1w4
+                it <= it + 1w5
             }
         }
     }
@@ -130,7 +142,12 @@ pub mod Top for virt::Virt {
 
     // Iterative divide/sqrt: the request fires on cycle 0 (the unit
     // is idle at reset) and the packet samples when its result turns
-    // valid, ~28 cycles later for the recurrence path.
+    // valid, ~28 cycles later for the recurrence path. The request
+    // stays valid through the whole computation (the unit must ignore
+    // it while not ready) -- that is the standing backpressure
+    // condition. With divsqrt_second, a second request (image words
+    // 5/6, mode in word 7) is issued the cycle after the first result
+    // is consumed, exercising the return-to-idle path.
     mod divsqrt of hardfloat::DivSqrtRecFnBinary32 {
         it.clock    := clock
         it.req.data := if {
@@ -141,11 +158,31 @@ pub mod Top for virt::Virt {
                 rounding_mode   = cast(operands[2][5..2]),
                 detect_tininess = #AfterRounding,
             })
+            when divsqrt_second && result_seen && !result2_seen =>
+                @Valid(${
+                sqrt_op         = sqrt_mode,
+                a               = operands[5][33..0],
+                b               = operands[6][33..0],
+                rounding_mode   = cast(operands[7][5..2]),
+                detect_tininess = #AfterRounding,
+            })
             else => @Invalid()
         }
     }
 
     unused divsqrt.req.ready
+
+    // Second-request enable: image word 2 bit 0 (unused by ops 8/9
+    // otherwise).
+    wire divsqrt_second : Bit {
+        it := divsqrt_mode && operands[2][0]
+    }
+
+    // Both requested results consumed (the second only counts when
+    // enabled); step may start streaming once this is high.
+    wire divsqrt_done : Bit {
+        it := result_seen && (!divsqrt_second || result2_seen)
+    }
 
     wire divsqrt_fired : Bit {
         it := match divsqrt.result {
@@ -158,6 +195,32 @@ pub mod Top for virt::Virt {
         initial it <= false
         if {
             when divsqrt_mode && divsqrt_fired { it <= true }
+        }
+    }
+
+    reg result2_seen : Bit {
+        initial it <= false
+        if {
+            when divsqrt_second && result_seen && divsqrt_fired {
+                it <= true
+            }
+        }
+    }
+
+    // Latency counter: counts cycles from a valid request presented
+    // in the idle cycle until the unit's result turns valid, and
+    // resets at every fire, so the value a packet samples at its fire
+    // edge is that request's latency (1 special -- the FSM jumps
+    // straight to its delivery state -- 28 recurrence).
+    reg div_cycles : Word[8] {
+        initial it <= 0
+        if {
+            when divsqrt_mode && divsqrt_fired {
+                it <= 0w8
+            }
+            when divsqrt_mode && !divsqrt_fired && !divsqrt_done {
+                it <= it + 1w8
+            }
         }
     }
 
@@ -202,21 +265,22 @@ pub mod Top for virt::Virt {
         if {
             when divsqrt_mode {
                 if {
-                    when divsqrt_fired {
+                    when divsqrt_fired && !result_seen {
                         it <= match divsqrt.result {
                             with @Valid(r) =>
-                                word(r->out, r->exception_flags, 0w26)
+                                word(r->out, r->exception_flags,
+                            div_cycles, 0w18)
                             else => 0w64
                         }
                     }
-                    when result_seen && step != 0w4 {
+                    when result_seen && step != 0w5 {
                         it <= word(0w8, it[64..8])
                     }
                 }
             }
             when !divsqrt_mode {
                 if {
-                    when step == 0w4 {
+                    when step == 0w5 {
                         it <= if {
                             when class_mode =>
                                 word(classifier.out, 0w54)
@@ -238,6 +302,29 @@ pub mod Top for virt::Virt {
                         it <= word(0w8, it[64..8])
                     }
                 }
+            }
+        }
+    }
+
+    // Second div/sqrt result (only latched in second-request mode;
+    // div_cycles still holds that request's latency at the fire edge
+    // -- the counter resets on the same edge but drivers read the
+    // pre-edge value).
+    reg packet2 : Word[64] {
+        initial it <= 0
+        if {
+            when divsqrt_second && result_seen && !result2_seen
+            && divsqrt_fired {
+                it                        <= match divsqrt.result {
+                    with @Valid(r) =>
+                        word(r->out, r->exception_flags,
+                    div_cycles, 0w18)
+                    else => 0w64
+                }
+            }
+            when divsqrt_second && result2_seen
+            && (step >= 9w5) && (step <= 16w5) {
+                it                        <= word(0w8, it[64..8])
             }
         }
     }

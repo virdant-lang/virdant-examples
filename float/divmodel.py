@@ -286,8 +286,9 @@ def rtl_div(a_bits, b_bits, mode):
     ], cycles=45)
     out_recoded = packet >> 31
     flag_bits = (packet >> 26) & 0x1F
+    latency = (packet >> 18) & 0xFF
     return out_recoded, {name for i, name in enumerate(FLAG_NAMES)
-                         if flag_bits & (1 << i)}
+                         if flag_bits & (1 << i)}, latency
 
 
 def rtl_sqrt(a_bits, mode):
@@ -299,8 +300,26 @@ def rtl_sqrt(a_bits, mode):
     ], cycles=45)
     out_recoded = packet >> 31
     flag_bits = (packet >> 26) & 0x1F
+    latency = (packet >> 18) & 0xFF
     return out_recoded, {name for i, name in enumerate(FLAG_NAMES)
-                         if flag_bits & (1 << i)}
+                         if flag_bits & (1 << i)}, latency
+
+
+def div_is_special(a_bits, b_bits):
+    """True iff the pair takes the RTL's special-case path (latency 2):
+    any NaN/zero/infinity operand covers every section-2 special
+    (qNaN/sNaN, 0/0, inf/inf, inf/0, finite/0, finite/inf, 0/normal).
+    """
+    ka = f32_class(a_bits)[3]
+    kb = f32_class(b_bits)[3]
+    return "nan" in (ka, kb) or "zero" in (ka, kb) or "inf" in (ka, kb)
+
+
+def sqrt_is_special(a_bits):
+    """True iff the operand takes the special-case path: NaN, zero,
+    infinity, or negative (negative finite and -inf are invalid)."""
+    sign, _, _, kind, _ = f32_class(a_bits)
+    return kind in ("nan", "zero", "inf") or sign == 1
 
 
 def _compare(ref_result, ref_flags, out, rtl_flags, what):
@@ -331,14 +350,24 @@ def _compare(ref_result, ref_flags, out, rtl_flags, what):
 
 def compare_div(a_bits, b_bits, mode):
     ref_result, ref_flags = ref_div(a_bits, b_bits, mode)
-    out, rtl_flags = rtl_div(a_bits, b_bits, mode)
-    return _compare(ref_result, ref_flags, out, rtl_flags, "div")
+    out, rtl_flags, latency = rtl_div(a_bits, b_bits, mode)
+    problems = _compare(ref_result, ref_flags, out, rtl_flags, "div")
+    expected = 1 if div_is_special(a_bits, b_bits) else 28
+    if latency != expected:
+        problems.append("latency: expected {} cycles, got {}"
+                        .format(expected, latency))
+    return problems
 
 
 def compare_sqrt(a_bits, mode):
     ref_result, ref_flags = ref_sqrt(a_bits, mode)
-    out, rtl_flags = rtl_sqrt(a_bits, mode)
-    return _compare(ref_result, ref_flags, out, rtl_flags, "sqrt")
+    out, rtl_flags, latency = rtl_sqrt(a_bits, mode)
+    problems = _compare(ref_result, ref_flags, out, rtl_flags, "sqrt")
+    expected = 1 if sqrt_is_special(a_bits) else 28
+    if latency != expected:
+        problems.append("latency: expected {} cycles, got {}"
+                        .format(expected, latency))
+    return problems
 
 
 # ---------------------------------------------------------------------
@@ -491,6 +520,70 @@ HISTORICAL_DIV = dcorpus.HISTORICAL_DIV
 HISTORICAL_SQRT = dcorpus.HISTORICAL_SQRT
 
 
+# ---------------------------------------------------------------------
+# Two-request backpressure battery
+# ---------------------------------------------------------------------
+
+# Back-to-back request pairs: (op, first_pair, second_pair). Chosen so
+# every combination of recurrence/special first and second request is
+# exercised, including divide-by-zero, qNaN, and the overflow region.
+BACKPRESSURE_SEQUENCES = [
+    ("div", (0x40400000, 0x3F800000), (0x3F800000, 0x40400000)),
+    ("div", (0x3FC00000, 0x40000000), (0x7F800000, 0x40000000)),
+    ("div", (0x40000000, 0x00000000), (0x40400000, 0x3F800000)),
+    ("div", (0x00800000, 0x7F800000), (0x7FC00000, 0x3F800000)),
+    ("sqrt", (0x40000000, 0), (0x40800000, 0)),
+    ("sqrt", (0x00000001, 0), (0xBF800000, 0)),
+    ("sqrt", (0x7F800001, 0), (0x41200000, 0)),
+]
+
+
+def compare_pair(op, first, second, mode):
+    """One two-request sequence: fire request 1, consume its result,
+    fire request 2 with fresh operands, and check BOTH packets (value,
+    flags, latency) against the exact reference.
+
+    The first request's data stays valid through the whole computation
+    (the standing backpressure condition); the second additionally
+    exercises the return-to-idle path.
+    """
+    is_sqrt = op == "sqrt"
+    (a1, b1), (a2, b2) = first, second
+    if is_sqrt:
+        b1 = b2 = 0
+    words = [
+        recode(a1), recode(b1),
+        (mode << 2) | 1,          # word 2: mode bits 4..2, bit 0 = second en
+        9 if is_sqrt else 8,      # operation selector
+        0,
+        recode(a2), recode(b2),
+        mode << 2,                # word 7: second request's rounding mode
+    ]
+    packet = run_packet(words, cycles=90, n_bytes=16)
+    problems = []
+    for i, (p, (ra, rb)) in enumerate(
+            ((packet & 0xFFFF_FFFF_FFFF_FFFF, first),
+             (packet >> 64, second)), 1):
+        out = p >> 31
+        flag_bits = (p >> 26) & 0x1F
+        latency = (p >> 18) & 0xFF
+        rtl_flags = {name for j, name in enumerate(FLAG_NAMES)
+                     if flag_bits & (1 << j)}
+        if is_sqrt:
+            ref_result, ref_flags = ref_sqrt(ra, mode)
+            expected = 1 if sqrt_is_special(ra) else 28
+        else:
+            ref_result, ref_flags = ref_div(ra, rb, mode)
+            expected = 1 if div_is_special(ra, rb) else 28
+        problems += ["req{}: {}".format(i, q)
+                     for q in _compare(ref_result, ref_flags,
+                                       out, rtl_flags, op)]
+        if latency != expected:
+            problems.append("req{} latency: expected {} cycles, got {}"
+                            .format(i, expected, latency))
+    return problems
+
+
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0xD1CE
@@ -555,6 +648,28 @@ def main():
             run_sqrt(a, mode)
     print("historical: {} cases, {} failures, {} flaky"
           .format(total - hist_total, failures, flaky))
+
+    # Back-to-back two-request protocol test (return-to-idle path).
+    bp_total = total
+    for mode in range(5):
+        for op, first, second in BACKPRESSURE_SEQUENCES:
+            total += 1
+            problems = compare_pair(op, first, second, mode)
+            if problems:
+                if not compare_pair(op, first, second, mode):
+                    flaky += 1
+                    continue
+                if not compare_pair(op, first, second, mode):
+                    flaky += 1
+                    continue
+            if problems:
+                failures += 1
+                print("FAIL pair {}: {} {} then {} {} mode={}({})"
+                      .format(total, op, first, second, mode, MODES[mode]))
+                for p in problems:
+                    print("      " + p)
+    print("backpressure: {} cases, {} failures, {} flaky"
+          .format(total - bp_total, failures, flaky))
 
     for i in range(n):
         mode = rng.randrange(5)

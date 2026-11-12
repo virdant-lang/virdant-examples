@@ -207,10 +207,21 @@ For ops 4..9: word 2 bit 0 = select_max / signed flag (unused for
 8/9); word 2 bits 4..2 = rounding mode (0 RNE, 1 RZ, 2 Rup, 3 Rdn,
 4 RMM), wired through `cast()`. div/sqrt read the mode from word 2.
 
+**Div/sqrt two-request mode** (backpressure test): for ops 8/9, word 2
+bit 0 = second-request enable. When set, a second request is issued
+from image words 5/6 (mode in word 7 bits 4..2) the cycle after the
+first result is consumed, and a second 8-byte packet follows (16 bytes
+total, exit at step 17; use cycles=90). The first request stays valid
+through the whole computation (the unit must ignore it while not
+ready); the second exercises the return-to-idle path. divmodel.py
+runs a 35-case battery over this in every invocation.
+
 Packet layouts (payloads at the TOP of the word, MSB-first):
 
     FMA / int->float:  [63..31] recoded out, [30..26] exception flags
-    divide / sqrt:     [63..31] recoded out, [30..26] exception flags
+    divide / sqrt:     [63..31] recoded out, [30..26] exception flags,
+                       [25..18] latency in cycles (1 special, 28
+                       recurrence)
     compare:           [3..0] = unordered, gt, eq, lt
     converters:        [63..31] (33-bit) or [63..32] (32-bit) result
     select:            [63..31] selected operand
@@ -295,15 +306,16 @@ detail):
 
 ## Known issues and deferred work (in priority order)
 
-1. **Div/sqrt final verification** — the seed-777 600-case fuzz was
-   still running at handoff (log: /tmp/divfuzz2.log). Before this
-   handoff: corners 225/225, a 725-case batch with 1 failure whose
-   root cause was the REFERENCE (missing overflow⇒inexact in
-   divmodel.round_div_exact — fixed, the case passes). If the batch
-   shows reproduced RTL failures, dissect with divmodel.model_div /
-   model_sqrt (bit-exact RTL transcriptions, verified 6000/6000
-   against exact arithmetic). Also worth adding: cycle-count
-   assertions and a two-request backpressure test.
+1. **Div/sqrt final verification** — DONE. Seed-777 600-case fuzz:
+   825 total cases (225 corners + 600 random), 0 failures, 1 flaky
+   (simulator transient, passed on retry). Cycle-count assertions:
+   every div/sqrt packet now carries its request's measured latency
+   in bits [25..18], asserted by divmodel (1 cycle special path, 28
+   recurrence -- note the HANDOFF's old "2 specials" was the FSM
+   STATE number, not the measured latency). Two-request backpressure
+   test: 35-case battery in every divmodel.py run (see testbench
+   protocol below), exercising the return-to-idle path with all
+   special/recurrence first/second combinations.
 2. **Persist the regression corpus** — DONE: the corner batteries and
    the historical failing cases now live in `tests/corpus.py`; fuzz.py
    and divmodel.py import them (single source of truth) and replay
