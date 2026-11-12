@@ -1,0 +1,122 @@
+# sixfiveohtwo stage 7 expectations.
+# Decimal mode (NMOS/Bruce Clark): SED/CLD, ADC/SBC with D=1.
+#
+# All checks apply at the single final marker (M line below): the last
+# data write is lda #$A7 / sta $F000, preceded by cld (D=0). Before
+# that, the last decimal ADC (99+01 in the SED block) left N=1, Z=1,
+# C=1, V=0, none of which cld or lda #$A7 except N/Z (N=1, Z=0 after
+# lda #$A7). I is the untouched reset value 1 (SEI/CLI never used).
+# X=$00 (X is never used; also proves decimal ops leave it alone),
+# Y=$02 (ldy #$02 for the SBC (zp),Y block, never changed after),
+# SP=$FD (seven PHP/PLA pairs, all balanced, no JSR). PC is the
+# address after the final 3-byte sta $F000 at $03CC.
+#
+# Decimal model recap for the checkpoints: ADC (D=1) sets N/V from the
+# pre-correction high-nibble sum (e.g. 58+46 -> N=1 V=1 although the
+# result $04 is positive) and Z from the decimal result; SBC (D=1)
+# sets N/V/Z strictly from the binary difference while result/C come
+# from the decimal correction -- the PHP/PLA bytes below pin those
+# (P is pushed as N V 1 B D I Z C; D=1 I=1 gives base $3C, D=0 gives
+# base $34 in the CLD block).
+
+M F000 A7
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A A7
+R X 00
+R Y 02
+R S FD
+R P 03CF
+
+# --- decimal ADC immediate ---
+C F100 04
+C F101 00
+C F102 01
+C F103 10
+C F104 05
+C F105 00
+C F106 01
+
+# --- decimal ADC zp/abs/(zp),Y ---
+C F107 05
+C F108 99
+C F109 81
+
+# --- decimal SBC immediate ---
+C F10A 25
+C F10B 00
+C F10C 99
+C F10D 60
+C F10E 50
+C F10F 49
+C F110 99
+C F111 80
+
+# --- decimal SBC zp/abs/(zp),Y ---
+C F112 34
+C F113 37
+C F114 30
+
+# --- SBC N/V/Z binary proofs: results + PHP/PLA P bytes ---
+C F115 25
+C F116 3D
+C F117 99
+C F118 BC
+C F119 00
+C F11A 3F
+C F11B 60
+C F11C FC
+C F11D 80
+C F11E BD
+C F11F 79
+C F120 7D
+C F121 B0
+C F122 3C
+
+# --- ORA/shifts unaffected by D=1 ---
+C F123 8F
+C F124 80
+C F125 01
+C F126 80
+C F127 40
+C F128 00
+
+# --- CLD/SED toggling: binary $9A vs decimal $00, D bit in P ---
+C F129 9A
+C F12A B4
+C F12B 00
+C F12C BF
+
+# --- fail-guard markers must NOT have been stored ---
+C F1E0 00
+C F1E1 00
+C F1E2 00
+C F1E3 00
+C F1E4 00
+C F1E5 00
+C F1E6 00
+C F1E7 00
+C F1E8 00
+C F1E9 00
+C F1EA 00
+C F1EB 00
+C F1EC 00
+
+# --- setup scratch, zero page (operands, pointers) ---
+C 20 46
+C 21 18
+C 40 10
+C 41 F2
+C 42 20
+C 43 F2
+
+# --- setup scratch, absolute (operands) ---
+C F200 32
+C F201 13
+C F211 45
+C F222 19

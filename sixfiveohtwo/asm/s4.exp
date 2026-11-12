@@ -1,0 +1,190 @@
+# sixfiveohtwo stage 4 expectations.
+# Stack ops (PHA/PLA/PHP/PLP), SP tracking, JSR/RTS nesting, JMP abs,
+# JMP (ind) incl. the NMOS page-wrap bug.
+#
+# Marker order (= store order): $F001 after the PHA/PLA round trip,
+# $F002 after the PLA-of-$00 zero pull (stx keeps the pulled flags
+# intact), $F003 inside sub2 (deepest JSR level), $F004 inside sub1
+# after the inner call returned, $F005 in the JMP (ind) stub (normal
+# pointer), $F006 in the JMP (ind) stub (page-wrap pointer), $F000
+# final marker (reached on the main flow via the jmp jsec navigation
+# jump and the ind stubs' jumps back).
+#
+# JSR pushes return-1 (the address of its high operand byte; RTS adds
+# 1 back). jsr sub1 sits at $0263, so the outer return-1 is $0265
+# ($01FD=high $02, $01FC=low $65). jsr sub2 sits at $0283, so the
+# inner return-1 is $0285 ($01FB=high $02, $01FA=low $85). R P is the
+# PC when the marker store commits: the address of the instruction
+# right after the 3-byte marker sta/stx.
+
+M F001 C3
+
+F N 1
+F Z 0
+F C 0
+F V 0
+F D 0
+F I 1
+R A C3
+R X FD
+R Y 00
+R S FD
+R P 0214
+
+# --- PLA of $00: N=0, Z=1 (stx marker store does not touch flags) ---
+M F002 FD
+
+F N 0
+F Z 1
+F C 0
+F V 0
+F D 0
+F I 1
+R A 00
+R X FD
+R Y 00
+R S FD
+R P 0220
+
+# --- inside sub2 (deepest level): SP=$F9 after two JSRs; both
+# return-1 pairs on the stack; X=$F9 from sub2's TSX ---
+M F003 D2
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A D2
+R X F9
+R Y 00
+R S F9
+R P 029F
+
+# outer return-1 ($0259) at $01FD/$01FC
+C 01FD 02
+C 01FC 65
+# inner return-1 ($0285) at $01FB/$01FA
+C 01FB 02
+C 01FA 85
+
+# --- inside sub1, after the inner call returned: SP restored to $FB,
+# outer return-1 bytes intact below; X=$F9 left over from sub2 ---
+M F004 D1
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A D1
+R X F9
+R Y 00
+R S FB
+R P 0290
+
+C 01FD 02
+C 01FC 65
+
+# --- JMP (ind) stub, normal zero-page pointer ($52/$53 -> $0300) ---
+M F005 D5
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A D5
+R X FD
+R Y 00
+R S FD
+R P 030A
+
+# --- JMP (ind) stub, page-wrap pointer (low from $10FF, high from
+# $1000 through the NMOS wrap -> $0500) ---
+M F006 D4
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A D4
+R X FD
+R Y 00
+R S FD
+R P 050A
+
+# --- final marker: very last data write on the main flow. Preceded
+# by ldx #$E7, ldy #$38, clv (V=0), sec (C=1), lda #$96 (N=1, Z=0).
+# D and I are untouched reset values (SED/SEI/CLI never used). SP
+# balanced back to $FD by the two RTS. ---
+
+M F000 96
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A 96
+R X E7
+R Y 38
+R S FD
+R P 0613
+
+# --- PHA/PLA round trips and SP tracking via TSX ---
+C F100 FC
+C F101 C3
+C F102 FD
+C F103 00
+
+# --- PHP->PLA exact P bytes (B=1, bit5=1; second with N=1, C=1) ---
+C F104 34
+C F105 B5
+
+# --- PLP restores: C (adc #$00 probe $41) and Z ($60 guard) ---
+C F106 41
+C F107 60
+
+# --- JSR/RTS: SP inside sub1/sub2, sub2's store, sub1's store after
+# the inner call returned, SP after both RTS ---
+C F108 FB
+C F109 7E
+C F10A 3C
+C F10B FD
+C F10F F9
+
+# --- JMP abs skipped the poison; both ind jumps landed ---
+C F10C 11
+C F10D 33
+C F10E 55
+
+# --- fail/poison markers must NOT have been stored ---
+C F140 00
+C F141 00
+C F142 00
+C F143 00
+C F144 00
+C F145 00
+C F146 00
+C F147 00
+
+# --- stack bytes persist after both RTS (pulls never clear) ---
+C 01FD 02
+C 01FC 65
+C 01FB 02
+C 01FA 85
+
+# --- pointer setup scratch (zero page and wrap pointer pages) ---
+C 52 00
+C 53 03
+C 54 04
+C 10FF 00
+C 1000 05
+C 1100 06

@@ -1,0 +1,97 @@
+//! The 64K memory for the Fomu build, on two SPRAM hard cells.
+
+import ice40
+import types
+
+//> The computer's 64K of RAM, realized as two iCE40 UltraPlus
+//> SB_SPRAM256KA hard cells (16K x 16 each), one per 32K half.
+//>
+//> The CPU sees a byte-wide, synchronous-read memory: addr[15]
+//> selects the half, addr[15..1] (bits 14..1) is the 16-bit word
+//> index, and addr[0] picks the byte lane, steering the write into
+//> the low or high nibble pair through the SPRAM's write mask. Reads
+//> return the addressed byte of the selected half, registered on the
+//> clock edge (one cycle of read latency; the CPU runs a two-cycle
+//> bus protocol).
+//>
+//> The hard cells are instantiated directly (rather than left to
+//> yosys's memory inference) so the mapping to SPRAM is guaranteed:
+//> inference failed here, mapping both arrays to half a million
+//> flip-flops instead.
+pub mod Memory {
+    incoming clock : Clock
+    incoming addr : Word[16]
+    incoming wdata : Word[8]
+    incoming wren : Bit
+    outgoing rdata : Word[8] dependson addr
+
+    //> Which 32K half ($0000-$7FFF vs $8000-$FFFF).
+    wire sel : Bit {
+        it := addr[15]
+    }
+
+    //> The 16-bit word index within a half.
+    wire widx : Word[14] {
+        it := addr[15..1]
+    }
+
+    //> The byte lane within a 16-bit word (0 = low byte).
+    wire lane : Bit {
+        it := addr[0]
+    }
+
+    //> Nibble write masks: MASKWREN[1:0] gate the low byte's nibbles,
+    //> MASKWREN[3:2] the high byte's.
+    wire mask : Word[4] {
+        it := mux(lane, 0b1100w4, 0b0011w4)
+    }
+
+    //> Both nibble pairs carry the write byte; the mask steers it.
+    wire din : Word[16] {
+        it := word(wdata, wdata)
+    }
+
+    wire we_lo : Bit {
+        it := wren && !sel
+    }
+
+    wire we_hi : Bit {
+        it := wren && sel
+    }
+
+    mod lo of ice40::SbSpram256ka {
+        it.CLOCK := clock
+        it.ADDRESS := widx
+        it.DATAIN := din
+        it.MASKWREN := mask
+        it.WREN := we_lo
+        it.CHIPSELECT := true
+        it.STANDBY := false
+        it.SLEEP := false
+        it.POWEROFF := false
+    }
+
+    mod hi of ice40::SbSpram256ka {
+        it.CLOCK := clock
+        it.ADDRESS := widx
+        it.DATAIN := din
+        it.MASKWREN := mask
+        it.WREN := we_hi
+        it.CHIPSELECT := true
+        it.STANDBY := false
+        it.SLEEP := false
+        it.POWEROFF := false
+    }
+
+    wire lo_out : Word[16] {
+        it := lo.DATAOUT
+    }
+
+    wire hi_out : Word[16] {
+        it := hi.DATAOUT
+    }
+
+    rdata := mux(lane,
+        mux(sel, hi_out[16..8], lo_out[16..8]),
+        mux(sel, hi_out[8..0], lo_out[8..0]))
+}

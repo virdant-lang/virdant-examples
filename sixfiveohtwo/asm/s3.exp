@@ -1,0 +1,172 @@
+# sixfiveohtwo stage 3 expectations.
+# ALU ops: ORA/AND/EOR/ADC/SBC/CMP/CPX/CPY/BIT (binary mode).
+#
+# All checks apply at the single final marker (M line below): the last
+# data write is lda #$A5 / sta $F000, preceded by clv (V=0) and sec
+# (C=1); lda #$A5 leaves N=1, Z=0. D and I are untouched reset values
+# (SED/SEI/CLI/CLD never used). SP is untouched ($FD). X=$10 (ldx #$10
+# in the CPX block, never changed after), Y=$80 (ldy #$80 in the CPY
+# block, never changed after). PC is the address after the final
+# 3-byte sta $F000 at $052F.
+
+M F000 A5
+
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 1
+R A A5
+R X 10
+R Y 80
+R S FD
+R P 0532
+
+# --- ADC immediate: no carry-in, carry-in, Z/C, V/N, zero ---
+C F100 30
+C F101 31
+C F102 00
+C F103 01
+C F104 A0
+C F105 00
+C F106 01
+
+# --- SBC immediate: basic, C-chain, borrow, borrow-in, V ---
+C F107 20
+C F108 00
+C F109 E0
+C F10A FF
+C F10B A0
+
+# --- ADC/SBC across all non-immediate modes ---
+C F10C 50
+C F10D 25
+C F10E 20
+C F10F 35
+C F110 20
+C F111 90
+C F112 70
+C F113 00
+C F114 26
+C F115 20
+
+# --- ORA/AND/EOR results ---
+C F116 00
+C F117 8F
+C F118 00
+C F119 F0
+C F11A FF
+C F11B 81
+C F11C 0F
+C F11D 00
+C F11E FF
+C F11F F0
+C F120 30
+C F121 66
+C F122 7F
+C F123 EF
+C F124 55
+
+# --- CMP: register unmodified + Z proofs + C probes ---
+C F125 42
+C F126 11
+C F127 41
+C F128 50
+C F129 22
+C F12A 41
+C F12B 30
+C F12C 33
+C F12D 40
+C F12E 44
+C F12F 55
+
+# --- CPX: X unmodified, Z/C proofs, zp/abs cases ---
+C F130 30
+C F131 77
+C F132 41
+C F133 10
+C F134 88
+C F135 5A
+C F136 A5
+
+# --- CPY: Y unmodified, Z/C proofs, zp/abs cases ---
+C F137 40
+C F138 99
+C F139 41
+C F13A 10
+C F13B 66
+C F13C 90
+C F13D 9B
+C F13E C5
+
+# --- BIT: A unmodified, N/V/Z proofs ---
+C F13F BE
+C F140 FF
+C F141 C2
+C F142 40
+C F143 D4
+
+# --- V=1 guards: bvs taken (ADC $50+$50, SBC $50-$B0); fail
+# markers must NOT have been stored ---
+C F144 00
+C F145 00
+
+# --- setup scratch, zero page (operands, pointers, decoys) ---
+C 20 40
+C 21 AA
+C 22 20
+C 25 0F
+C 26 EE
+C 28 10
+C 2A F0
+C 2B 55
+C 2C 80
+C 2D 0F
+C 2E F0
+C 2F 00
+C 31 C0
+C 34 60
+C 35 F2
+C 36 D0
+C 37 F2
+C 3C D0
+C 3D F2
+C 40 70
+C 41 F2
+C 42 80
+C 43 F2
+C 44 B0
+C 45 F2
+C 46 E0
+C 47 F2
+C 48 F0
+C 49 F2
+C 4A 30
+C 4B 90
+
+# --- setup scratch, absolute (operands, pointers, decoys) ---
+C F210 30
+C F245 15
+C F252 20
+C F260 80
+C F271 30
+C F281 70
+C F290 C3
+C F291 0F
+C F292 FF
+C F2A0 11
+C F2A1 22
+C F2A2 40
+C F2A3 40
+C F2A4 15
+C F2A5 33
+C F2B0 DE
+C F2B1 EF
+C F2C0 00
+C F2C3 3C
+C F2D0 0F
+C F2E0 00
+C F2E1 AA
+C F2F0 AA
+C F2F1 20

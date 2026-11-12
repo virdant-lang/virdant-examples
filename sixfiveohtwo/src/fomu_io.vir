@@ -1,0 +1,70 @@
+//! Memory-mapped I/O for the Fomu build.
+
+//> The $FF00 I/O register.
+//>
+//> Writes light the RGB LED (bit0 red, bit1 green, bit2 blue; the
+//> pins are driven inverted, active-low). Reads return the touch-pad
+//> state in bits 3:0 (active-low: 0 = pressed). The readback is
+//> registered to match the memory's one-cycle read latency.
+//>
+//> The touch pads also drive the CPU's interrupt lines: touch1 is
+//> wired to NMI and touch2 to IRQ (a press asserts the active-low
+//> interrupt input).
+pub mod Io {
+    incoming clock : Clock
+    incoming reset : Bit
+
+    //> A CPU store to $FF00 commits this cycle.
+    incoming write : Bit
+    incoming wdata : Word[8]
+
+    //> Touch pads (active-low: 0 = pressed).
+    incoming touch1 : Bit
+    incoming touch2 : Bit
+    incoming touch3 : Bit
+    incoming touch4 : Bit
+
+    //> LED pins (active-low).
+    outgoing led_red : Bit
+    outgoing led_green : Bit
+    outgoing led_blue : Bit
+
+    //> Registered read data for $FF00 (one cycle after the address).
+    outgoing rdata : Word[8] {
+        it := pad_byte
+    }
+
+    //> Interrupt outputs (active-low), from the touch pads.
+    outgoing nmi_n : Bit dependson touch1
+    outgoing irq_n : Bit dependson touch2
+
+    reg leds : Word[8] {
+        if {
+            when reset {
+                it <= 0b001w8
+            }
+            when write {
+                it <= wdata
+            }
+        }
+    }
+
+    //> The touch byte, registered like the memory's read data.
+    reg pad_byte : Word[8] {
+        if {
+            when reset {
+                it <= 0xFFw8
+            }
+            else {
+                it <= word(0w4, touch1, touch2, touch3, touch4)
+            }
+        }
+    }
+
+    led_red := !leds[0]
+    led_green := !leds[1]
+    led_blue := !leds[2]
+
+    nmi_n := touch1
+    irq_n := touch2
+}

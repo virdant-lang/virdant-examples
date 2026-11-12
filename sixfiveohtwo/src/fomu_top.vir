@@ -1,0 +1,211 @@
+//! The sixfiveohtwo 6502 computer on the Fomu PVT board.
+
+import core
+import fomu_boot
+import fomu_io
+import fomu_memory
+import ice40
+import types
+
+//> Divides the pad clock down for the system logic.
+//>
+//> The processor's state machine, placed and routed on the UP5K,
+//> falls short of the 48 MHz pad clock (about 10 MHz placed); the
+//> divider gives it headroom. Implemented as an external Verilog
+//> module because Virdant cannot derive a Clock from logic yet; the
+//> implementation is a registered toggle, so the divided clock is
+//> glitch-free.
+@cell("ClkDiv")
+ext mod ClkDiv {
+    incoming clock : Clock
+    //> The divided system clock (one eighth of `clock`).
+    outgoing sys_clk : Clock
+}
+
+//> Routes the processor's bus to the memory and the I/O registers.
+//>
+//> The CPU's client socket connects here; stores to $FF00 are flagged
+//> for the I/O registers and everything else goes to RAM. The read
+//> mux selects the registered I/O readback or the memory's registered
+//> output — both are valid on the CPU's data cycle.
+mod BusBridge {
+    //> The processor side of the bus.
+    server socket busif of types::Bus {
+        it.data := data_mux
+    }
+
+    //> The current bus address (the processor drives it).
+    outgoing addr : Word[16]
+
+    //> The byte being written (0 when reading).
+    outgoing wdata : Word[8]
+
+    //> A store commits this cycle.
+    outgoing wren : Bit
+
+    //> The store targets the I/O register at $FF00.
+    outgoing io_select : Bit
+
+    //> The memory's registered read data.
+    incoming mem_rdata : Word[8]
+
+    //> The I/O registers' registered read data.
+    incoming io_rdata : Word[8]
+
+    wire io_sel : Bit {
+        it := busif.addr == 0xFF00w16
+    }
+
+    wire wr_data : Word[8] {
+        it := match busif.write {
+            with @Valid(d) => d
+            with @Invalid() => 0w8
+        }
+    }
+
+    wire wr_en : Bit {
+        it := match busif.write {
+            with @Valid(dontcare) => true
+            with @Invalid() => false
+        }
+    }
+
+    wire data_mux : Word[8] {
+        it := mux(io_sel, io_rdata, mem_rdata)
+    }
+
+    addr := busif.addr
+
+    wdata := wr_data
+
+    wren := wr_en
+
+    io_select := io_sel
+}
+
+//> The 6502 computer for Fomu.
+//>
+//> Memory is 64K of SPRAM (synchronous read; the CPU runs a two-cycle
+//> bus protocol). At power-on a boot ROM copies the program image
+//> from SPI flash offset $80000 into memory, then releases the CPU,
+//> which fetches its reset vector from $FFFC like any 6502.
+//>
+//> Memory map: $0000-$FEFF RAM; $FF00 is I/O (write: LED byte with
+//> bit0 red, bit1 green, bit2 blue; read: touch pads in bits 3:0,
+//> active-low). touch1 is wired to NMI and touch2 to IRQ, so a pad
+//> press asserts the corresponding interrupt. The USB pins are held
+//> low (disconnected); uploads go through the Foboot bootloader.
+pub mod FomuTop for ice40::Fomu {
+    incoming clock : Clock
+    outgoing led_red : Bit
+    outgoing led_green : Bit
+    outgoing led_blue : Bit
+    incoming touch1 : Bit
+    incoming touch2 : Bit
+    incoming touch3 : Bit
+    incoming touch4 : Bit
+    outgoing usb_dp : Bit
+    outgoing usb_dn : Bit
+    outgoing usb_dp_pu : Bit
+    outgoing flash_cs : Bit
+    outgoing flash_clk : Bit
+    outgoing flash_mosi : Bit
+    incoming flash_miso : Bit
+
+    // -- power-on reset --
+    //>
+    //> FPGA flip-flops come up zero; count 64 cycles so every
+    //> submodule sees a clean reset pulse before the boot starts.
+    reg por_cnt : Word[6] on sys_clk {
+        if {
+            when !por_done {
+                it <= it + 1w6
+            }
+        }
+    }
+
+    wire por_done : Bit {
+        it := por_cnt == 0x3Fw6
+    }
+
+    wire por_reset : Bit {
+        it := !por_done
+    }
+
+    // -- system clock --
+    //> Everything runs on the divided clock; only the divider itself
+    //> runs on the pad clock.
+    mod clkdiv of ClkDiv {
+        it.clock := clock
+    }
+
+    wire sys_clk : Clock {
+        it := clkdiv.sys_clk
+    }
+
+    // -- boot ROM: copies the program from flash into memory --
+    mod boot of fomu_boot::Boot {
+        it.clock := sys_clk
+        it.reset := por_reset
+        it.flash_miso := flash_miso
+    }
+
+    flash_cs := boot.flash_cs
+    flash_clk := boot.flash_clk
+    flash_mosi := boot.flash_mosi
+
+    // -- memory-mapped I/O --
+    mod io of fomu_io::Io {
+        it.clock := sys_clk
+        it.reset := por_reset
+        it.write := bridge.wren && bridge.io_select
+        it.wdata := bridge.wdata
+        it.touch1 := touch1
+        it.touch2 := touch2
+        it.touch3 := touch3
+        it.touch4 := touch4
+    }
+
+    led_red := io.led_red
+    led_green := io.led_green
+    led_blue := io.led_blue
+
+    // -- the processor --
+    //> Held in reset until the boot ROM finishes.
+    wire cpu_reset : Bit {
+        it := por_reset || !boot.done
+    }
+
+    mod cpu of core::Core {
+        it.clock := sys_clk
+        it.reset := cpu_reset
+        it.irq_n := io.irq_n
+        it.nmi_n := io.nmi_n
+    }
+
+    // -- memory --
+    //> While booting, the boot ROM owns the memory write port;
+    //> afterwards the CPU does.
+    wire boot_active : Bit {
+        it := !boot.done
+    }
+
+    mod mem of fomu_memory::Memory {
+        it.clock := sys_clk
+        it.addr := mux(boot_active, boot.mem_addr, bridge.addr)
+        it.wdata := mux(boot_active, boot.mem_wdata, bridge.wdata)
+        it.wren := mux(boot_active, boot.mem_wren, bridge.wren && !bridge.io_select)
+    }
+
+    mod bridge of BusBridge {
+        it.mem_rdata := mem.rdata
+        it.io_rdata := io.rdata
+    }
+
+    cpu.busif :=: bridge.busif
+
+    // -- USB: disconnected --
+    usb_dp := false
+    usb_dn := false
+    usb_dp_pu := false
+}

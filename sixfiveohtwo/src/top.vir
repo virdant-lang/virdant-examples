@@ -1,0 +1,26 @@
+//! The sixfiveohtwo 6502 processor.
+
+import core
+import types
+
+//> Top-level 6502 processor.
+//>
+//> Attach async-read memory (or a testbench model) to the bus socket.
+pub mod Top {
+    incoming clock : Clock
+    incoming reset : Bit
+    incoming irq_n : Bit
+    incoming nmi_n : Bit
+
+    //> The external memory bus.
+    client socket busif of types::Bus
+
+    mod cpu of core::Core {
+        it.clock := clock
+        it.reset := reset
+        it.irq_n := irq_n
+        it.nmi_n := nmi_n
+    }
+
+    cpu.busif :=: busif
+}

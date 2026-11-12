@@ -1,0 +1,5 @@
+[project]
+name = "sixfiveohtwo"
+
+[prog]
+top = "fomu_top::FomuTop"

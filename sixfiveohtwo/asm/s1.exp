@@ -1,0 +1,47 @@
+# sixfiveohtwo stage 1 expectations.
+# Loads, stores, transfers, inc/dec, flag ops.
+
+M F001 80
+F N 1
+F Z 0
+
+M F000 C6
+F N 0
+F Z 1
+F C 1
+F V 0
+F D 1
+F I 1
+R A 00
+R X C6
+R Y FF
+R S 77
+
+C F100 42
+C F101 80
+C F102 00
+C F103 DE
+C F104 AD
+C F105 11
+C F106 22
+C F107 DE
+C F108 AD
+C F109 DE
+C F10A AD
+C F10B 5A
+C F10C C3
+C F10D 99
+C F10E 66
+C F10F FD
+C F111 77
+C F112 78
+C F113 77
+C F114 67
+C F115 66
+C F116 00
+C F117 FF
+C F118 00
+C F119 FF
+C F11A 00
+C F110 AD
+C 10 DE

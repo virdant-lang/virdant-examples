@@ -1,0 +1,33 @@
+# hw1 expectations (Fomu color-cycling demo).
+# The LED cycles through 8 color values (0-7) with a visible delay
+# between each step.  The program never terminates; these records
+# check the init marker and the first few color transitions.
+
+# --- init: $F000 = $A5, $F001 = $01 (red) ---
+M F000 A5
+M F001 01
+F I 1
+
+# --- main loop: $01 → $02 (green) ---
+M F001 02
+
+# --- $02 → $03 (yellow) ---
+M F001 03
+
+# --- $03 → $04 (blue) ---
+M F001 04
+
+# --- $04 → $05 (magenta) ---
+M F001 05
+
+# --- $05 → $06 (cyan) ---
+M F001 06
+
+# --- $06 → $07 (white) ---
+M F001 07
+
+# --- $07 → $00 (off) ---
+M F001 00
+
+# --- $00 → $01 (red again) ---
+M F001 01

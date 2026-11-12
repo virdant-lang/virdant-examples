@@ -1,0 +1,210 @@
+//! The SPI boot ROM for the Fomu build.
+
+//> The boot stage: shift the command and address bytes, stream the
+//> program into memory, then hand over.
+enum type BootStage {
+    //> Shifting the $03 command and the 24-bit address.
+    Load = 0w8
+    //> Streaming program bytes into memory.
+    Data = 1w8
+    //> The full 64K image is copied; the SPI bus is released.
+    Done = 2w8
+}
+
+//> Boot ROM: copies a 64K program image from SPI flash into memory.
+//>
+//> At reset it drives the flash with SPI mode 0: the $03 (READ)
+//> command, the 24-bit source address, then 65536 bytes streamed
+//> into memory starting at address 0. SPI runs at half the system
+//> clock (one bit per two cycles, ~24 Mbit/s at 48 MHz; the full
+//> image takes ~22 ms). While running, the module owns the memory
+//> write port; when done, `done` rises and the CPU is released.
+//>
+//> SPI convention: mosi is sampled by the flash on spi_clk rising
+//> edges; the flash updates miso on falling edges; the boot ROM
+//> samples miso on rising edges.
+pub mod Boot {
+    incoming clock : Clock
+    //> Power-on reset (active-high).
+    incoming reset : Bit
+    //> Flash data input.
+    incoming flash_miso : Bit
+
+    //> Flash chip select (active-low; asserted while booting).
+    outgoing flash_cs : Bit
+    //> Flash clock (half the system clock; idle low).
+    outgoing flash_clk : Bit
+    //> Flash data output.
+    outgoing flash_mosi : Bit
+
+    //> Memory write port, driven while booting.
+    outgoing mem_addr : Word[16]
+    outgoing mem_wdata : Word[8] dependson flash_miso
+    outgoing mem_wren : Bit
+
+    //> Rises when the program image is fully copied.
+    outgoing done : Bit
+
+    reg running : Bit {
+        if {
+            when reset {
+                it <= true
+            }
+            when data_write && bytecnt == 0xFFFFw17 {
+                it <= false
+            }
+        }
+    }
+
+    reg stage : BootStage {
+        if {
+            when reset {
+                it <= #Load
+            }
+            when stage_to_data {
+                it <= #Data
+            }
+            when data_write && bytecnt == 0xFFFFw17 {
+                it <= #Done
+            }
+        }
+    }
+
+    //> The SPI clock line: toggles every cycle while booting.
+    reg spi_clk : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when running {
+                it <= !it
+            }
+        }
+    }
+
+    //> Bits completed within the current byte (0-7).
+    reg bitcnt : Word[4] {
+        if {
+            when reset {
+                it <= 0w4
+            }
+            when byte_complete {
+                it <= 0w4
+            }
+            when rising {
+                it <= it + 1w4
+            }
+        }
+    }
+
+    //> Pre-data bytes sent (0 = command, 1-3 = address).
+    reg byte_idx : Word[4] {
+        if {
+            when reset {
+                it <= 0w4
+            }
+            when byte_complete && stage == #Load {
+                it <= it + 1w4
+            }
+        }
+    }
+
+    //> Program bytes copied so far.
+    reg bytecnt : Word[17] {
+        if {
+            when reset {
+                it <= 0w17
+            }
+            when data_write {
+                it <= it + 1w17
+            }
+        }
+    }
+
+    //> Transmit shift register (MSB first).
+    reg tx : Word[8] {
+        if {
+            when reset {
+                it <= 0x03w8
+            }
+            when byte_complete && stage == #Load {
+                it <= tx_next
+            }
+            when falling && bitcnt != 0w4 {
+                it <= word(it[7..0], 0w1)
+            }
+        }
+    }
+
+    //> Receive shift register (samples miso at each rising edge).
+    reg rx : Word[8] {
+        if {
+            when rising {
+                it <= word(it[7..0], flash_miso)
+            }
+        }
+    }
+
+    reg done_r : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when data_write && bytecnt == 0xFFFFw17 {
+                it <= true
+            }
+        }
+    }
+
+    //> Load-stage operand byte completed: advance stage to Data.
+    //> (A wire, so the stage reg's own driver block never reads the
+    //> reg name.)
+    wire stage_to_data : Bit {
+        it := byte_complete && stage == #Load && byte_idx == 3w4
+    }
+
+    //> A rising spi_clk edge happens at the end of this cycle: the
+    //> flash samples mosi, and this module samples miso.
+    wire rising : Bit {
+        it := running && !spi_clk
+    }
+
+    //> A falling spi_clk edge happens at the end of this cycle: the
+    //> flash presents the next miso bit, and the next mosi bit is set.
+    wire falling : Bit {
+        it := running && spi_clk
+    }
+
+    //> The eighth bit of the current byte completes at this edge.
+    wire byte_complete : Bit {
+        it := rising && bitcnt == 7w4
+    }
+
+    //> A program byte commits to memory at this edge.
+    wire data_write : Bit {
+        it := byte_complete && stage == #Data
+    }
+
+    //> The next command/address byte to transmit.
+    //>
+    //> The 24-bit source address $080000 shifts out MSB-first as the
+    //> bytes $08, $00, $00 (the first byte carries A[23:16] = $08;
+    //> sending $80 instead would address 8 MiB, past the 4 MiB part).
+    wire tx_next : Word[8] {
+        it := match byte_idx {
+            with 0w4 => 0x08w8
+            else => 0x00w8
+        }
+    }
+
+    done := done_r
+
+    flash_cs := !running
+    flash_clk := spi_clk
+    flash_mosi := tx[7]
+
+    // The byte currently being assembled; complete at the write edge.
+    mem_wdata := word(rx[7..0], flash_miso)
+    mem_addr := bytecnt[16..0]
+    mem_wren := data_write
+}

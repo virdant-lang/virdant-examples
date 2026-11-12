@@ -1,0 +1,5 @@
+# Appended to build/sixfiveohtwo.pcf by `vir bitstream`.
+# nextpnr's derived-clock detection constrains sys_clk to 12 MHz (it
+# mis-reads the ClkDiv toggle rate as divide-by-4; the divider is
+# divide-by-8, so sys_clk is 6 MHz). This constraint overrides that.
+set_frequency sys_clk 6.0

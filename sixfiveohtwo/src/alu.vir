@@ -1,0 +1,206 @@
+//! The sixfiveohtwo arithmetic-logic unit.
+
+import types
+
+//> Combinational ALU for the 6502.
+//>
+//> Computes the 9-bit sum `a + b + carry_in` for Adc/Sbc and the
+//> bitwise results otherwise. `Pass` forwards `a`. With `decimal`
+//> asserted, Adc/Sbc use the NMOS BCD algorithm (Bruce Clark model):
+//> decimal ADC takes N/V from the intermediate high-nibble sum and
+//> Z from the final BCD result; decimal SBC takes N/V/Z from the
+//> binary subtract while only the result and carry are decimal.
+//> (CMOS fixes all flags to the BCD result; NMOS does not.)
+pub mod Alu {
+    //> Left operand (accumulator, X, or Y).
+    incoming a : Word[8]
+    //> Right operand (the bus data).
+    incoming b : Word[8]
+    //> Operation selector.
+    incoming op : types::AluOp
+    //> Carry into Adc/Sbc (carry flag, or no-borrow for compares).
+    incoming carry_in : Bit
+    //> Decimal mode (D flag): BCD arithmetic for Adc/Sbc.
+    incoming decimal : Bit
+
+    outgoing result : Word[8] dependson a, b, op, carry_in, decimal {
+        it := mux(use_decimal, dec_result, bin_result)
+    }
+
+    //> The value Z is computed from: the result, except that decimal
+    //> SBC derives it from the binary subtract.
+    outgoing nz_source : Word[8] dependson a, b, op, carry_in, decimal {
+        it := mux(use_decimal, mux(is_adc, adc_result, sum_result), bin_result)
+    }
+
+    //> The N flag source: the result's bit 7, except decimal ADC takes
+    //> it from the intermediate high-nibble sum (NMOS behavior) and
+    //> decimal SBC from the binary subtract.
+    outgoing negative : Bit dependson a, b, op, carry_in, decimal {
+        it := mux(use_decimal, mux(is_adc, adc_high[7], sum_result[7]), bin_result[7])
+    }
+
+    //> Carry out of bit 7 for Adc/Sbc.
+    outgoing carry : Bit dependson a, b, op, carry_in, decimal {
+        it := mux(use_decimal, mux(is_adc, adc_carry, sbc_carry), bin_carry)
+    }
+
+    //> Signed overflow of bit 7 for Adc/Sbc.
+    outgoing overflow : Bit dependson a, b, op, carry_in, decimal {
+        it := mux(use_decimal, mux(is_adc, adc_overflow, bin_overflow), bin_overflow)
+    }
+
+    // -- Operation classification --
+
+    wire is_adc : Bit {
+        it := match op {
+            with #Adc => true
+            else => false
+        }
+    }
+
+    wire is_sbc : Bit {
+        it := match op {
+            with #Sbc => true
+            else => false
+        }
+    }
+
+    wire use_decimal : Bit {
+        it := decimal && (is_adc || is_sbc)
+    }
+
+    // -- Binary path --
+
+    //> The right operand complemented for subtraction.
+    wire addend : Word[8] {
+        it := mux(is_sbc, ~b, b)
+    }
+
+    //> 9-bit arithmetic sum.
+    wire sum : Word[9] {
+        it := word(0w1, a) + word(0w1, addend) + word(0w8, carry_in)
+    }
+
+    //> The 9-bit sum truncated to 8 bits.
+    wire sum_result : Word[8] {
+        it := sum[8..0]
+    }
+
+    wire bin_result : Word[8] {
+        it := match op {
+            with #Adc => sum_result
+            with #Sbc => sum_result
+            with #Or => a | b
+            with #And => a & b
+            with #Xor => a ^ b
+            with #Pass => a
+        }
+    }
+
+    wire bin_carry : Bit {
+        it := match op {
+            with #Adc => sum[8]
+            with #Sbc => sum[8]
+            else => carry_in
+        }
+    }
+
+    wire bin_overflow : Bit {
+        it := match op {
+            with #Sbc => (a[7] != b[7]) && (sum_result[7] != a[7])
+            else => (a[7] == b[7]) && (sum_result[7] != a[7])
+        }
+    }
+
+    // -- Decimal ADC (NMOS) --
+
+    //> Low-nibble sum including carry (5 bits).
+    wire adc_low : Word[5] {
+        it := word(0w1, a[4..0]) + word(0w1, b[4..0]) + word(0w4, carry_in)
+    }
+
+    //> The low nibble overflowed decimal digits.
+    wire adc_low_carry : Bit {
+        it := adc_low >= 0x0Aw5
+    }
+
+    //> High-nibble sum including the low carry (9 bits).
+    wire adc_high : Word[9] {
+        it := word(0w1, a & 0xF0w8) + word(0w1, b & 0xF0w8) + mux(adc_low_carry, 0x10w9, 0w9)
+    }
+
+    //> Decimal carry out.
+    wire adc_carry : Bit {
+        it := adc_high >= 0xA0w9
+    }
+
+    //> High sum after the decimal correction.
+    wire adc_high_adj : Word[9] {
+        it := mux(adc_carry, adc_high + 0x60w9, adc_high)
+    }
+
+    //> N/V come from the intermediate high-nibble sum.
+    wire adc_overflow : Bit {
+        it := (a[7] == b[7]) && (adc_high[7] != a[7])
+    }
+
+    //> Corrected low nibble.
+    wire adc_low_adj : Word[5] {
+        it := mux(adc_low_carry, adc_low + 0x6w5, adc_low)
+    }
+
+    //> Final BCD result (Z is computed from it by the core).
+    wire adc_result : Word[8] {
+        it := word(adc_high_adj[8..4], adc_low_adj[4..0])
+    }
+
+    // -- Decimal SBC (NMOS) --
+
+    //> Low-nibble difference including borrow (5-bit two's complement).
+    wire sbc_low : Word[5] {
+        it := word(0w1, a[4..0]) - word(0w1, b[4..0]) - word(0w4, !carry_in)
+    }
+
+    //> The low nibble borrowed.
+    wire sbc_borrow : Bit {
+        it := sbc_low[4]
+    }
+
+    //> Corrected low nibble.
+    wire sbc_low_adj : Word[5] {
+        it := mux(sbc_borrow, sbc_low - 0x6w5, sbc_low)
+    }
+
+    //> High-nibble difference including the borrow (9-bit two's complement).
+    wire sbc_high : Word[9] {
+        it := word(0w1, a & 0xF0w8) - word(0w1, b & 0xF0w8) - mux(sbc_borrow, 0x10w9, 0w9)
+    }
+
+    //> Decimal carry out = no high-nibble borrow.
+    wire sbc_carry : Bit {
+        it := !sbc_high_borrow
+    }
+
+    //> The high nibble borrowed (decimal carry = no borrow).
+    wire sbc_high_borrow : Bit {
+        it := sbc_high[8]
+    }
+
+    //> High nibble after the decimal correction (applies only when
+    //> the high nibble itself borrowed, not on a low-nibble borrow).
+    wire sbc_high_adj : Word[9] {
+        it := mux(sbc_high_borrow, sbc_high - 0x60w9, sbc_high)
+    }
+
+    //> Final BCD result; N/V/Z come from the binary subtract instead.
+    wire sbc_result : Word[8] {
+        it := word(sbc_high_adj[8..4], sbc_low_adj[4..0])
+    }
+
+    // -- Decimal result selection --
+
+    wire dec_result : Word[8] {
+        it := mux(is_adc, adc_result, sbc_result)
+    }
+}

@@ -1,0 +1,147 @@
+# sixfiveohtwo stage 6 expectations.
+# Interrupts: masked IRQ (I=1), unmasked IRQ, NMI (unmaskable), BRK
+# (pushes PC+2 with B=1), RTI flag restore, ISR register preservation.
+#
+# P records drive the active-low irq_n (I) / nmi_n (N) pins right
+# after the preceding marker is observed. The tb waits on the per-source
+# counters ($30 irq, $31 nmi, $32 brk) inside the ISRs to deassert the
+# irq level before RTI restores I=0 in phases 2 and 5 -- the pin is
+# level-sensitive, so a still-asserted level would re-trigger the IRQ
+# the moment RTI restores I=0.
+
+# --- phase 1: IRQ level asserted while I=1 -> masked ---
+# Vectors written at runtime: $FFFE/$FFFF = irq_isr ($0276),
+# $FFFA/$FFFB = nmi_isr ($028D).
+M F001 11
+F I 1
+C FFFE 76
+C FFFF 02
+C FFFA 8D
+C FFFB 02
+P I 0
+
+# Marker 2: main continued through the asserted level; irq counter
+# still 0 because I=1 masks it.
+M F002 22
+F I 1
+F N 0
+F Z 0
+C 30 00
+P I 1
+
+# --- phase 2: CLI unmasks -> IRQ taken, RTI restores I=0 ---
+M F003 33
+F I 0
+P I 0
+
+# Wait inside the ISR (irq counter just incremented to 1), then
+# deassert the level so the restored I=0 cannot re-trigger.
+M 30 01
+P I 1
+
+# Marker 4: after RTI. I=0 restored from the pushed P (entry had set
+# I=1); SP unwound; X/Y preserved by the ISR; stacked P captured with
+# B=0, I=0, N=V=D=Z=C=0 -> $20.
+M F004 55
+F I 0
+R A 55
+R X 44
+R Y 00
+R S FD
+C 30 01
+C F110 20
+
+# --- phase 3: NMI edge taken despite I=1 ---
+M F005 66
+F I 1
+P N 0
+
+# Marker 6: after the NMI ISR and RTI. The edge was taken although
+# I=1; stacked P captured with B=0, I=1 -> $24; irq counter untouched.
+M F006 77
+F I 1
+R A 77
+R X 44
+R Y 00
+R S FD
+C 30 01
+C 31 01
+C F111 24
+P N 1
+
+# --- phase 4: BRK pushes PC+2 with B=1; RTI resumes at brk_cont ---
+# Marker 7: stored by the continuation at brk_cont ($0245), proving
+# the padding byte was skipped. $32=1 proves the padding (itself a
+# BRK opcode) was never executed. The ISR captured the stacked P
+# ($B4: N=1, I=1, B=1) and the stacked PC = $0245 exactly, and the
+# vector was restored to irq_isr.
+M F007 88
+F I 1
+R A 88
+R X 44
+R Y 00
+R S FD
+C 32 01
+C F112 B4
+C F113 45
+C F114 02
+C FFFE 76
+C FFFF 02
+
+# --- phase 5: RTI restores N/C/I; ISR preserves A/X/Y ---
+# Flags at the marker: CLI (I=0), SEC (C=1), LDA #$80 (N=1, Z=0).
+M F008 80
+F N 1
+F Z 0
+F C 1
+F I 0
+P I 0
+
+# Wait inside the ISR (irq counter incremented to 2), then deassert
+# the level before RTI restores I=0.
+M 30 02
+P I 1
+
+# Marker 9: after RTI. The PHP/PLA byte $B1 (N=1, C=1, I=0, B=1,
+# bit5=1) proves RTI restored C/N and pulled I=0 from the stack
+# instead of leaving the interrupt's I=1. A/X/Y registers still hold
+# the pre-interrupt values the ISR preserved. Stacked P captured by
+# the ISR: $A1 (N=1, C=1, I=0, B=0).
+M F009 B1
+F N 1
+F Z 0
+F C 1
+F V 0
+F D 0
+F I 0
+R A B1
+R X 66
+R Y 33
+R S FD
+C 30 02
+C F110 A1
+C F120 80
+C F121 66
+C F122 33
+C F123 B1
+
+# --- final marker + complete final snapshot ---
+# clc (C=0), lda #$E5 (N=1, Z=0). I is still the RTI-restored 0.
+# All interrupt frames unwound: SP=$FD. PC = $0276, the address after
+# the final 3-byte sta $F000 at $0273.
+M F000 E5
+F N 1
+F Z 0
+F C 0
+F V 0
+F D 0
+F I 0
+R A E5
+R X 66
+R Y 33
+R S FD
+R P 0276
+C 30 02
+C 31 01
+C 32 01
+C 4E 66

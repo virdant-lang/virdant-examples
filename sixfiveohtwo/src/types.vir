@@ -1,0 +1,178 @@
+//! Shared types for the sixfiveohtwo 6502 core.
+
+//> The 6502 instruction mnemonics.
+//>
+//> Grows stage by stage; the value is an arbitrary stable tag.
+pub enum type Instruction {
+    //> No operation.
+    Nop = 0w8
+    //> Load accumulator from memory.
+    Lda = 1w8
+    //> Load index register X from memory.
+    Ldx = 2w8
+    //> Load index register Y from memory.
+    Ldy = 3w8
+    //> Store accumulator to memory.
+    Sta = 4w8
+    //> Store index register X to memory.
+    Stx = 5w8
+    //> Store index register Y to memory.
+    Sty = 6w8
+    //> Transfer accumulator to X.
+    Tax = 7w8
+    //> Transfer accumulator to Y.
+    Tay = 8w8
+    //> Transfer X to accumulator.
+    Txa = 9w8
+    //> Transfer Y to accumulator.
+    Tya = 10w8
+    //> Transfer stack pointer to X.
+    Tsx = 11w8
+    //> Transfer X to stack pointer.
+    Txs = 12w8
+    //> Clear carry flag.
+    Clc = 13w8
+    //> Set carry flag.
+    Sec = 14w8
+    //> Clear interrupt disable flag.
+    Cli = 15w8
+    //> Set interrupt disable flag.
+    Sei = 16w8
+    //> Clear overflow flag.
+    Clv = 17w8
+    //> Clear decimal flag.
+    Cld = 18w8
+    //> Set decimal flag.
+    Sed = 19w8
+    //> Increment X.
+    Inx = 20w8
+    //> Increment Y.
+    Iny = 21w8
+    //> Decrement X.
+    Dex = 22w8
+    //> Decrement Y.
+    Dey = 23w8
+    //> Branch if minus (N set).
+    Bmi = 24w8
+    //> Branch if not equal (Z clear).
+    Bne = 25w8
+    //> Branch if plus (N clear).
+    Bpl = 26w8
+    //> Branch if overflow set (V set).
+    Bvs = 27w8
+    //> Branch if carry clear.
+    Bcc = 28w8
+    //> Branch if carry set.
+    Bcs = 29w8
+    //> Branch if overflow clear.
+    Bvc = 30w8
+    //> Branch if equal (Z set).
+    Beq = 31w8
+    //> Bitwise OR with accumulator.
+    Ora = 32w8
+    //> Bitwise AND with accumulator.
+    And = 33w8
+    //> Bitwise exclusive OR with accumulator.
+    Eor = 34w8
+    //> Add with carry.
+    Adc = 35w8
+    //> Subtract with borrow.
+    Sbc = 36w8
+    //> Compare accumulator with memory.
+    Cmp = 37w8
+    //> Compare X with memory.
+    Cpx = 38w8
+    //> Compare Y with memory.
+    Cpy = 39w8
+    //> Bit test.
+    Bit = 40w8
+    //> Push accumulator.
+    Pha = 41w8
+    //> Pull accumulator.
+    Pla = 42w8
+    //> Push processor status.
+    Php = 43w8
+    //> Pull processor status.
+    Plp = 44w8
+    //> Jump.
+    Jmp = 45w8
+    //> Jump to subroutine.
+    Jsr = 46w8
+    //> Return from subroutine.
+    Rts = 47w8
+    //> Arithmetic shift left.
+    Asl = 48w8
+    //> Logical shift right.
+    Lsr = 49w8
+    //> Rotate left.
+    Rol = 50w8
+    //> Rotate right.
+    Ror = 51w8
+    //> Increment memory.
+    Inc = 52w8
+    //> Decrement memory.
+    Dec = 53w8
+    //> Force interrupt (software).
+    Brk = 54w8
+    //> Return from interrupt.
+    Rti = 55w8
+}
+
+//> ALU operation selector.
+pub enum type AluOp {
+    //> Bitwise OR (ORA).
+    Or = 0w8
+    //> Bitwise AND (AND).
+    And = 1w8
+    //> Bitwise XOR (EOR).
+    Xor = 2w8
+    //> Add with carry (ADC).
+    Adc = 3w8
+    //> Subtract with borrow (SBC, CMP, CPX, CPY).
+    Sbc = 4w8
+    //> Pass a through unchanged (loads).
+    Pass = 5w8
+}
+
+//> The 6502 addressing modes.
+//>
+//> Grows stage by stage.
+pub enum type AddressingMode {
+    //> Implied: no operand byte (also used for unknown opcodes).
+    Implied = 0w8
+    //> Immediate: operand byte follows the opcode.
+    Immediate = 1w8
+    //> Zero page: one address byte, address $00xx.
+    ZeroPage = 2w8
+    //> Absolute: two address bytes, low then high.
+    Absolute = 3w8
+    //> Zero page indexed by X: address $00(base + X), 8-bit wrap.
+    ZeroPageX = 4w8
+    //> Zero page indexed by Y: address $00(base + Y), 8-bit wrap.
+    ZeroPageY = 5w8
+    //> Absolute indexed by X: address = base + X, 16-bit.
+    AbsoluteX = 6w8
+    //> Absolute indexed by Y: address = base + Y, 16-bit.
+    AbsoluteY = 7w8
+    //> Indirect indexed by X: pointer fetched from $00(base + X).
+    IndirectX = 8w8
+    //> Indexed indirect: pointer fetched from $00(base), target + Y.
+    IndirectY = 9w8
+    //> Indirect: pointer fetched from base (JMP only).
+    Indirect = 10w8
+    //> Relative: signed offset byte (branches only).
+    Relative = 11w8
+    //> Accumulator operand (shifts on A).
+    Accumulator = 12w8
+}
+
+//> The 6502 external memory bus.
+//>
+//> The client (CPU) drives `addr` and `write`.
+//> A `@Valid` payload on `write` is a store; `@Invalid()` is a load.
+//> The server drives `data`, valid in the same cycle `addr` is driven.
+pub socket Bus {
+    cosi addr : Word[16]
+    cosi write : Valid[Word[8]] dependson data
+    soci data : Word[8] dependson addr
+}

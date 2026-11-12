@@ -1,0 +1,1523 @@
+//! The sixfiveohtwo 6502 processor core.
+//!
+//! Functional implementation of the NMOS 6502: one state per bus
+//! transaction, not cycle-exact with the real chip. The CPU expects
+//! async-read memory: `data` is valid in the same cycle `addr` is
+//! driven, and stores commit at the rising edge.
+
+import alu
+import types
+
+//> One state of the processor state machine.
+//>
+//> Each state drives one bus transaction and performs one register or
+//> flag update at the clock edge.
+union type CpuState {
+    //> Fetch the opcode at PC.
+    FetchOpcode()
+    //> Fetch an immediate operand, relative offset, or zero page address.
+    FetchOperand()
+    //> Fetch the low byte of an absolute address at PC.
+    FetchLow()
+    //> Fetch the high byte of an absolute address at PC.
+    FetchHigh()
+    //> Access memory at an effective address: load or store.
+    Access(addr : Word[16])
+    //> Fetch the low byte of a pointer (indexed/indirect modes).
+    ReadPointerLow(pointer_addr : Word[16])
+    //> Fetch the high byte of a pointer.
+    ReadPointerHigh(pointer_addr : Word[16])
+    //> Write the modified value back (RMW ops).
+    WriteModified(addr : Word[16])
+    //> Push a register or status byte (PHA/PHP).
+    PushValue()
+    //> Push the high byte of the return address (JSR; BRK/IRQ/NMI later).
+    PushPcHigh(software : Bit)
+    //> Push the low byte of the return address.
+    PushPcLow(software : Bit)
+    //> Push the status byte (B = software), set I, fetch the vector.
+    PushStatusInterrupt(software : Bit)
+    //> Pull the accumulator (PLA).
+    PullAccumulator()
+    //> Pull the processor status (PLP; RTI later).
+    PullProcessorStatus()
+    //> Pull the low byte of the return address (RTS; RTI later).
+    PullPcLow()
+    //> Pull the high byte of the return address.
+    PullPcHigh()
+    //> Fetch the low byte of a vector (reset for now).
+    FetchVectorLow(vector_addr : Word[16])
+    //> Fetch the high byte of a vector.
+    FetchVectorHigh(vector_addr : Word[16])
+}
+
+//> The 6502 processor core.
+pub mod Core {
+    incoming clock : Clock
+    incoming reset : Bit
+    incoming irq_n : Bit
+    incoming nmi_n : Bit
+
+    //> Bus-cycle phase for wait-state memory: register updates fire
+    //> only on the second cycle of each bus transaction, when
+    //> synchronous-read memory (block RAM) data is valid.
+    reg tick : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            else {
+                it <= !it
+            }
+        }
+    }
+
+    // -- State classification --
+
+    wire is_fetching_opcode : Bit {
+        it := (match state {
+            with @FetchOpcode() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_fetching_operand : Bit {
+        it := (match state {
+            with @FetchOperand() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_fetching_low : Bit {
+        it := (match state {
+            with @FetchLow() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_fetching_high : Bit {
+        it := (match state {
+            with @FetchHigh() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_fetching_vector_low : Bit {
+        it := (match state {
+            with @FetchVectorLow(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_fetching_vector_high : Bit {
+        it := (match state {
+            with @FetchVectorHigh(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_reading_pointer_low : Bit {
+        it := (match state {
+            with @ReadPointerLow(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    //> The pointer address being read in a ReadPointerLow state.
+    wire pointer_addr : Word[16] {
+        it := match state {
+            with @ReadPointerLow(addr) => addr
+            else => 0w16
+        }
+    }
+
+    wire is_pushing_value : Bit {
+        it := (match state {
+            with @PushValue() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pushing_pc_high : Bit {
+        it := (match state {
+            with @PushPcHigh(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pushing_pc_low : Bit {
+        it := (match state {
+            with @PushPcLow(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pulling_a : Bit {
+        it := (match state {
+            with @PullAccumulator() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pulling_status : Bit {
+        it := (match state {
+            with @PullProcessorStatus() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pulling_pc_high : Bit {
+        it := (match state {
+            with @PullPcHigh() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pulling_pc_low : Bit {
+        it := (match state {
+            with @PullPcLow() => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pushing_status_interrupt : Bit {
+        it := (match state {
+            with @PushStatusInterrupt(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_pushing : Bit {
+        it := is_pushing_value || is_pushing_pc_high || is_pushing_pc_low || is_pushing_status_interrupt
+    }
+
+    wire is_pulling : Bit {
+        it := is_pulling_a || is_pulling_status || is_pulling_pc_low || is_pulling_pc_high
+    }
+
+    //> A JMP/JSR is consuming the absolute target's high byte.
+    wire is_absolute_jump : Bit {
+        it := is_fetching_high && (match mode {
+            with #Absolute => true
+            else => false
+        }) && (match instruction {
+            with #Jmp => true
+            with #Jsr => true
+            else => false
+        })
+    }
+
+    //> A JMP (ind) is completing through the pointer high byte.
+    wire is_indirect_jump : Bit {
+        it := (match state {
+            with @ReadPointerHigh(dontcare) => true
+            else => false
+        }) && (match mode {
+            with #Indirect => true
+            else => false
+        }) && tick
+    }
+
+    //> The effective address being accessed in an Access state.
+    wire access_addr : Word[16] {
+        it := match state {
+            with @Access(addr) => addr
+            else => 0w16
+        }
+    }
+
+    wire is_writing_modified : Bit {
+        it := (match state {
+            with @WriteModified(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    wire is_accessing_memory : Bit {
+        it := (match state {
+            with @Access(dontcare) => true
+            else => false
+        }) && tick
+    }
+
+    // -- Interrupts --
+
+    //> An NMI edge is pending (falling edge on nmi_n: low now, high
+    //> the previous cycle).
+    wire nmi_edge : Bit {
+        it := !nmi_n && nmi_prev
+    }
+
+    //> The CPU should service an interrupt at the opcode-fetch edge.
+    wire interrupt_pending : Bit {
+        it := nmi_pending || (!irq_n && !flag_i)
+    }
+
+    //> The vector address for the interrupt being serviced.
+    wire interrupt_vector : Word[16] {
+        it := mux(serving_nmi, 0xFFFAw16, 0xFFFEw16)
+    }
+
+    // -- Stack --
+
+    //> Push address: $0100 + SP.
+    wire stack_push_addr : Word[16] {
+        it := word(0x01w8, sp)
+    }
+
+    //> Pull address: $0100 + SP + 1.
+    wire stack_pull_addr : Word[16] {
+        it := word(0x01w8, sp + 1w8)
+    }
+
+    //> The status byte as pushed by PHP (B=1, bit5=1).
+    wire status_byte : Word[8] {
+        it := word(flag_n, flag_v, true, true, flag_d, flag_i, flag_z, flag_c)
+    }
+
+    //> The status byte pushed by an interrupt or BRK (B = software).
+    wire interrupt_status : Word[8] {
+        it := match state {
+            with @PushStatusInterrupt(software) => word(flag_n, flag_v, true, software, flag_d, flag_i, flag_z, flag_c)
+            else => dontcare
+        }
+    }
+
+    //> The value pushed by PHA/PHP.
+    wire push_value : Word[8] {
+        it := match instruction {
+            with #Pha => a
+            with #Php => status_byte
+            else => dontcare
+        }
+    }
+
+    // -- Decode --
+
+    //> The opcode being decoded: fresh from the bus during an opcode
+    //> fetch, otherwise the latched instruction register.
+    wire decode_opcode : Word[8] {
+        it := mux(is_fetching_opcode, busif.data, ir)
+    }
+
+    // The opcode table is duplicated across these two matches; keep
+    // them in sync. (Struct literals pack inconsistently with struct
+    // field projection in this compiler version, so a single match
+    // into a struct is avoided.)
+    wire instruction : types::Instruction {
+        it := match decode_opcode : Word[8] {
+            with 0xA9w8 => #Lda
+            with 0xA5w8 => #Lda
+            with 0xADw8 => #Lda
+            with 0xA2w8 => #Ldx
+            with 0xA6w8 => #Ldx
+            with 0xAEw8 => #Ldx
+            with 0xA0w8 => #Ldy
+            with 0xA4w8 => #Ldy
+            with 0xACw8 => #Ldy
+            with 0x85w8 => #Sta
+            with 0x8Dw8 => #Sta
+            with 0x86w8 => #Stx
+            with 0x8Ew8 => #Stx
+            with 0x84w8 => #Sty
+            with 0x8Cw8 => #Sty
+            with 0xAAw8 => #Tax
+            with 0xA8w8 => #Tay
+            with 0x8Aw8 => #Txa
+            with 0x98w8 => #Tya
+            with 0xBAw8 => #Tsx
+            with 0x9Aw8 => #Txs
+            with 0x18w8 => #Clc
+            with 0x38w8 => #Sec
+            with 0x58w8 => #Cli
+            with 0x78w8 => #Sei
+            with 0xB8w8 => #Clv
+            with 0xD8w8 => #Cld
+            with 0xF8w8 => #Sed
+            with 0xE8w8 => #Inx
+            with 0xC8w8 => #Iny
+            with 0xCAw8 => #Dex
+            with 0x88w8 => #Dey
+            with 0xB5w8 => #Lda
+            with 0xBDw8 => #Lda
+            with 0xB9w8 => #Lda
+            with 0xA1w8 => #Lda
+            with 0xB1w8 => #Lda
+            with 0xB6w8 => #Ldx
+            with 0xBEw8 => #Ldx
+            with 0xB4w8 => #Ldy
+            with 0xBCw8 => #Ldy
+            with 0x95w8 => #Sta
+            with 0x9Dw8 => #Sta
+            with 0x99w8 => #Sta
+            with 0x81w8 => #Sta
+            with 0x91w8 => #Sta
+            with 0x96w8 => #Stx
+            with 0x94w8 => #Sty
+            with 0x10w8 => #Bpl
+            with 0x30w8 => #Bmi
+            with 0x50w8 => #Bvc
+            with 0x70w8 => #Bvs
+            with 0x90w8 => #Bcc
+            with 0xB0w8 => #Bcs
+            with 0xD0w8 => #Bne
+            with 0xF0w8 => #Beq
+            with 0x09w8 => #Ora
+            with 0x05w8 => #Ora
+            with 0x15w8 => #Ora
+            with 0x0Dw8 => #Ora
+            with 0x1Dw8 => #Ora
+            with 0x19w8 => #Ora
+            with 0x01w8 => #Ora
+            with 0x11w8 => #Ora
+            with 0x29w8 => #And
+            with 0x25w8 => #And
+            with 0x35w8 => #And
+            with 0x2Dw8 => #And
+            with 0x3Dw8 => #And
+            with 0x39w8 => #And
+            with 0x21w8 => #And
+            with 0x31w8 => #And
+            with 0x49w8 => #Eor
+            with 0x45w8 => #Eor
+            with 0x55w8 => #Eor
+            with 0x4Dw8 => #Eor
+            with 0x5Dw8 => #Eor
+            with 0x59w8 => #Eor
+            with 0x41w8 => #Eor
+            with 0x51w8 => #Eor
+            with 0x69w8 => #Adc
+            with 0x65w8 => #Adc
+            with 0x75w8 => #Adc
+            with 0x6Dw8 => #Adc
+            with 0x7Dw8 => #Adc
+            with 0x79w8 => #Adc
+            with 0x61w8 => #Adc
+            with 0x71w8 => #Adc
+            with 0xE9w8 => #Sbc
+            with 0xE5w8 => #Sbc
+            with 0xF5w8 => #Sbc
+            with 0xEDw8 => #Sbc
+            with 0xFDw8 => #Sbc
+            with 0xF9w8 => #Sbc
+            with 0xE1w8 => #Sbc
+            with 0xF1w8 => #Sbc
+            with 0xC9w8 => #Cmp
+            with 0xC5w8 => #Cmp
+            with 0xD5w8 => #Cmp
+            with 0xCDw8 => #Cmp
+            with 0xDDw8 => #Cmp
+            with 0xD9w8 => #Cmp
+            with 0xC1w8 => #Cmp
+            with 0xD1w8 => #Cmp
+            with 0xE0w8 => #Cpx
+            with 0xE4w8 => #Cpx
+            with 0xECw8 => #Cpx
+            with 0xC0w8 => #Cpy
+            with 0xC4w8 => #Cpy
+            with 0xCCw8 => #Cpy
+            with 0x24w8 => #Bit
+            with 0x2Cw8 => #Bit
+            with 0x00w8 => #Brk
+            with 0x40w8 => #Rti
+            with 0x0Aw8 => #Asl
+            with 0x06w8 => #Asl
+            with 0x16w8 => #Asl
+            with 0x0Ew8 => #Asl
+            with 0x1Ew8 => #Asl
+            with 0x4Aw8 => #Lsr
+            with 0x46w8 => #Lsr
+            with 0x56w8 => #Lsr
+            with 0x4Ew8 => #Lsr
+            with 0x5Ew8 => #Lsr
+            with 0x2Aw8 => #Rol
+            with 0x26w8 => #Rol
+            with 0x36w8 => #Rol
+            with 0x2Ew8 => #Rol
+            with 0x3Ew8 => #Rol
+            with 0x6Aw8 => #Ror
+            with 0x66w8 => #Ror
+            with 0x76w8 => #Ror
+            with 0x6Ew8 => #Ror
+            with 0x7Ew8 => #Ror
+            with 0xE6w8 => #Inc
+            with 0xF6w8 => #Inc
+            with 0xEEw8 => #Inc
+            with 0xFEw8 => #Inc
+            with 0xC6w8 => #Dec
+            with 0xD6w8 => #Dec
+            with 0xCEw8 => #Dec
+            with 0xDEw8 => #Dec
+            with 0x48w8 => #Pha
+            with 0x68w8 => #Pla
+            with 0x08w8 => #Php
+            with 0x28w8 => #Plp
+            with 0x4Cw8 => #Jmp
+            with 0x6Cw8 => #Jmp
+            with 0x20w8 => #Jsr
+            with 0x60w8 => #Rts
+            with 0xEAw8 => #Nop
+            // Unknown opcodes act as one-cycle NOPs.
+            else => #Nop
+        }
+    }
+
+    wire mode : types::AddressingMode {
+        it := match decode_opcode : Word[8] {
+            with 0xA9w8 => #Immediate
+            with 0xA5w8 => #ZeroPage
+            with 0xADw8 => #Absolute
+            with 0xA2w8 => #Immediate
+            with 0xA6w8 => #ZeroPage
+            with 0xAEw8 => #Absolute
+            with 0xA0w8 => #Immediate
+            with 0xA4w8 => #ZeroPage
+            with 0xACw8 => #Absolute
+            with 0x85w8 => #ZeroPage
+            with 0x8Dw8 => #Absolute
+            with 0x86w8 => #ZeroPage
+            with 0x8Ew8 => #Absolute
+            with 0x84w8 => #ZeroPage
+            with 0x8Cw8 => #Absolute
+            with 0xAAw8 => #Implied
+            with 0xA8w8 => #Implied
+            with 0x8Aw8 => #Implied
+            with 0x98w8 => #Implied
+            with 0xBAw8 => #Implied
+            with 0x9Aw8 => #Implied
+            with 0x18w8 => #Implied
+            with 0x38w8 => #Implied
+            with 0x58w8 => #Implied
+            with 0x78w8 => #Implied
+            with 0xB8w8 => #Implied
+            with 0xD8w8 => #Implied
+            with 0xF8w8 => #Implied
+            with 0xE8w8 => #Implied
+            with 0xC8w8 => #Implied
+            with 0xCAw8 => #Implied
+            with 0x88w8 => #Implied
+            with 0xB5w8 => #ZeroPageX
+            with 0xBDw8 => #AbsoluteX
+            with 0xB9w8 => #AbsoluteY
+            with 0xA1w8 => #IndirectX
+            with 0xB1w8 => #IndirectY
+            with 0xB6w8 => #ZeroPageY
+            with 0xBEw8 => #AbsoluteY
+            with 0xB4w8 => #ZeroPageX
+            with 0xBCw8 => #AbsoluteX
+            with 0x95w8 => #ZeroPageX
+            with 0x9Dw8 => #AbsoluteX
+            with 0x99w8 => #AbsoluteY
+            with 0x81w8 => #IndirectX
+            with 0x91w8 => #IndirectY
+            with 0x96w8 => #ZeroPageY
+            with 0x94w8 => #ZeroPageX
+            with 0x10w8 => #Relative
+            with 0x30w8 => #Relative
+            with 0x50w8 => #Relative
+            with 0x70w8 => #Relative
+            with 0x90w8 => #Relative
+            with 0xB0w8 => #Relative
+            with 0xD0w8 => #Relative
+            with 0xF0w8 => #Relative
+            with 0x09w8 => #Immediate
+            with 0x05w8 => #ZeroPage
+            with 0x15w8 => #ZeroPageX
+            with 0x0Dw8 => #Absolute
+            with 0x1Dw8 => #AbsoluteX
+            with 0x19w8 => #AbsoluteY
+            with 0x01w8 => #IndirectX
+            with 0x11w8 => #IndirectY
+            with 0x29w8 => #Immediate
+            with 0x25w8 => #ZeroPage
+            with 0x35w8 => #ZeroPageX
+            with 0x2Dw8 => #Absolute
+            with 0x3Dw8 => #AbsoluteX
+            with 0x39w8 => #AbsoluteY
+            with 0x21w8 => #IndirectX
+            with 0x31w8 => #IndirectY
+            with 0x49w8 => #Immediate
+            with 0x45w8 => #ZeroPage
+            with 0x55w8 => #ZeroPageX
+            with 0x4Dw8 => #Absolute
+            with 0x5Dw8 => #AbsoluteX
+            with 0x59w8 => #AbsoluteY
+            with 0x41w8 => #IndirectX
+            with 0x51w8 => #IndirectY
+            with 0x69w8 => #Immediate
+            with 0x65w8 => #ZeroPage
+            with 0x75w8 => #ZeroPageX
+            with 0x6Dw8 => #Absolute
+            with 0x7Dw8 => #AbsoluteX
+            with 0x79w8 => #AbsoluteY
+            with 0x61w8 => #IndirectX
+            with 0x71w8 => #IndirectY
+            with 0xE9w8 => #Immediate
+            with 0xE5w8 => #ZeroPage
+            with 0xF5w8 => #ZeroPageX
+            with 0xEDw8 => #Absolute
+            with 0xFDw8 => #AbsoluteX
+            with 0xF9w8 => #AbsoluteY
+            with 0xE1w8 => #IndirectX
+            with 0xF1w8 => #IndirectY
+            with 0xC9w8 => #Immediate
+            with 0xC5w8 => #ZeroPage
+            with 0xD5w8 => #ZeroPageX
+            with 0xCDw8 => #Absolute
+            with 0xDDw8 => #AbsoluteX
+            with 0xD9w8 => #AbsoluteY
+            with 0xC1w8 => #IndirectX
+            with 0xD1w8 => #IndirectY
+            with 0xE0w8 => #Immediate
+            with 0xE4w8 => #ZeroPage
+            with 0xECw8 => #Absolute
+            with 0xC0w8 => #Immediate
+            with 0xC4w8 => #ZeroPage
+            with 0xCCw8 => #Absolute
+            with 0x24w8 => #ZeroPage
+            with 0x2Cw8 => #Absolute
+            with 0x00w8 => #Implied
+            with 0x40w8 => #Implied
+            with 0x0Aw8 => #Accumulator
+            with 0x4Aw8 => #Accumulator
+            with 0x2Aw8 => #Accumulator
+            with 0x6Aw8 => #Accumulator
+            with 0x06w8 => #ZeroPage
+            with 0x16w8 => #ZeroPageX
+            with 0x0Ew8 => #Absolute
+            with 0x1Ew8 => #AbsoluteX
+            with 0x46w8 => #ZeroPage
+            with 0x56w8 => #ZeroPageX
+            with 0x4Ew8 => #Absolute
+            with 0x5Ew8 => #AbsoluteX
+            with 0x26w8 => #ZeroPage
+            with 0x36w8 => #ZeroPageX
+            with 0x2Ew8 => #Absolute
+            with 0x3Ew8 => #AbsoluteX
+            with 0x66w8 => #ZeroPage
+            with 0x76w8 => #ZeroPageX
+            with 0x6Ew8 => #Absolute
+            with 0x7Ew8 => #AbsoluteX
+            with 0xE6w8 => #ZeroPage
+            with 0xF6w8 => #ZeroPageX
+            with 0xEEw8 => #Absolute
+            with 0xFEw8 => #AbsoluteX
+            with 0xC6w8 => #ZeroPage
+            with 0xD6w8 => #ZeroPageX
+            with 0xCEw8 => #Absolute
+            with 0xDEw8 => #AbsoluteX
+            with 0x48w8 => #Implied
+            with 0x68w8 => #Implied
+            with 0x08w8 => #Implied
+            with 0x28w8 => #Implied
+            with 0x4Cw8 => #Absolute
+            with 0x6Cw8 => #Indirect
+            with 0x20w8 => #Absolute
+            with 0x60w8 => #Implied
+            with 0xEAw8 => #Implied
+            // Unknown opcodes act as one-cycle NOPs.
+            else => #Implied
+        }
+    }
+
+    // -- Execution gating --
+
+    //> The current instruction consumes an operand from memory.
+    wire reads_operand : Bit {
+        it := match instruction {
+            with #Lda => true
+            with #Ldx => true
+            with #Ldy => true
+            with #Ora => true
+            with #And => true
+            with #Eor => true
+            with #Adc => true
+            with #Sbc => true
+            with #Cmp => true
+            with #Cpx => true
+            with #Cpy => true
+            with #Bit => true
+            else => false
+        }
+    }
+
+    //> The current instruction stores a register to memory.
+    wire writes_memory : Bit {
+        it := match instruction {
+            with #Sta => true
+            with #Stx => true
+            with #Sty => true
+            else => false
+        }
+    }
+
+    //> The operand byte is a relative branch offset.
+    wire mode_relative : Bit {
+        it := match mode {
+            with #Relative => true
+            else => false
+        }
+    }
+
+    //> The branch instruction would transfer control.
+    wire branch_taken : Bit {
+        it := match instruction {
+            with #Bpl => !flag_n
+            with #Bmi => flag_n
+            with #Bvc => !flag_v
+            with #Bvs => flag_v
+            with #Bcc => !flag_c
+            with #Bcs => flag_c
+            with #Bne => !flag_z
+            with #Beq => flag_z
+            else => false
+        }
+    }
+
+    //> An immediate-mode operand is being consumed this cycle.
+    wire immediate_execute : Bit {
+        it := is_fetching_operand && (match mode {
+            with #Immediate => true
+            else => false
+        })
+    }
+
+    //> A memory operand is being consumed this cycle.
+    wire memory_execute : Bit {
+        it := is_accessing_memory && reads_operand
+    }
+
+    // -- Implied-op classification (executed at the opcode-fetch edge) --
+
+    wire fetch_txs : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Txs => true
+            else => false
+        })
+    }
+
+    wire fetch_sec : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Sec => true
+            else => false
+        })
+    }
+
+    wire fetch_clc : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Clc => true
+            else => false
+        })
+    }
+
+    wire fetch_sei : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Sei => true
+            else => false
+        })
+    }
+
+    wire fetch_cli : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Cli => true
+            else => false
+        })
+    }
+
+    wire fetch_sed : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Sed => true
+            else => false
+        })
+    }
+
+    wire fetch_cld : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Cld => true
+            else => false
+        })
+    }
+
+    wire fetch_clv : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Clv => true
+            else => false
+        })
+    }
+
+    // -- ALU --
+
+    //> An ALU instruction consumes its operand this cycle.
+    wire alu_execute : Bit {
+        it := (immediate_execute || memory_execute) && (match instruction {
+            with #Ora => true
+            with #And => true
+            with #Eor => true
+            with #Adc => true
+            with #Sbc => true
+            with #Cmp => true
+            with #Cpx => true
+            with #Cpy => true
+            else => false
+        })
+    }
+
+    //> An instruction updating carry from the ALU this cycle.
+    wire alu_carry_execute : Bit {
+        it := alu_execute && (match instruction {
+            with #Adc => true
+            with #Sbc => true
+            with #Cmp => true
+            with #Cpx => true
+            with #Cpy => true
+            else => false
+        })
+    }
+
+    //> An instruction updating overflow from the ALU this cycle.
+    wire alu_v_execute : Bit {
+        it := alu_execute && (match instruction {
+            with #Adc => true
+            with #Sbc => true
+            else => false
+        })
+    }
+
+    //> Left operand: accumulator, or X/Y for the compares.
+    wire alu_left : Word[8] {
+        it := match instruction {
+            with #Cpx => x
+            with #Cpy => y
+            else => a
+        }
+    }
+
+    //> ALU operation for the current instruction.
+    wire alu_op : types::AluOp {
+        it := match instruction {
+            with #Ora => #Or
+            with #And => #And
+            with #Eor => #Xor
+            with #Adc => #Adc
+            with #Sbc => #Sbc
+            with #Cmp => #Sbc
+            with #Cpx => #Sbc
+            with #Cpy => #Sbc
+            else => #Pass
+        }
+    }
+
+    //> Carry input: the carry flag, except compares borrow nothing.
+    wire alu_carry_in : Bit {
+        it := match instruction {
+            with #Cmp => true
+            with #Cpx => true
+            with #Cpy => true
+            else => flag_c
+        }
+    }
+
+    //> The current instruction is a memory read-modify-write.
+    wire is_rmw : Bit {
+        it := (match instruction {
+            with #Asl => true
+            with #Lsr => true
+            with #Rol => true
+            with #Ror => true
+            with #Inc => true
+            with #Dec => true
+            else => false
+        }) && (match mode {
+            with #Accumulator => false
+            else => true
+        })
+    }
+
+    //> The current instruction is an accumulator-mode shift.
+    wire is_acc_shift : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Asl => true
+            with #Lsr => true
+            with #Rol => true
+            with #Ror => true
+            else => false
+        }) && (match mode {
+            with #Accumulator => true
+            else => false
+        })
+    }
+
+    //> BIT consumes memory and only touches flags.
+    wire bit_execute : Bit {
+        it := (immediate_execute || memory_execute) && (match instruction {
+            with #Bit => true
+            else => false
+        })
+    }
+
+    mod math of alu::Alu {
+        it.a := alu_left
+        it.b := busif.data
+        it.op := alu_op
+        it.carry_in := alu_carry_in
+        it.decimal := flag_d
+    }
+
+    // -- Results --
+
+    //> Next value for the accumulator.
+    wire result_a : Word[8] {
+        it := match instruction {
+            with #Lda => busif.data
+            with #Pla => busif.data
+            with #Asl => word(a[7..0], 0w1)
+            with #Lsr => word(0w1, a[8..1])
+            with #Rol => word(a[7..0], flag_c)
+            with #Ror => word(flag_c, a[8..1])
+            with #Ora => math.result
+            with #And => math.result
+            with #Eor => math.result
+            with #Adc => math.result
+            with #Sbc => math.result
+            with #Txa => x
+            with #Tya => y
+            else => dontcare
+        }
+    }
+
+    //> Next value for register X.
+    wire result_x : Word[8] {
+        it := match instruction {
+            with #Ldx => busif.data
+            with #Tax => a
+            with #Tsx => sp
+            with #Inx => x + 1w8
+            with #Dex => x - 1w8
+            else => dontcare
+        }
+    }
+
+    //> Next value for register Y.
+    wire result_y : Word[8] {
+        it := match instruction {
+            with #Ldy => busif.data
+            with #Tay => a
+            with #Iny => y + 1w8
+            with #Dey => y - 1w8
+            else => dontcare
+        }
+    }
+
+    //> The RMW value to write back.
+    wire rmw_result : Word[8] {
+        it := match instruction {
+            with #Asl => word(operand_latch[7..0], 0w1)
+            with #Lsr => word(0w1, operand_latch[8..1])
+            with #Rol => word(operand_latch[7..0], flag_c)
+            with #Ror => word(flag_c, operand_latch[8..1])
+            with #Inc => operand_latch + 1w8
+            with #Dec => operand_latch - 1w8
+            else => dontcare
+        }
+    }
+
+    //> The carry produced by a shift (RMW or accumulator mode).
+    wire shift_carry : Bit {
+        it := match instruction {
+            with #Asl => operand_latch[7]
+            with #Rol => operand_latch[7]
+            with #Lsr => operand_latch[0]
+            with #Ror => operand_latch[0]
+            else => flag_c
+        }
+    }
+
+    //> The carry produced by an accumulator-mode shift.
+    wire acc_shift_carry : Bit {
+        it := match instruction {
+            with #Asl => a[7]
+            with #Rol => a[7]
+            with #Lsr => a[0]
+            with #Ror => a[0]
+            else => flag_c
+        }
+    }
+
+    //> Value stored by STA/STX/STY.
+    wire store_value : Word[8] {
+        it := match instruction {
+            with #Sta => a
+            with #Stx => x
+            with #Sty => y
+            else => dontcare
+        }
+    }
+
+    // -- Register writes --
+
+    //> The accumulator updates this cycle.
+    //> Accumulator updates this cycle.
+    //> Load instructions write it directly.
+    //> ALU instructions (Ora, And, Eor, Adc, Sbc) write the math result.
+    wire write_a : Bit {
+        it := ((immediate_execute || memory_execute) && (match instruction {
+            with #Lda => true
+            with #Ora => true
+            with #And => true
+            with #Eor => true
+            with #Adc => true
+            with #Sbc => true
+            else => false
+        })) || (is_fetching_opcode && (match instruction {
+            with #Txa => true
+            with #Tya => true
+            else => false
+        })) || is_pulling_a || is_acc_shift
+    }
+
+    //> Register X updates this cycle.
+    wire write_x : Bit {
+        it := ((immediate_execute || memory_execute) && (match instruction {
+            with #Ldx => true
+            else => false
+        })) || (is_fetching_opcode && (match instruction {
+            with #Tax => true
+            with #Tsx => true
+            with #Inx => true
+            with #Dex => true
+            else => false
+        }))
+    }
+
+    //> Register Y updates this cycle.
+    wire write_y : Bit {
+        it := ((immediate_execute || memory_execute) && (match instruction {
+            with #Ldy => true
+            else => false
+        })) || (is_fetching_opcode && (match instruction {
+            with #Tay => true
+            with #Iny => true
+            with #Dey => true
+            else => false
+        }))
+    }
+
+    //> A load is updating N and Z this cycle.
+    wire load_nz : Bit {
+        it := (immediate_execute || memory_execute) && (match instruction {
+            with #Lda => true
+            with #Ldx => true
+            with #Ldy => true
+            else => false
+        })
+    }
+
+    //> An implied instruction is updating N and Z this cycle.
+    wire implied_nz : Bit {
+        it := is_fetching_opcode && (match instruction {
+            with #Tax => true
+            with #Tay => true
+            with #Txa => true
+            with #Tya => true
+            with #Tsx => true
+            with #Inx => true
+            with #Iny => true
+            with #Dex => true
+            with #Dey => true
+            else => false
+        })
+    }
+
+    //> N and Z update this cycle.
+    wire nz_write : Bit {
+        it := load_nz || implied_nz || alu_execute || is_pulling_a || is_writing_modified || is_acc_shift
+    }
+
+    //> The value N and Z are computed from.
+    wire nz_value : Word[8] {
+        it := if {
+            when alu_execute => math.nz_source
+            when is_writing_modified => rmw_result
+            when write_x => result_x
+            when write_y => result_y
+            when write_a => result_a
+            else => 0w8
+        }
+    }
+
+    // -- Bus driver --
+
+    wire bus_addr : Word[16] {
+        it := match state {
+            with @FetchOpcode() => pc
+            with @FetchOperand() => pc
+            with @FetchLow() => pc
+            with @FetchHigh() => pc
+            with @Access(addr) => addr
+            with @WriteModified(addr) => addr
+            with @PushValue() => stack_push_addr
+            with @PushPcHigh(dontcare) => stack_push_addr
+            with @PushPcLow(dontcare) => stack_push_addr
+            with @PushStatusInterrupt(dontcare) => stack_push_addr
+            with @PullAccumulator() => stack_pull_addr
+            with @PullProcessorStatus() => stack_pull_addr
+            with @PullPcLow() => stack_pull_addr
+            with @PullPcHigh() => stack_pull_addr
+            with @ReadPointerLow(addr) => addr
+            with @ReadPointerHigh(addr) => addr
+            with @FetchVectorLow(addr) => addr
+            with @FetchVectorHigh(addr) => addr
+        }
+    }
+
+    wire bus_write : Valid[Word[8]] {
+        it := if {
+            when is_accessing_memory && writes_memory => @Valid(store_value)
+            when is_writing_modified => @Valid(rmw_result)
+            when is_pushing_status_interrupt => @Valid(interrupt_status)
+            when is_pushing_value => @Valid(push_value)
+            when is_pushing_pc_high => @Valid(pc[16..8])
+            when is_pushing_pc_low => @Valid(pc[8..0])
+            else => @Invalid()
+        }
+    }
+
+    client socket busif of types::Bus {
+        it.addr := bus_addr
+        it.write := bus_write
+    }
+
+    // -- Register drivers --
+
+    reg pc : Word[16] {
+        if {
+            when reset {
+                it <= 0w16
+            }
+            when is_fetching_operand && mode_relative && branch_taken {
+                it <= it + 1w16 + sext(busif.data)
+            }
+            when is_absolute_jump {
+                it <= word(busif.data, addr_low)
+            }
+            when is_indirect_jump {
+                it <= word(busif.data, addr_low)
+            }
+            when is_pulling_pc_high {
+                // RTS resumes after the pushed return-1 (hence +1);
+                // RTI resumes at the exact pushed PC.
+                it <= word(busif.data, addr_low) + (match instruction {
+                    with #Rts => 1w16
+                    else => 0w16
+                })
+            }
+            // The hijack (is_fetching_opcode && interrupt_pending)
+            // holds PC deliberately: it becomes the pushed return
+            // address and the instruction re-executes after RTI.
+            when is_fetching_opcode && (match instruction {
+                with #Brk => true
+                else => false
+            }) {
+                it <= it + 2w16
+            }
+            when ((is_fetching_opcode && (!interrupt_pending)) || is_fetching_operand || is_fetching_low || is_fetching_high) {
+                it <= it + 1w16
+            }
+            when is_fetching_vector_high {
+                it <= word(busif.data, addr_low)
+            }
+        }
+    }
+
+    reg ir : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when is_fetching_opcode && interrupt_pending {
+                // Hijack: force the BRK opcode so the push sequence
+                // behaves exactly like a software interrupt.
+                it <= 0w8
+            }
+            when is_fetching_opcode {
+                it <= busif.data
+            }
+        }
+    }
+
+    reg a : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when write_a {
+                it <= result_a
+            }
+        }
+    }
+
+    reg x : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when write_x {
+                it <= result_x
+            }
+        }
+    }
+
+    reg y : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when write_y {
+                it <= result_y
+            }
+        }
+    }
+
+    reg sp : Word[8] {
+        if {
+            when reset {
+                it <= 0xFDw8
+            }
+            when fetch_txs {
+                it <= x
+            }
+            when is_pushing {
+                it <= it - 1w8
+            }
+            when is_pulling {
+                it <= it + 1w8
+            }
+        }
+    }
+
+    reg nmi_prev : Bit {
+        if {
+            when reset {
+                it <= true
+            }
+            else {
+                it <= nmi_n
+            }
+        }
+    }
+
+    reg nmi_pending : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when nmi_edge {
+                it <= true
+            }
+            when nmi_take {
+                it <= false
+            }
+        }
+    }
+
+    //> The interrupt hijack clears a pending NMI at the opcode-fetch
+    //> edge (a wire, so the reg's own driver block never reads the
+    //> reg name).
+    wire nmi_take : Bit {
+        it := is_fetching_opcode && nmi_pending
+    }
+
+    reg serving_nmi : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when is_fetching_opcode && interrupt_pending {
+                it <= nmi_pending
+            }
+            when is_fetching_vector_high {
+                // The vector has been consumed; clear so a later BRK
+                // uses the IRQ/BRK vector again.
+                it <= false
+            }
+        }
+    }
+
+    reg operand_latch : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when is_accessing_memory && is_rmw {
+                it <= busif.data
+            }
+        }
+    }
+
+    reg addr_low : Word[8] {
+        if {
+            when reset {
+                it <= 0w8
+            }
+            when is_fetching_low || is_fetching_vector_low || is_reading_pointer_low || is_pulling_pc_low {
+                it <= busif.data
+            }
+        }
+    }
+
+    reg flag_n : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when alu_execute {
+                // The ALU knows the NMOS decimal N quirks (the
+                // intermediate high-nibble sum for decimal ADC, the
+                // binary subtract for decimal SBC).
+                it <= math.negative
+            }
+            when nz_write {
+                it <= nz_value[7]
+            }
+            when bit_execute {
+                it <= busif.data[7]
+            }
+            when is_pulling_status {
+                it <= busif.data[7]
+            }
+        }
+    }
+
+    reg flag_z : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when nz_write {
+                it <= nz_value == 0w8
+            }
+            when bit_execute {
+                it <= (a & busif.data) == 0w8
+            }
+            when is_pulling_status {
+                it <= busif.data[1]
+            }
+        }
+    }
+
+    reg flag_c : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when fetch_sec {
+                it <= true
+            }
+            when fetch_clc {
+                it <= false
+            }
+            when alu_carry_execute {
+                it <= math.carry
+            }
+            when is_writing_modified && (match instruction {
+                with #Asl => true
+                with #Lsr => true
+                with #Rol => true
+                with #Ror => true
+                else => false
+            }) {
+                it <= shift_carry
+            }
+            when is_acc_shift {
+                it <= acc_shift_carry
+            }
+            when is_pulling_status {
+                it <= busif.data[0]
+            }
+        }
+    }
+
+    reg flag_v : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when fetch_clv {
+                it <= false
+            }
+            when alu_v_execute {
+                it <= math.overflow
+            }
+            when bit_execute {
+                it <= busif.data[6]
+            }
+            when is_pulling_status {
+                it <= busif.data[6]
+            }
+        }
+    }
+
+    reg flag_d : Bit {
+        if {
+            when reset {
+                it <= false
+            }
+            when fetch_sed {
+                it <= true
+            }
+            when fetch_cld {
+                it <= false
+            }
+            when is_pulling_status {
+                it <= busif.data[3]
+            }
+        }
+    }
+
+    reg flag_i : Bit {
+        if {
+            when reset {
+                it <= true
+            }
+            when fetch_sei {
+                it <= true
+            }
+            when fetch_cli {
+                it <= false
+            }
+            when is_pulling_status {
+                it <= busif.data[2]
+            }
+            when is_pushing_status_interrupt {
+                it <= true
+            }
+        }
+    }
+
+    // Interrupt lines are consumed by interrupt_pending.
+
+    //> The state after the current one, evaluated every cycle and
+    //> consumed by the state register only on the data cycle.
+    wire next_state : CpuState {
+        it := match state : CpuState {
+            with @FetchOpcode() =>
+                if {
+                    // Interrupt hijack: force the BRK sequence
+                    // with software = 0; PC is held so it
+                    // becomes the pushed PC; serving_nmi
+                    // selects the vector.
+                    when interrupt_pending => @PushPcHigh(false)
+                    else =>
+                        match instruction {
+                            with #Brk => @PushPcHigh(true)
+                            with #Rti => @PullProcessorStatus()
+                            with #Pha => @PushValue()
+                            with #Php => @PushValue()
+                            with #Pla => @PullAccumulator()
+                            with #Plp => @PullProcessorStatus()
+                            with #Rts => @PullPcLow()
+                            else =>
+                                match mode {
+                                    with #Implied => @FetchOpcode()
+                                    with #Accumulator => @FetchOpcode()
+                                    with #Immediate => @FetchOperand()
+                                    with #ZeroPage => @FetchOperand()
+                                    with #ZeroPageX => @FetchOperand()
+                                    with #ZeroPageY => @FetchOperand()
+                                    with #IndirectX => @FetchOperand()
+                                    with #IndirectY => @FetchOperand()
+                                    with #Relative => @FetchOperand()
+                                    with #Absolute => @FetchLow()
+                                    with #AbsoluteX => @FetchLow()
+                                    with #AbsoluteY => @FetchLow()
+                                    with #Indirect => @FetchLow()
+                                }
+                        }
+                }
+            with @FetchOperand() =>
+                match mode {
+                    with #Immediate => @FetchOpcode()
+                    with #Relative => @FetchOpcode()
+                    with #ZeroPage => @Access(word(0w8, busif.data))
+                    with #ZeroPageX => @Access(word(0w8, busif.data + x))
+                    with #ZeroPageY => @Access(word(0w8, busif.data + y))
+                    with #IndirectX => @ReadPointerLow(word(0w8, busif.data + x))
+                    with #IndirectY => @ReadPointerLow(word(0w8, busif.data))
+                    else => @FetchOpcode()
+                }
+            with @FetchLow() =>
+                match instruction {
+                    with #Jsr => @PushPcHigh(false)
+                    else => @FetchHigh()
+                }
+            with @FetchHigh() =>
+                match mode {
+                    with #Absolute =>
+                        match instruction {
+                            with #Jmp => @FetchOpcode()
+                            with #Jsr => @FetchOpcode()
+                            else => @Access(word(busif.data, addr_low))
+                        }
+                    with #AbsoluteX => @Access(word(busif.data, addr_low) + zext(x))
+                    with #AbsoluteY => @Access(word(busif.data, addr_low) + zext(y))
+                    with #Indirect => @ReadPointerLow(word(busif.data, addr_low))
+                    else => @FetchOpcode()
+                }
+            with @Access(dontcare) =>
+                if {
+                    when is_rmw => @WriteModified(access_addr)
+                    else => @FetchOpcode()
+                }
+            with @ReadPointerLow(dontcare) =>
+                match mode {
+                    with #Indirect => @ReadPointerHigh(word(pointer_addr[16..8], pointer_addr[8..0] + 1w8))
+                    // Pointers for (zp,X) and (zp),Y always live in
+                    // page zero; the low-byte add wraps at 8 bits.
+                    else => @ReadPointerHigh(word(0w8, pointer_addr[8..0] + 1w8))
+                }
+            with @ReadPointerHigh(dontcare) =>
+                match mode {
+                    with #IndirectX => @Access(word(busif.data, addr_low))
+                    with #IndirectY => @Access(word(busif.data, addr_low) + zext(y))
+                    else => @FetchOpcode()
+                }
+            with @PushValue() => @FetchOpcode()
+            with @PushPcHigh(sw) => @PushPcLow(sw)
+            with @PushPcLow(software) =>
+                // JSR continues to the operand fetch; BRK and
+                // interrupt hijacks (ir forced to $00) push the
+                // status byte next, B = 1 for BRK, 0 for a
+                // hardware interrupt.
+                match instruction {
+                    with #Jsr => @FetchHigh()
+                    else => @PushStatusInterrupt(software)
+                }
+            with @PushStatusInterrupt(dontcare) =>
+                @FetchVectorLow(interrupt_vector)
+            with @PullAccumulator() => @FetchOpcode()
+            with @PullProcessorStatus() =>
+                match instruction {
+                    with #Rti => @PullPcLow()
+                    else => @FetchOpcode()
+                }
+            with @PullPcLow() => @PullPcHigh()
+            with @PullPcHigh() => @FetchOpcode()
+            with @WriteModified(dontcare) => @FetchOpcode()
+            with @FetchVectorLow(addr) => @FetchVectorHigh(addr + 1w16)
+            with @FetchVectorHigh(dontcare) => @FetchOpcode()
+        }
+    }
+
+    reg state : CpuState {
+        if {
+            when reset {
+                it <= @FetchVectorLow(0xFFFCw16)
+            }
+            else {
+                // Two-cycle bus: hold the state on the wait cycle,
+                // dispatch on the data cycle (tick = 1).
+                it <= mux(tick, next_state, it)
+            }
+        }
+    }
+}

@@ -1,0 +1,196 @@
+# sixfiveohtwo stage 5 expectations.
+# Read-modify-write ops: ASL/LSR/ROL/ROR (accumulator and memory
+# forms) and INC/DEC across zp, zp,X, abs, abs,X.
+#
+# All checks apply at the single final marker (M line below): the
+# last data write is lda #$5A / sta $F000; lda #$5A leaves N=0, Z=0,
+# and C=0 (the last C-setting event is the clc in the ROR abs,X
+# block; INC/DEC never touch C), V=0 (clv in the INC/DEC zp block,
+# never set again), D=0 and I=1 (untouched reset values). SP is $FD
+# (every PHP is paired with a PLA). X=$01 (ldx #$01 in the DEC abs,X
+# block, never changed after), Y=$27 (set once at the start, never
+# changed after). PC is the address after the final 3-byte sta $F000.
+#
+# Flag bytes captured by PHP/PLA: P is pushed as N V 1 B D I Z C, so
+# bit5=1 and B=1 always, and the base byte is $34 (I=1, V=D=Z=C=0,
+# N=0). E.g. $B4=N1, $37=C1 Z1, $36=Z1 with C=0, $B5=N1 C1.
+
+M F000 5A
+
+F N 0
+F Z 0
+F C 0
+F V 0
+F D 0
+F I 1
+R A 5A
+R X 01
+R Y 27
+R S FD
+R P 051A
+
+# --- ASL A: C-out 0/1, N set, zero result, C-in ignored ---
+C F100 34
+C F101 02
+C F102 37
+C F103 00
+C F104 B4
+C F105 80
+C F106 34
+C F107 02
+
+# --- LSR A: C-out 0/1, N cleared, zero result ---
+C F108 34
+C F109 01
+C F10A 35
+C F10B 01
+C F10C 34
+C F10D 40
+C F10E 37
+C F10F 00
+
+# --- ROL A: C-in 0/1, zero result, C-out 0/1 ---
+C F110 34
+C F111 02
+C F112 37
+C F113 00
+C F114 34
+C F115 03
+C F116 35
+C F117 01
+
+# --- ROR A: C-in 0/1, zero result ---
+C F118 34
+C F119 01
+C F11A 37
+C F11B 00
+C F11C B4
+C F11D 81
+C F11E B4
+C F11F 80
+
+# --- shift chains: carry handed ASL->ROL->ROL and LSR->ROR->ROR ---
+C F120 34
+C F121 01
+C F122 34
+C F123 40
+
+# --- zp memory shifts: flag bytes (C-out, N set, N cleared) ---
+C F124 35
+C F125 B4
+C F126 34
+C F127 35
+C F128 B4
+C F129 B4
+C F12A B4
+C F12B 35
+
+# --- zp INC/DEC: A untouched, wraps, C/V untouched ---
+C F148 99
+C F12C B4
+C F12D 36
+C F12E 36
+C F12F B4
+C F130 B5
+
+# --- zp,X memory shifts + INC/DEC: flag bytes, X untouched ---
+C F131 B4
+C F132 02
+C F133 35
+C F134 B5
+C F135 35
+C F136 B5
+C F137 37
+C F138 B4
+C F139 C9
+
+# --- abs memory shifts + INC/DEC: flag bytes ---
+C F13A 34
+C F13B 37
+C F13C B4
+C F13D 34
+C F13E 37
+C F13F 37
+C F140 B5
+
+# --- abs,X memory shifts + INC/DEC: A/X untouched, flag bytes ---
+C F149 77
+C F141 B5
+C F142 03
+C F143 35
+C F144 37
+C F145 B4
+C F146 B4
+C F147 36
+
+# --- written-back cells, zero page shifts ---
+C 10 82
+C 11 42
+C 12 42
+C 13 01
+C 14 80
+C 15 81
+C 16 81
+C 17 01
+
+# --- zp,X wrap: target $18 hit, base $4F and neighbor untouched ---
+C 18 FF
+C 19 66
+C 4F 99
+
+# --- written-back cells + decoys, zp,X clusters ---
+C 20 11
+C 21 22
+C 22 33
+C 23 FE
+C 24 44
+C 25 55
+C 26 42
+C 27 66
+C 28 FD
+C 30 77
+C 31 88
+C 32 3F
+C 33 99
+C 34 80
+C 35 AA
+C 36 00
+C 37 BB
+
+# --- INC/DEC zp results ---
+C 40 80
+C 41 00
+C 42 00
+C 43 FE
+
+# --- written-back cells, absolute ---
+C F200 02
+C F201 00
+C F202 40
+C F203 81
+C F204 00
+C F205 00
+C F206 FF
+
+# --- written-back cells + decoys, abs,X clusters ---
+C F210 D1
+C F211 D2
+C F212 D3
+C F213 82
+C F214 D4
+C F215 E1
+C F216 E2
+C F217 20
+C F218 E3
+C F219 F9
+C F21A 00
+C F21B FA
+C F21C 80
+C F220 F1
+C F221 F2
+C F222 F3
+C F223 FF
+C F224 F4
+C F225 A1
+C F226 00
+C F227 A2
