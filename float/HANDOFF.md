@@ -40,17 +40,23 @@ the correctly-rounded glibc oracle pattern (`fmaf`, `fesetround` +
                           `python3 divmodel.py [n_random] [seed]`,
                           `python3 divmodel.py model` = datapath-model
                           cross-check
-    add_mult, compare,
+    add_mult, add,
+    subtract, compare,
     select, divide, sqrt,
     fntorec, rectofn,
     itof, ftoi, classify  CLI drivers, one per operation; every run
                           self-checks against a Python reference and
-                          exits nonzero on mismatch. divide/sqrt take
-                          an optional rounding mode (rne/rz/rup/rdn/rmm
-                          or 0..4); itof/ftoi take an optional
-                          signed|unsigned before the mode. rectofn
-                          models the documented sNaN->IEEE-infinity
-                          boundary quirk in its self-check.
+                          exits nonzero on mismatch. divide/sqrt and
+                          add/subtract take an optional rounding mode
+                          (rne/rz/rup/rdn/rmm or 0..4); itof/ftoi take
+                          an optional signed|unsigned before the mode.
+                          rectofn models the documented
+                          sNaN->IEEE-infinity boundary quirk in its
+                          self-check. FADD/FSUB ride the FMA as
+                          a*1.0 (+/- b) — exact identity, so values,
+                          flags, and rounding match a dedicated
+                          adder; subtract negates b by an exact
+                          sign-bit flip.
     add_mult.img          Generated testbench input image (gitignored
                           artifacts: do not edit by hand)
     src/*.vir             One package per module family (see inventory)

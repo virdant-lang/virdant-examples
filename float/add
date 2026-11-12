@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Run two floats through the hardware FMA as an addition (FADD.S).
+
+Usage: ./add <a> <b> [mode]
+
+FADD is computed as the fused multiply-add a*1.0 + b: multiplying by
+1.0 is exact, so the fused add IS the addition -- values, exception
+flags, and rounding all match a dedicated adder. The result is
+decoded and printed on stdout; the exception flags are reported on
+stderr. Every run self-checks against fuzz.py's Fraction-exact FMA
+reference, exiting nonzero on any mismatch.
+
+Mode is a rounding-mode name (rne, rz, rup, rdn, rmm) or a number
+0..4 in HardFloat order; the default is rne.
+"""
+
+import sys
+
+from fputils import decode, parse_round_mode, recode, run_packet, to_binary32
+import fuzz
+
+ONE_BITS = 0x3F800000
+
+
+def main():
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: {} <a> <b> [mode]".format(sys.argv[0]))
+    try:
+        a, b = (float(arg) for arg in sys.argv[1:3])
+    except ValueError:
+        sys.exit("operands must be numbers")
+    mode = parse_round_mode(sys.argv[3]) if len(sys.argv) == 4 else 0
+
+    a_bits = to_binary32(a)
+    b_bits = to_binary32(b)
+
+    packet = run_packet([
+        recode(a_bits),
+        recode(ONE_BITS),
+        recode(b_bits),
+        0,            # operation selector: FMA
+        mode << 2,    # FMA rounding mode in bits 4..2
+    ])
+    out = packet >> 31
+    flag_bits = (packet >> 26) & 0x1F
+    rtl_flags = {name for i, name in enumerate(fuzz.FLAG_NAMES)
+                 if flag_bits & (1 << i)}
+
+    ref_result, ref_flags = fuzz.ref_fma(a_bits, ONE_BITS, b_bits, mode)
+    kind = fuzz.recoded_class(out)
+    problems = []
+    if ref_result[0] == "num":
+        expected = recode(ref_result[1])
+        if out != expected:
+            problems.append("expected {:#010x} (recoded {:#x}), "
+                            "got recoded {:#x}"
+                            .format(ref_result[1], expected, out))
+    else:
+        # zero/inf/nan classes: compare by decode-equivalence class
+        # and sign for zero/inf.
+        sign = ref_result[1] if len(ref_result) > 1 else 0
+        if kind != ref_result[0] or \
+                (kind in ("zero", "inf") and (out >> 32) != sign):
+            problems.append("expected {}{}, got recoded {:#x}"
+                            .format("-" if sign else "+",
+                                    ref_result[0], out))
+    if rtl_flags != ref_flags:
+        problems.append("flags: expected {} got {}"
+                        .format(sorted(ref_flags), sorted(rtl_flags)))
+    if problems:
+        for p in problems:
+            sys.stderr.write("SELF-CHECK FAIL: {}\n".format(p))
+        sys.exit(1)
+
+    print(decode(out))
+    if rtl_flags:
+        sys.stderr.write("exception_flags: {}\n"
+                         .format(", ".join(sorted(rtl_flags))))
+
+
+if __name__ == "__main__":
+    main()
