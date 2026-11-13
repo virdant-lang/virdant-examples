@@ -135,6 +135,6 @@ build/klaus.hex: klaus/6502_functional_test.bin tools/mkklaus.py
 
 klaus-run: build/.virdant.stamp build/klaus.hex
 	$(IVERILOG) -g2012 $(TB_SV) tb.sv -o build/run
-	./build/run +hex=$< +klaus=1
+	./build/run +hex=build/klaus.hex +klaus=1
 
 .PHONY: klaus klaus-run

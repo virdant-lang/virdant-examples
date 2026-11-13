@@ -60,6 +60,14 @@ module Tb;
     end
 
     reg [15:0] prev_addr = 16'hFFFF;
+
+    // Write trace: every memory write the CPU drives.
+    always @(negedge clock) begin
+        if (dut.bridge.wren && !dut.boot.running) begin
+            $display("WR addr=%h data=%h io_sel=%b", dut.bridge.addr, dut.bridge.wdata, dut.bridge.io_select);
+        end
+    end
+
     always @(*) begin
         if (dut.bridge.\busif.addr  != prev_addr) begin
             if (dut.bridge.\busif.addr  == 16'hFF00 || dut.bridge.\busif.addr  == 16'hF001) begin
