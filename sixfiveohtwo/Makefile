@@ -12,7 +12,7 @@ PROG ?= hw1
 
 # The CPU-only flows (tb.sv) link the core's Verilog; the Fomu build's
 # fomu_top.sv and fomu_memory.sv (hard-cell SPRAM instantiations) are
-# excluded there (the fomu-sim flow links them with ext/Spram.sv).
+# excluded there (the fomu-sim flow links them with the native models).
 # Lazily expanded: after `make clean` the files only exist once the
 # build/.virdant.stamp prerequisite has run.
 TB_SV = $(filter-out build/fomu_top.sv build/fomu_memory.sv,$(wildcard build/*.sv))
@@ -42,11 +42,6 @@ test: test-s1 test-s2 test-s3 test-s4 test-s5 test-s6 test-s7
 
 # -- Fomu (iCE40 UP5K) flows --
 
-# fomu-sim's flash image: the program at $080000 (reset vector
-# patched to $0200). Named for PROG, so switching PROG rebuilds it.
-build/$(PROG).flash.hex: build/$(PROG).bin tools/mkflash.py
-	python3 tools/mkflash.py $< $@
-
 build/ClkDiv.sv: ext/ClkDiv.sv
 	cp $< $@
 
@@ -55,15 +50,46 @@ build/.virdant.stamp: $(wildcard src/*.vir) $(wildcard ../lib/*.vir)
 	$(VIR) build
 	touch $@
 
-fomu-sim: build/.virdant.stamp build/$(PROG).flash.hex build/ClkDiv.sv
-	$(IVERILOG) -g2012 build/*.sv ext/Spram.sv ext/Flash.sv tb-fomu.sv -o build/run-fomu
-	./build/run-fomu +flashhex=build/$(PROG).flash.hex
+# -- models: the native simulation models (models/src/models.vir) --
+# Compiled as their own project so the main design's build/ never
+# contains them: yosys must take the SB_SPRAM256KA cell from its own
+# library in synthesis, so the sim flows link the models' emitted
+# Verilog by explicit file name instead of the build/*.sv glob.
+models/build/models.sv: models/src/models.vir
+	cd models && $(VIR) build
+
+# The flash image: the program at $080000 (reset vector patched to
+# $0200), zero bytes before that -- the flat one-byte-per-line format
+# the native flash model's @image_hex loads. The image name is shared
+# across PROG values, so the rule runs unconditionally: a timestamp
+# comparison alone would not notice a PROG switch (and the conversion
+# is cheap).
+models/build/flash_image.hex: build/$(PROG).bin tools/mkflash.py FORCE
+	python3 tools/mkflash.py build/$(PROG).bin models/build/flash_image.hex
+
+FORCE:
+
+# Differential testbenches (models/tb): each native model against the
+# former ext/ Verilog model it replaces -- random stimulus for the two
+# RAMs, directed SPI transactions for the flash.
+models-test: models/build/models.sv models/build/flash_image.hex
+	$(IVERILOG) -g2012 models/build/models.sv ext/Spram.sv models/tb/tb_spram.sv -o build/run-model-spram
+	./build/run-model-spram
+	$(IVERILOG) -g2012 models/build/models.sv ext/Spram.sv models/tb/tb_memory.sv -o build/run-model-memory
+	./build/run-model-memory
+	$(IVERILOG) -g2012 models/build/models.sv ext/Flash.sv models/tb/tb_flash.sv -o build/run-model-flash
+	./build/run-model-flash +flashhex=models/build/flash_image.hex
+
+fomu-sim: build/.virdant.stamp models/build/models.sv models/build/flash_image.hex build/ClkDiv.sv
+	$(IVERILOG) -g2012 build/*.sv models/build/models.sv models/shim/sb_spram256ka_sim.sv tb-fomu.sv -o build/run-fomu
+	./build/run-fomu
 
 # The memory's SPRAM cells and the ClkDiv divider are instantiated
 # directly in Virdant (ext mods emitted by name) and must exist as
 # Verilog: ClkDiv is copied into build/ for yosys's script (which
 # globs build/*.sv); SB_SPRAM256KA comes from yosys's own cell
-# library, and the SPRAM sim model is only needed for iverilog.
+# library, and in iverilog the plain cell instances resolve through
+# models/shim to the native models::SB_SPRAM256KA.
 fomu-build: build/ClkDiv.sv
 	$(VIR) bitstream
 
@@ -96,9 +122,9 @@ build/sixfiveohtwo.img: build/sixfiveohtwo.bin build/$(PROG).bin tools/mkimg.py
 	python3 tools/mkimg.py build/sixfiveohtwo.bin build/$(PROG).bin $@
 
 clean:
-	rm -rf build
+	rm -rf build models/build
 
-.PHONY: check build test fomu-sim fomu-build fomu-upload clean
+.PHONY: check build test fomu-sim fomu-build fomu-upload models-test clean FORCE
 .PRECIOUS: build/%.hex
 
 klaus: build/klaus.hex

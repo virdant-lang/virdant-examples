@@ -1,0 +1,363 @@
+//! Native Virdant rewrites of the external Verilog memory models that
+//! sixfiveohtwo kept under ext/ before the `memory` construct existed.
+//! Each module keeps the name of the Verilog module it replaces.
+//!
+//! This directory is its own project (it has its own virdant.toml):
+//! these are simulation models, not part of the synthesis design. The
+//! main project's build directory must never contain them — it must
+//! not define the SB_SPRAM256KA cell, which yosys supplies from its
+//! own library — so the sim flows link this project's emitted Verilog
+//! by explicit file name instead of the main build/*.sv glob.
+//!
+//! - Memory: the computer's 64K x 8 RAM. The design itself
+//!   instantiates fomu_memory::Memory (hard SPRAM cells; only they
+//!   guarantee the SPRAM mapping in synthesis), so this module is the
+//!   plain-native form of the memory the CPU actually sees, checked
+//!   against the hard-cell wiring by models/tb.
+//! - SB_SPRAM256KA: behavioral model of the iCE40 UltraPlus SPRAM
+//!   hard cell (replaces ext/Spram.sv, which remains as the
+//!   differential reference).
+//! - Flash: simulation model of a 4 MiB SPI flash chip (replaces
+//!   ext/Flash.sv) for the Fomu boot testbench.
+//!
+//! models/tb holds differential testbenches that check each module
+//! against the former Verilog model under random and directed
+//! stimulus.
+
+//> The SPI flash protocol stages, mirroring the command framing of a
+//> mode-0 serial flash.
+enum type FlashStage {
+    //> cs high: idle.
+    Wait = 0w3
+    //> Receiving the command byte.
+    Command = 1w3
+    //> Receiving the 24-bit address.
+    Address = 2w3
+    //> Streaming data out.
+    Read = 3w3
+    //> Unmodeled command: idle until cs rises.
+    Ignore = 4w3
+}
+
+//> The computer's 64K of RAM: 65536 byte-wide, word-addressed memory.
+//> Read latency is one cycle: `rdata` presents the byte addressed in
+//> the previous cycle — the CPU's wait-state protocol samples data on
+//> the second cycle of every bus transaction.
+//>
+//> The design instantiates fomu_memory::Memory (two hard SPRAM cells;
+//> only they guarantee the SPRAM mapping in synthesis) rather than
+//> this module, but this is the same memory expressed natively — a
+//> plain 64K x 8 `memory`, the shape the CPU sees — and models/tb
+//> checks it against the hard-cell wiring byte for byte.
+pub mod Memory {
+    incoming clock : Clock
+    incoming addr : Word[16]
+    incoming wdata : Word[8]
+    incoming wren : Bit
+
+    //> The byte at `addr` as of the previous clock edge.
+    outgoing rdata : Word[8]
+
+    memory mem[65536] : Word[8] {
+        if {
+            when wren {
+                it[dyn addr] <= wdata
+            }
+        }
+    }
+
+    reg rdata_reg : Word[8] {
+        it <= mem[dyn addr]
+    }
+
+    rdata := rdata_reg
+}
+
+//> Behavioral model of the iCE40 UltraPlus SB_SPRAM256KA hard cell:
+//> a 256 Kbit single-port RAM, 16K x 16, with per-nibble write masks.
+//>
+//> Semantics modeled: on each rising CLOCK edge with CHIPSELECT
+//> high, WREN writes the nibbles selected by MASKWREN (bit0 ->
+//> DATAIN[3..0], bit1 -> [7..4], bit2 -> [11..8], bit3 -> [15..12])
+//> and DATAOUT is updated with the word at ADDRESS as it was BEFORE
+//> the write (read-old-data). While CHIPSELECT is low, DATAOUT
+//> holds. STANDBY, SLEEP, and POWEROFF are ignored.
+//>
+//> The design instantiates the ice40::SbSpram256ka ext mod (yosys
+//> maps the SB_SPRAM256KA cell through its own spram techmap), and
+//> the iverilog sim resolves those plain-named cell instances through
+//> models/shim/sb_spram256ka_sim.sv, which forwards to this module.
+//> ext/Spram.sv — the original Verilog model — remains as the
+//> reference for the differential testbench.
+pub mod SB_SPRAM256KA {
+    incoming CLOCK       : Clock
+    incoming ADDRESS     : Word[14]
+    incoming DATAIN      : Word[16]
+    incoming MASKWREN    : Word[4]
+    incoming WREN        : Bit
+    incoming CHIPSELECT  : Bit
+    incoming STANDBY     : Bit
+    incoming SLEEP       : Bit
+    incoming POWEROFF    : Bit
+
+    //> The word at ADDRESS as it was before this cycle's write.
+    outgoing DATAOUT : Word[16]
+
+    unused STANDBY
+    unused SLEEP
+    unused POWEROFF
+
+    //> MASKWREN expanded to a per-bit write mask: the bits of each
+    //> masked nibble pass through, the rest are held.
+    wire mask_bits : Word[16] {
+        it := word(
+            mux(MASKWREN[3], 0b1111w4, 0b0000w4),
+            mux(MASKWREN[2], 0b1111w4, 0b0000w4),
+            mux(MASKWREN[1], 0b1111w4, 0b0000w4),
+            mux(MASKWREN[0], 0b1111w4, 0b0000w4))
+    }
+
+    //> The merged write: masked nibbles take DATAIN, the rest keep
+    //> their contents (the read sees the pre-write value).
+    wire write_data : Word[16] {
+        it := (mem[dyn ADDRESS] & ~mask_bits) | (DATAIN & mask_bits)
+    }
+
+    memory mem[16384] : Word[16] {
+        if {
+            when CHIPSELECT && WREN {
+                it[dyn ADDRESS] <= write_data
+            }
+        }
+    }
+
+    //> DATAOUT holds its value while CHIPSELECT is low.
+    reg dataout_reg : Word[16] {
+        if {
+            when CHIPSELECT {
+                it <= mem[dyn ADDRESS]
+            }
+        }
+    }
+
+    DATAOUT := dataout_reg
+}
+
+//> Simulation-only behavioral model of a 4 MiB SPI flash chip
+//> (mode 0), for the Fomu boot testbench: the boot ROM reads the
+//> program image from flash.
+//>
+//> Pins match the Fomu platform: cs (active-low), clk (the SPI clock
+//> line), mosi, miso. Mode 0 convention: the master samples on
+//> rising clk edges, so this model samples mosi on rising clk edges
+//> and presents miso between edges: the bit the master samples at
+//> each rising edge is the one miso holds going into it. Command,
+//> address, and data all move MSB first.
+//>
+//> Only command 0x03 (READ) is modeled. While cs is high the model
+//> idles; a falling cs edge selects the chip and starts a command
+//> byte, then a 24-bit address, then the bytes at that address
+//> stream out (incrementing) until cs rises again. Any other command
+//> is ignored (miso stays 0).
+//>
+//> Contents come from @image_hex: tools/mkflash.py writes the image
+//> to models/build/flash_image.hex (zero bytes up to $080000, then
+//> the 64K program image; the model wraps addresses at the 4 MiB
+//> boundary).
+//>
+//> Timing: the original Verilog model reacted to cs edges
+//> asynchronously and presented each miso bit on a falling clk edge.
+//> This native form acts only on rising clk edges (Virdant cannot
+//> trigger on a falling clock edge or an asynchronous control edge)
+//> and computes miso combinationally from the shift register, so the
+//> master samples the same bit at each rising edge. The framing edge
+//> is the first rising clk edge with cs low, which — for a mode-0
+//> master that presents the first command bit before it — is also
+//> the edge that samples the command byte's first bit; the model
+//> therefore samples mosi on that same edge.
+pub mod Flash {
+    incoming cs : Bit
+    incoming clk : Clock
+    incoming mosi : Bit
+
+    //> cs as sampled at the previous rising clk edge, for edge
+    //> detection. It idles true so that the first low sample after
+    //> power-on frames a command (the boot's chip select falls
+    //> between clk edges and this model has seen no edges yet).
+    reg cs_sampled : Bit {
+        initial it <= true
+        it <= cs
+    }
+
+    //> A rising clk edge on which cs just fell: the chip is selected,
+    //> and the command byte's first bit is sampled at this edge.
+    wire select_edge : Bit {
+        it := !cs && cs_sampled
+    }
+
+    //> A rising clk edge on which cs just rose: the chip is released.
+    wire deselect_edge : Bit {
+        it := cs && !cs_sampled
+    }
+
+    //> The command as sampled through this edge (the complete command
+    //> at the edge that finishes it).
+    wire command_so_far : Word[8] {
+        it := word(command_shift[7..0], mosi)
+    }
+
+    //> The edge that samples the command byte's eighth bit.
+    wire command_done : Bit {
+        it := stage == #Command && bit_count == 7w5
+    }
+
+    //> The command is a READ.
+    wire command_is_read : Bit {
+        it := command_so_far == 0x03w8
+    }
+
+    //> The address as sampled through this edge (the complete address
+    //> at the edge that finishes it).
+    wire address_so_far : Word[24] {
+        it := word(address_shift[23..0], mosi)
+    }
+
+    //> The edge that samples the address's 24th bit.
+    wire address_done : Bit {
+        it := stage == #Address && bit_count == 23w5
+    }
+
+    //> The address following the streaming pointer (wraps at 4 MiB,
+    //> so the read address only ever shows its low 22 bits).
+    wire next_stream_addr : Word[24] {
+        it := address_shift + 1w24
+    }
+
+    reg stage : FlashStage {
+        initial it <= #Wait
+        if {
+            when select_edge {
+                it <= #Command
+            }
+            else if {
+                when deselect_edge {
+                    it <= #Wait
+                }
+                else if {
+                    when command_done && command_is_read {
+                        it <= #Address
+                    }
+                    when command_done && !command_is_read {
+                        it <= #Ignore
+                    }
+                    else if {
+                        when address_done {
+                            it <= #Read
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //> Bits captured within the current command or address byte
+    //> (including the bit sampled at this edge).
+    reg bit_count : Word[5] {
+        initial it <= 0w5
+        if {
+            when select_edge {
+                it <= 1w5
+            }
+            else if {
+                when stage == #Command {
+                    it <= mux(it == 7w5, 0w5, it + 1w5)
+                }
+                else if {
+                    when stage == #Address {
+                        it <= mux(it == 23w5, 0w5, it + 1w5)
+                    }
+                }
+            }
+        }
+    }
+
+    //> The command byte's shift register (MSB first).
+    reg command_shift : Word[8] {
+        initial it <= 0w8
+        if {
+            when select_edge {
+                it <= word(0w7, mosi)
+            }
+            else if {
+                when stage == #Command {
+                    it <= word(it[7..0], mosi)
+                }
+            }
+        }
+    }
+
+    //> The address shift register (MSB first); after the address
+    //> completes it doubles as the streaming pointer and increments
+    //> once per data byte.
+    reg address_shift : Word[24] {
+        initial it <= 0w24
+        if {
+            when stage == #Address {
+                it <= word(it[23..0], mosi)
+            }
+            else if {
+                when stage == #Read if {
+                    when bits_presented == 7w3 {
+                        it <= it + 1w24
+                    }
+                }
+            }
+        }
+    }
+
+    //> Data bits presented from the current byte so far.
+    reg bits_presented : Word[3] {
+        initial it <= 0w3
+        if {
+            when address_done {
+                it <= 0w3
+            }
+            else if {
+                when stage == #Read {
+                    it <= mux(it == 7w3, 0w3, it + 1w3)
+                }
+            }
+        }
+    }
+
+    //> The data byte currently being presented: loaded at the
+    //> address-done edge and at each byte boundary, shifted one bit
+    //> left per presented bit; miso shows the top bit.
+    reg data_byte : Word[8] {
+        if {
+            when address_done {
+                it <= flash[dyn address_so_far[22..0]]
+            }
+            else if {
+                when stage == #Read if {
+                    when bits_presented == 7w3 {
+                        it <= flash[dyn next_stream_addr[22..0]]
+                    }
+                    else {
+                        it <= word(it[7..0], 0w1)
+                    }
+                }
+            }
+        }
+    }
+
+    //> The flash contents (the image is read at simulation load).
+    @image_hex("build/flash_image.hex")
+    memory flash[4194304] : Word[8]
+
+    //> The bit the master samples at the next rising clk edge (0
+    //> unless a read is streaming with the chip selected).
+    outgoing miso : Bit dependson cs {
+        it := mux(!cs && stage == #Read, data_byte[7], false)
+    }
+}

@@ -2,16 +2,17 @@
 
 // Hardware-wrapper testbench for the Fomu build of the sixfiveohtwo
 // 6502: the real FomuTop (boot ROM, SPRAM-backed memory, I/O
-// registers) against the behavioral flash model.
+// registers) against the native flash model (models::Flash, built
+// from models/src/models.vir).
 //
-// The flash image (+flashhex) carries the hw1 demo program at
-// $80000; the boot ROM copies it into SPRAM, releases the CPU, and
-// the program runs: it cycles the RGB LED through colors 0-7
-// (off, red, green, yellow, blue, magenta, cyan, white) with a
-// ~440 ms delay between steps, checkpointing the current color to
-// $F001.
+// The flash image (models/build/flash_image.hex, which the model
+// loads via @image_hex) carries the hw1 demo program at $80000; the
+// boot ROM copies it into SPRAM, releases the CPU, and the program
+// runs: it cycles the RGB LED through colors 0-7 (off, red, green,
+// yellow, blue, magenta, cyan, white) with a ~440 ms delay between
+// steps, checkpointing the current color to $F001.
 //
-// Run with: ./run +flashhex=build/hw1.flash.hex
+// Run with: make fomu-sim PROG=hw1
 
 module Tb;
     reg clock = 0;
@@ -47,7 +48,7 @@ module Tb;
         .flash_miso(flash_miso)
     );
 
-    Flash flash_model(
+    \models::Flash flash_model(
         .cs(flash_cs),
         .clk(flash_clk),
         .mosi(flash_mosi),
@@ -85,16 +86,16 @@ module Tb;
     function [7:0] mem_peek(input [15:0] addr);
         reg [15:0] word;
         begin
-            word = addr[15] ? dut.mem.hi.mem[addr[14:1]] : dut.mem.lo.mem[addr[14:1]];
+            // The plain SB_SPRAM256KA cell instances resolve through
+            // models/shim, which instantiates the native model as
+            // `native` — one hierarchy level below each cell.
+            word = addr[15] ? dut.mem.hi.native.mem[addr[14:1]]
+                            : dut.mem.lo.native.mem[addr[14:1]];
             mem_peek = addr[0] ? word[15:8] : word[7:0];
         end
     endfunction
 
-    reg [8*64:1] flashfile;
-
     initial begin
-        void'($value$plusargs("flashhex=%s", flashfile));
-        void'($value$plusargs("debug=%d", debug));
         errors = 0;
 
         repeat (100) @(posedge clock);

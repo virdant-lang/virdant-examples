@@ -123,7 +123,7 @@ touch2 → IRQ). All logic runs on a derived 6 MHz clock (the pad clock ÷ 8).
 cd sixfiveohtwo
 
 # Full-stack simulation: FomuTop (boot ROM + SPRAM + I/O) against the
-# behavioral flash model, running the hw1 LED/touch demo. No board needed.
+# native flash model, running the hw1 LED/touch demo. No board needed.
 make fomu-sim
 # expected final line:  FOMU SIM PASS in 8389513 cycles
 
@@ -211,10 +211,26 @@ sixfiveohtwo/
     fomu_top.vir            export mod FomuTop for ice40::Fomu + BusBridge
                             + the ClkDiv ext mod (pad/8 system clock)
   ext/
-    Spram.sv                behavioral SB_SPRAM256KA model (simulation only;
-                            yosys supplies the cell itself)
+    Spram.sv                the former Verilog SPRAM cell model — kept as
+                            the differential reference for the native
+                            rewrite (yosys supplies the cell itself)
     ClkDiv.sv               the registered divide-by-eight (sim + synthesis)
-    Flash.sv                SPI flash model, mode 0, +flashhex=<image>
+  models/
+    virdant.toml            the native simulation models as their own
+                            Virdant project (their Verilog must never
+                            appear in the main build/ — yosys supplies
+                            the SB_SPRAM256KA cell itself)
+    src/models.vir          the ext/ memories rewritten natively with the
+                            `memory` construct, same module names: Memory
+                            (the 64K x 8 RAM), SB_SPRAM256KA (the SPRAM
+                            cell), Flash (the SPI flash, image via
+                            @image_hex)
+    shim/sb_spram256ka_sim.sv
+                            plain-name wrapper binding the emitted
+                            \models::SB_SPRAM256KA to the SB_SPRAM256KA
+                            cell instances fomu_memory.vir emits
+    tb/                     differential testbenches: each native model
+                            against the former ext/ Verilog model
   asm/
     README.md               smoke-test conventions (the contract every
                             test program and expectation file follows)
@@ -232,8 +248,9 @@ sixfiveohtwo/
     exp.py                  expectation text -> binary hex records
     mkklaus.py              Klaus 64K image -> hex
     diffklaus.py            differential checker (DUT vs Python reference)
-    mkflash.py              64K program -> sparse flash hex at $080000
-                            (reset vector patched to $0200) for fomu-sim
+    mkflash.py              64K program -> flat flash hex at $080000
+                            (reset vector patched to $0200; the image the
+                            native flash model loads via @image_hex)
     mkimg.py                bitstream + 64K program -> the upload image
   klaus/
     README.md               Klaus gate mechanics + the passing result
@@ -793,11 +810,13 @@ make test         all seven smoke tests (s1..s7)
 make test-sN      one smoke test (assembles if needed)
 make klaus        build/klaus.hex from the 64K image
 make klaus-run    iverilog Klaus run (SLOW — prefer Verilator, section 19)
+make models-test  differential tests: the native models (models/) against
+                  the former ext/ Verilog models they replace
 make fomu-sim     full-stack Fomu simulation (boot + the PROG demo, default hw1)
 make fomu-build   bitstream: yosys + nextpnr-ice40 + icepack, timing-checked
 make build/sixfiveohtwo.img   upload image (bitstream + program at $080000)
 make fomu-upload  dfu-suffix + dfu-util upload (needs the board)
-make clean        remove build/
+make clean        remove build/ and models/build/
 ```
 
 Build rules: `asm/%.s` → ca65 → ld65 (`asm/6502.cfg`: one 64K RAM region,
